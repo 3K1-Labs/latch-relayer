@@ -1,0 +1,177 @@
+# Operations and Transactions
+
+:::note
+
+Find how-to guides for smart contract and non-smart contract transactions in the [Transactions How-To Guides section](https://developers.stellar.org/docs/build/guides/transactions.md).
+
+:::
+
+## Operations and transactions: how they work
+
+To perform actions with an account on the Stellar network, you compose operations, bundle them into a transaction, and then sign and submit the transaction to the network. Smart contract transactions (those with `InvokeHostFunctionOp`, `ExtendFootprintTTLOp`, or `RestoreFootprintOp` operations) can only have one operation per transaction.
+
+### Operations
+
+Operations are individual commands that modify the ledger. Operations are used to send payments, invoke a smart contract function, enter orders into the decentralized exchange, change settings on accounts, and authorize accounts to hold assets.
+
+All operations fall into one of three threshold categories: low, medium, or high, and each threshold category has a weight between 0 and 255 (which can be determined using set_options). Thresholds determine what signature weight is required for the operation to be accepted. For example, let’s say an account sets the medium threshold weight to 5. If the account wants to successfully establish a trustline with the `changeTrust` operation, the weight of the signature(s) must be greater than or equal to 5.
+
+To learn more about signature weight, see the [Signatures and Multisig section](https://developers.stellar.org/docs/learn/fundamentals/transactions/signatures-multisig.md).
+
+View a comprehensive list of Stellar operations and their threshold levels in the [List of Operations section](https://developers.stellar.org/docs/learn/fundamentals/transactions/list-of-operations.md).
+
+### Transactions
+
+The Stellar network encodes transactions using a standardized protocol called External Data Representation (XDR). You can read more about this in our [XDR Section](https://developers.stellar.org/docs/learn/fundamentals/data-format/xdr.md).
+
+Accounts can only perform one transaction at a time.
+
+Transactions comprise a bundle of between 1-100 operations (except smart contract transactions, which can only have one operation per transaction) and are signed and submitted to the ledger by accounts. Transactions always need to be authorized by the source account’s public key to be valid, which involves signing the transaction object with the public key’s associated secret key. A transaction plus its signature(s) is called a transaction envelope.
+
+A transaction may need more than one signature- this happens if it has operations that affect more than one account or if it has a high threshold weight. Check out the [Signature and Multisignature Section](https://developers.stellar.org/docs/learn/fundamentals/transactions/signatures-multisig.md) for more information.
+
+Transactions are atomic. Meaning if one operation in a transaction fails, all operations fail, and the entire transaction is not applied to the ledger.
+
+Operations are executed for the source account of the transaction unless an operation override is defined.
+
+Smart contract transactions also go through a simulation process where developers can test how the transaction would be executed on the network using the RPC endpoint `simulateTransaction`. Read more in the [Soroban docs](https://developers.stellar.org/docs/learn/fundamentals/contract-development/contract-interactions/transaction-simulation.md).
+
+## Memo
+
+Memos are an optional unstructured data field that can be used to embed any additional identifying information about the transaction relevant to the sender or receiver.
+
+They were previously used to differentiate between individual accounts in a pooled account - something we used muxed accounts for now.
+
+For more information on muxed accounts, see our [Pooled Accounts - Muxed Accounts & Memos Guide](https://developers.stellar.org/docs/build/guides/transactions/pooled-accounts-muxed-accounts-memos.md)
+
+Memos can be one of the following types:
+
+- `MEMO_TEXT`: A string encoded using either ASCII or UTF-8, up to 28-bytes long.
+- `MEMO_ID`: A 64-bit unsigned integer.
+- `MEMO_HASH`: A 32-byte hash.
+- `MEMO_RETURN`: A 32-byte hash intended to be interpreted as the hash of the transaction the sender is refunding.
+
+## Memo content examples
+
+- Notifying that the transaction is a refund or reimbursement
+- Reference to an invoice the transaction is paying
+- Any further internal routing information
+- Links to relevant data
+
+#### Transaction attributes
+
+- [Fee](https://developers.stellar.org/docs/learn/fundamentals/fees-resource-limits-metering.md)
+- [List of operations](https://developers.stellar.org/docs/learn/fundamentals/transactions/list-of-operations.md)
+- [List of signatures](https://developers.stellar.org/docs/learn/fundamentals/transactions/signatures-multisig.md)
+- [Memo or muxed account](https://developers.stellar.org/docs/build/guides/transactions/pooled-accounts-muxed-accounts-memos.md)
+- [Sequence number](https://developers.stellar.org/docs/learn/glossary.md#sequence-number)
+- [Source account](https://developers.stellar.org/docs/learn/glossary.md#source-account)
+- [Preconditions (optional)](#preconditions)
+
+## Transaction and operation validity
+
+Before being successfully submitted to the Stellar network, transactions go through several validity checks. These checks are grouped into three categories:
+
+### Preconditions (optional) {/* #preconditions */}
+
+Preconditions are checked first.
+
+All preconditions are optional. Time bounds are encouraged, but the other preconditions are used in more specialized circumstances. You can set multiple preconditions as long as the combination is logically sound.
+
+#### Time bounds
+
+Valid if within set time bounds of the transaction
+
+Time bounds are an optional UNIX timestamp (in seconds), determined by ledger time, of a lower and upper bound of when a transaction will be valid. If a transaction is submitted too early or too late, it will fail to make it into the transaction set.
+
+Setting time bounds on transactions is highly encouraged, and many SDKs enforce them.
+
+If `maxTime` is 0, upper time bounds are not set. In this case, if a transaction does not make it to the transaction set, it is kept in memory and continuously tries to make it to the next transaction set. Because of this, we advise that all transactions are created with time bounds to invalidate transactions after a certain amount of time, especially if you plan to resubmit your transaction at a later time.
+
+#### Ledger bounds
+
+Valid if within the set ledger bounds of the transaction
+
+Ledger bounds apply to ledger numbers. With these defined, a transaction will only be valid for ledger numbers that fall within the determined range.
+
+The lower bound is inclusive (less than or equal to) while the upper bound is not (just greater than).
+
+If the upper bound is set to 0, this indicates there is no upper bound.
+
+#### Minimum sequence number
+
+If a minimum sequence number is set, the transaction will only be valid when its source account’s sequence number (call it S) is large enough. Specifically, it’s valid when S satisfies `minSeqNum <= S < tx.seqNum`.
+
+If this precondition is omitted, the default behavior applies: the transaction’s sequence number must be exactly one greater than the account’s sequence number.
+
+Note that after a transaction is executed, the account will always set its sequence number to the transaction’s sequence number.
+
+#### Minimum sequence age
+
+Transaction is valid after a particular duration (expressed in seconds) elapses since the account’s sequence number age.
+
+Minimum sequence age is a precondition relating to time, but unlike time bounds, which express absolute times, minimum sequence age is relative to when the transaction source account’s sequence number was touched.
+
+#### Minimum sequence ledger gap
+
+Valid if submitted in a ledger meeting or exceeding the source account’s sequence number age
+
+This is similar to the minimum sequence age, except it is expressed as a number of ledgers rather than a duration of time.
+
+#### Extra signers
+
+Valid if submitted with signatures that fulfill each of the extra signers
+
+A transaction can specify up to two extra signers as a precondition, meaning it must have signatures that correspond to those extra signers, even if those signatures would not otherwise be required to authorize the transaction (i.e., for its sources account or operations).
+
+The additional signers can be of any type besides the pre-authorized transaction signer since to pre-authorize a transaction, you need to know its hash, but be hash must include the extra signers. This Catch-22 relationship means including this type of extra signer will return an error.
+
+### Operation validity
+
+When a transaction is submitted to a node, the node checks the validity of each operation in the transaction before attempting to include it in a candidate transaction set. These initial operation validity checks are intended to be fast and simple, with more intensive checks coming after the fees have been consumed. For an operation to pass this validity check, it has to meet the following conditions:
+
+#### The signatures on the transaction must be valid for the operation
+
+The signatures are from valid signers for the source account of the operation. The combined weight of all signatures for the source account of the operation meets the threshold for the operation.
+
+#### The operation must be well-formed
+
+Typically this means checking the parameters for the operation to see if they’re in a valid format. For example, only positive values can be set for the amount of a payment operation.
+
+#### The operation must be valid in the current protocol version of the network
+
+Deprecated operations, such as inflation, are invalid by design.
+
+### Transaction validity
+
+Finally, the following transaction checks take place:
+
+#### Source account
+
+The source account must exist on the ledger.
+
+#### Fee
+
+The fee must be greater than or equal to the network minimum fee for the number of operations submitted as part of the transaction. This does not guarantee that the transaction will be applied, only that it is valid. In addition, the source account must be able to pay the fee specified.
+
+#### Fee-bump (if applicable)
+
+See Validity of a [Fee-Bump Transaction Guide](https://developers.stellar.org/docs/build/guides/transactions/fee-bump-transactions.md) for more information.
+
+#### Sequence number
+
+The sequence number must be one greater than the sequence number stored in the source account entry when the transaction is applied unless sequence number preconditions are set. An account can only have one transaction (and, therefore, one sequence number) consumed per ledger.
+
+#### List of operations
+
+Each operation must pass all the validity checks for an operation, described in the Operation Validity section above.
+
+#### List of signatures
+
+- Meet signature requirements for each operation in the transaction
+- Appropriate network passphrase is part of the transaction hash signed by each signer
+- Combined weight of the signatures for the source account of the transaction meets the low threshold for the source account.
+
+#### Memo (if applicable)
+
+The memo type must be a valid type, and the memo itself must adhere to the formatting of the memo type.
