@@ -13,7 +13,16 @@ var (
 	ErrNotMemoID      = errors.New("memo type is not MEMO_ID")
 	ErrInvalidMemoID  = errors.New("memo value is not a valid uint64")
 	ErrInvalidAddress = errors.New("invalid Stellar G-address")
+	ErrInvalidCAddress = errors.New("invalid Soroban C-address")
 )
+
+// ValidateCAddress returns nil if addr is a valid Soroban contract (C...) address.
+func ValidateCAddress(addr string) error {
+	if _, err := sdkstrkey.Decode(sdkstrkey.VersionByteContract, addr); err != nil {
+		return ErrInvalidCAddress
+	}
+	return nil
+}
 
 // DeriveID deterministically derives a uint64 memo ID from a Soroban C-address.
 // It takes the first 8 bytes of the SHA-256 hash of the address string.
