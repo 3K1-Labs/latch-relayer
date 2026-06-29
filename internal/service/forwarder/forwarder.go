@@ -2,14 +2,17 @@ package forwarder
 
 import (
 	"context"
-	"encoding/hex"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
+	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	"github.com/stellar/go-stellar-sdk/keypair"
+	rpcprotocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
+	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/latch/relayer/internal/config"
 	"github.com/latch/relayer/internal/store"
@@ -21,10 +24,11 @@ type Forwarder struct {
 	store   *store.Store
 	config  *config.Config
 	horizon *horizonclient.Client
+	rpc     *rpcclient.Client
 }
 
-func New(st *store.Store, cfg *config.Config, hz *horizonclient.Client) *Forwarder {
-	return &Forwarder{store: st, config: cfg, horizon: hz}
+func New(st *store.Store, cfg *config.Config, hz *horizonclient.Client, rpc *rpcclient.Client) *Forwarder {
+	return &Forwarder{store: st, config: cfg, horizon: hz, rpc: rpc}
 }
 
 // backoffs mirrors the retry strategy in ARCHITECTURE.md:
@@ -125,32 +129,79 @@ func (f *Forwarder) submit(ctx context.Context, reg *store.Registration, amount,
 		return "", fmt.Errorf("unsupported asset %q", asset)
 	}
 
-	// Decode the hex tx hash into 32 raw bytes for MEMO_HASH.
-	rawHash, err := hex.DecodeString(inboundHash)
-	if err != nil || len(rawHash) != 32 {
-		return "", fmt.Errorf("invalid inbound tx hash %q", inboundHash)
+	// Classic Payment only accepts G-addresses. C-addresses (Soroban contracts)
+	// must be paid via the native XLM SAC's transfer function instead.
+	op, err := txnbuild.NewPaymentToContract(txnbuild.PaymentToContractParams{
+		NetworkPassphrase: f.config.NetworkPassphrase,
+		Destination:       reg.CAddress,
+		Amount:            amount,
+		Asset:             txnbuild.NativeAsset{},
+		SourceAccount:     reg.PoolAddress,
+	})
+	if err != nil {
+		return "", fmt.Errorf("build payment-to-contract: %w", err)
 	}
-	var memoHash txnbuild.MemoHash
-	copy(memoHash[:], rawHash)
 
+	// Build with placeholder fee — simulation will give us the real values.
 	tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
 		SourceAccount:        &sourceAccount,
 		IncrementSequenceNum: true,
-		Operations: []txnbuild.Operation{
-			&txnbuild.Payment{
-				Destination: reg.CAddress,
-				Amount:      amount,
-				Asset:       txnbuild.NativeAsset{},
-			},
-		},
-		Memo:    memoHash,
-		BaseFee: txnbuild.MinBaseFee,
+		Operations: []txnbuild.Operation{&op},
+		BaseFee:    txnbuild.MinBaseFee,
 		Preconditions: txnbuild.Preconditions{
 			TimeBounds: txnbuild.NewTimeout(300),
 		},
 	})
 	if err != nil {
 		return "", fmt.Errorf("build tx: %w", err)
+	}
+
+	// ── Simulate via Stellar RPC to get the exact footprint and resource fee ──
+	// Soroban transactions are rejected if the footprint or fee doesn't match the
+	// network's actual resource usage. Simulation gives us the ground truth.
+	env := tx.ToXDR()
+	envBytes, err := env.MarshalBinary()
+	if err != nil {
+		return "", fmt.Errorf("marshal tx for simulation: %w", err)
+	}
+
+	simResp, err := f.rpc.SimulateTransaction(ctx, rpcprotocol.SimulateTransactionRequest{
+		Transaction: base64.StdEncoding.EncodeToString(envBytes),
+	})
+	if err != nil {
+		return "", fmt.Errorf("simulate tx: %w", err)
+	}
+	if simResp.Error != "" {
+		return "", fmt.Errorf("simulate tx: %s", simResp.Error)
+	}
+
+	// Decode the simulation's updated SorobanTransactionData (corrected footprint + limits).
+	simDataBytes, err := base64.StdEncoding.DecodeString(simResp.TransactionDataXDR)
+	if err != nil {
+		return "", fmt.Errorf("decode simulation data: %w", err)
+	}
+	var sorobanData xdr.SorobanTransactionData
+	if err := xdr.SafeUnmarshal(simDataBytes, &sorobanData); err != nil {
+		return "", fmt.Errorf("unmarshal soroban data: %w", err)
+	}
+
+	// Apply simulation results: update Ext with real footprint and set total fee.
+	// Total fee = inclusion fee (min 100) + resource fee from simulation + small buffer.
+	env.V1.Tx.Ext = xdr.TransactionExt{V: 1, SorobanData: &sorobanData}
+	env.V1.Tx.Fee = xdr.Uint32(uint32(txnbuild.MinBaseFee) + uint32(simResp.MinResourceFee) + 10_000)
+
+	// Re-parse from XDR so we can use the txnbuild Sign API on the updated envelope.
+	updatedBytes, err := env.MarshalBinary()
+	if err != nil {
+		return "", fmt.Errorf("marshal updated tx: %w", err)
+	}
+	generic, err := txnbuild.TransactionFromXDR(base64.StdEncoding.EncodeToString(updatedBytes))
+	if err != nil {
+		return "", fmt.Errorf("parse updated tx: %w", err)
+	}
+	tx, ok := generic.Transaction()
+	if !ok {
+		return "", fmt.Errorf("updated envelope is not a simple transaction")
 	}
 
 	tx, err = tx.Sign(f.config.NetworkPassphrase, kp)

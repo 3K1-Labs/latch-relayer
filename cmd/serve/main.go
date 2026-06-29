@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
+	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 
 	"github.com/latch/relayer/internal/config"
 	"github.com/latch/relayer/internal/db"
@@ -55,7 +56,9 @@ func main() {
 	// ── 4. Core services ──────────────────────────────────────────────────────
 	st := store.New(pool)
 	hz := &horizonclient.Client{HorizonURL: cfg.HorizonURL}
-	fwd := forwarder.New(st, cfg, hz)
+	rpc := rpcclient.NewClient(cfg.RPCURL, nil)
+	defer rpc.Close()
+	fwd := forwarder.New(st, cfg, hz, rpc)
 
 	// ── 5. Background workers ─────────────────────────────────────────────────
 	// Retry worker polls every 30s for pending_retry forwards.
