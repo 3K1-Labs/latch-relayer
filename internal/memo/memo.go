@@ -1,7 +1,6 @@
 package memo
 
 import (
-	"encoding/binary"
 	"errors"
 	"strconv"
 
@@ -11,7 +10,6 @@ import (
 var (
 	ErrNotMemoID       = errors.New("memo type is not MEMO_ID")
 	ErrInvalidMemoID   = errors.New("memo value is not a valid uint64")
-	ErrInvalidAddress  = errors.New("invalid Stellar G-address")
 	ErrInvalidCAddress = errors.New("invalid Soroban C-address")
 )
 
@@ -23,9 +21,9 @@ func ValidateCAddress(addr string) error {
 	return nil
 }
 
-// ParseID parses a memo ID from a Horizon payment event.
-// Horizon returns memos as (memoType string, memo string).
-// We only accept MEMO_ID type ("id") — all others are rejected.
+// ParseID parses a MEMO_ID from a Horizon payment event.
+// Returns ErrNotMemoID if the memo type is not "id", ErrInvalidMemoID if the value
+// is not a valid uint64.
 func ParseID(memoType, memo string) (uint64, error) {
 	if memoType != "id" {
 		return 0, ErrNotMemoID
@@ -35,21 +33,4 @@ func ParseID(memoType, memo string) (uint64, error) {
 		return 0, ErrInvalidMemoID
 	}
 	return id, nil
-}
-
-// ToMuxedAddress encodes a pooled G-address + memo ID into an M-address (SEP-23).
-// Muxed accounts are not yet universally supported, but memo IDs double as muxed IDs —
-// so this gives us a zero-migration upgrade path when support matures.
-func ToMuxedAddress(gAddress string, id uint64) (string, error) {
-	raw, err := sdkstrkey.Decode(sdkstrkey.VersionByteAccountID, gAddress)
-	if err != nil {
-		return "", ErrInvalidAddress
-	}
-
-	// SEP-23 muxed account payload: 8-byte big-endian uint64 ID + 32-byte public key
-	payload := make([]byte, 40)
-	binary.BigEndian.PutUint64(payload[:8], id)
-	copy(payload[8:], raw)
-
-	return sdkstrkey.Encode(sdkstrkey.VersionByteMuxedAccount, payload)
 }
