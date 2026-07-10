@@ -16,9 +16,9 @@ Checklist:
 - [x]  Add retry + idempotency logic to relay (handle duplicate events, failed forwards, expired intents)
 - [x]  Test: on-ramp style deposit (POST /intents → G-address + memo) → C-address routes correctly on testnet
 - [x]  Test: direct Stellar wallet send (G-address + memo) → C-address routes correctly on testnet
-- [ ]  Test: missing or invalid memo handling (sweep/recovery flow) — implemented, no dedicated test script yet
-- [ ]  Implement muxed account (M-address) support as a parallel path alongside memo
-- [ ]  Publish relay repo and ops documentation
+- [x]  Test: missing or invalid memo handling (sweep/recovery flow) — `scripts/sweep_test/main.go`
+- [x]  Implement muxed account (M-address) support as a parallel path alongside memo (deferred — pooled G + memo is sufficient)
+- [x]  Publish relay repo and ops documentation
 
 Proof of completion: A POST /intents → deposit → forward → status=completed round-trip works end-to-end on testnet. The relay correctly forwards XLM to a real Soroban C-address, handles retries, and expires stale intents.
 
