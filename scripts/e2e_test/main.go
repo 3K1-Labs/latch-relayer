@@ -13,8 +13,6 @@ import (
 	"github.com/stellar/go-stellar-sdk/keypair"
 	"github.com/stellar/go-stellar-sdk/network"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
-
-	"github.com/latch/relayer/internal/memo"
 )
 
 const (
@@ -31,52 +29,55 @@ func main() {
 	fmt.Println("=== Latch Relayer — End-to-End Testnet Test ===")
 	fmt.Println()
 
-	// ── 1. Register the C-address ────────────────────────────────────────────
-	fmt.Printf("Step 1: Register C-address %s\n", cAddress)
-	regBody := fmt.Sprintf(`{"c_address":"%s"}`, cAddress)
-	resp, err := http.Post(relayerURL+"/register", "application/json", strings.NewReader(regBody))
+	// ── 1. Create a funding intent ───────────────────────────────────────────
+	fmt.Printf("Step 1: Create intent for C-address %s\n", cAddress)
+	intentBody := fmt.Sprintf(`{"c_address":"%s","expected_amt":"%s","expires_in":3600}`, cAddress, depositAmount)
+	resp, err := http.Post(relayerURL+"/intents", "application/json", strings.NewReader(intentBody))
 	if err != nil {
-		log.Fatalf("POST /register: %v", err)
+		log.Fatalf("POST /intents: %v", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 
-	var regResp struct {
+	var intentResp struct {
+		IntentID    string `json:"intent_id"`
 		MemoID      string `json:"memo_id"`
 		PoolAddress string `json:"pool_address"`
+		ExpiresAt   string `json:"expires_at"`
 		Error       string `json:"error"`
 	}
-	json.Unmarshal(raw, &regResp)
+	json.Unmarshal(raw, &intentResp)
 
-	if regResp.Error != "" {
-		log.Fatalf("register error: %s", regResp.Error)
+	if intentResp.Error != "" {
+		log.Fatalf("create intent error: %s", intentResp.Error)
 	}
-	fmt.Printf("  ✓ memo_id:      %s\n", regResp.MemoID)
-	fmt.Printf("  ✓ pool_address: %s\n", regResp.PoolAddress)
-
-	// Verify the derived memo_id matches what the server returned
-	derivedID := memo.DeriveID(cAddress)
-	fmt.Printf("  ✓ local DeriveID check: %d\n\n", derivedID)
+	fmt.Printf("  ✓ intent_id:    %s\n", intentResp.IntentID)
+	fmt.Printf("  ✓ memo_id:      %s\n", intentResp.MemoID)
+	fmt.Printf("  ✓ pool_address: %s\n", intentResp.PoolAddress)
+	fmt.Printf("  ✓ expires_at:   %s\n\n", intentResp.ExpiresAt)
 
 	// ── 2. Send deposit to pool ──────────────────────────────────────────────
-	fmt.Printf("Step 2: Send %s XLM from depositor → pool (memo_id: %s)\n", depositAmount, regResp.MemoID)
+	fmt.Printf("Step 2: Send %s XLM from depositor → pool (memo_id: %s)\n", depositAmount, intentResp.MemoID)
 
 	sourceAccount, err := client.AccountDetail(horizonclient.AccountRequest{AccountID: depositor.Address()})
 	if err != nil {
 		log.Fatalf("fetch depositor account: %v", err)
 	}
 
+	var memoIDInt uint64
+	fmt.Sscanf(intentResp.MemoID, "%d", &memoIDInt)
+
 	tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
 		SourceAccount:        &sourceAccount,
 		IncrementSequenceNum: true,
 		Operations: []txnbuild.Operation{
 			&txnbuild.Payment{
-				Destination: regResp.PoolAddress,
+				Destination: intentResp.PoolAddress,
 				Amount:      depositAmount,
 				Asset:       txnbuild.NativeAsset{},
 			},
 		},
-		Memo:    txnbuild.MemoID(derivedID),
+		Memo:    txnbuild.MemoID(memoIDInt),
 		BaseFee: txnbuild.MinBaseFee,
 		Preconditions: txnbuild.Preconditions{
 			TimeBounds: txnbuild.NewTimeout(300),
@@ -98,9 +99,9 @@ func main() {
 	fmt.Printf("  ✓ deposit tx hash: %s\n", result.Hash)
 	fmt.Printf("  ✓ ledger:          %d\n\n", result.Ledger)
 
-	// ── 3. Wait for watcher to pick it up and forwarder to process it ────────
-	fmt.Println("Step 3: Polling /deposit/status until forward is confirmed...")
-	statusURL := fmt.Sprintf("%s/deposit/status/%s", relayerURL, regResp.MemoID)
+	// ── 3. Poll until the intent is completed ────────────────────────────────
+	fmt.Println("Step 3: Polling /deposit/status until intent is completed...")
+	statusURL := fmt.Sprintf("%s/deposit/status/%s", relayerURL, intentResp.MemoID)
 
 	for attempt := 1; attempt <= 12; attempt++ {
 		time.Sleep(5 * time.Second)
@@ -114,14 +115,15 @@ func main() {
 		statusResp.Body.Close()
 
 		var status struct {
+			IntentID string `json:"intent_id"`
 			MemoID   string `json:"memo_id"`
 			CAddress string `json:"c_address"`
+			Status   string `json:"status"`
 			Forwards []struct {
 				TxHash    string  `json:"tx_hash"`
 				Amount    string  `json:"amount"`
 				Status    string  `json:"status"`
 				ForwardTx *string `json:"forward_tx"`
-				CreatedAt string  `json:"created_at"`
 			} `json:"forwards"`
 		}
 		json.Unmarshal(body, &status)
@@ -132,11 +134,12 @@ func main() {
 		}
 
 		fwd := status.Forwards[0]
-		fmt.Printf("  [%ds] forward status: %s\n", attempt*5, fwd.Status)
+		fmt.Printf("  [%ds] intent: %-12s  forward: %s\n", attempt*5, status.Status, fwd.Status)
 
-		if fwd.Status == "done" {
+		if status.Status == "completed" {
 			fmt.Println()
 			fmt.Println("=== ✅ END-TO-END SUCCESS ===")
+			fmt.Printf("  Intent ID:    %s\n", status.IntentID)
 			fmt.Printf("  Deposit tx:   %s\n", fwd.TxHash)
 			fmt.Printf("  Forward tx:   %s\n", *fwd.ForwardTx)
 			fmt.Printf("  Amount:       %s XLM\n", fwd.Amount)
@@ -145,10 +148,10 @@ func main() {
 			return
 		}
 
-		if fwd.Status == "failed" {
-			log.Fatalf("forward failed — check server logs")
+		if status.Status == "failed" {
+			log.Fatalf("intent failed — check server logs")
 		}
 	}
 
-	log.Fatal("timed out waiting for forward to complete (60s)")
+	log.Fatal("timed out waiting for intent to complete (60s)")
 }

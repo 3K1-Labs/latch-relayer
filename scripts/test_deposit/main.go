@@ -17,9 +17,6 @@ const (
 	horizonURL    = "https://horizon-testnet.stellar.org"
 	depositorSeed = "SAHTDBI4OCTAP6XAVG3F5FDYEX5S36DXMT36LRIUAZQPWKANX4ETLA2A"
 	poolAddress   = "GB3AETG6Q5SYNM36TPHULYXPP364EC77YJJBDMNKDA5CF4QYP3XHJ6I5"
-
-	// Fake C-address — stands in for a real Soroban contract address in tests
-	fakeCAddress = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
 )
 
 func main() {
@@ -32,9 +29,11 @@ func main() {
 	}
 	fmt.Println("Depositor:", depositor.Address())
 
-	// ── 2. Derive memo ID from C-address ────────────────────────────────────
-	memoID := memo.DeriveID(fakeCAddress)
-	fmt.Printf("Memo ID (derived from C-address): %d\n", memoID)
+	// ── 2. Use a fixed test memo_id ──────────────────────────────────────────
+	// In production, memo_ids come from POST /intents. This script uses a
+	// hardcoded value to test the send → confirm → ParseID round-trip only.
+	const memoID uint64 = 1234567890
+	fmt.Printf("Memo ID (test value): %d\n", memoID)
 
 	// ── 3. Fetch depositor account (we need the sequence number) ────────────
 	accountReq := horizonclient.AccountRequest{AccountID: depositor.Address()}
@@ -45,7 +44,6 @@ func main() {
 	fmt.Printf("Depositor sequence: %s\n", sourceAccount.Sequence)
 
 	// ── 4. Build the transaction ─────────────────────────────────────────────
-	// Payment: depositor → pool, 10 XLM, MEMO_ID = memoID
 	tx, err := txnbuild.NewTransaction(
 		txnbuild.TransactionParams{
 			SourceAccount:        &sourceAccount,
@@ -87,7 +85,7 @@ func main() {
 
 	// ── 7. Confirm the pool received it ──────────────────────────────────────
 	fmt.Println("\nChecking pool account received the payment...")
-	time.Sleep(6 * time.Second) // wait one ledger close (~5s)
+	time.Sleep(6 * time.Second)
 
 	paymentsReq := horizonclient.OperationRequest{
 		ForAccount: poolAddress,
@@ -116,7 +114,6 @@ func main() {
 	fmt.Printf("\n✓ Transaction memo:\n")
 	fmt.Printf("  Type:  %s\n", txDetail.MemoType)
 	fmt.Printf("  Value: %s\n", txDetail.Memo)
-	fmt.Printf("\nExpected memo ID: %d\n", memoID)
 
 	// ── 9. Round-trip: parse the memo back ───────────────────────────────────
 	parsed, err := memo.ParseID(txDetail.MemoType, txDetail.Memo)
@@ -126,5 +123,5 @@ func main() {
 	if parsed != memoID {
 		log.Fatalf("memo mismatch: sent %d, got back %d", memoID, parsed)
 	}
-	fmt.Printf("\n✅ Round-trip success: DeriveID → send → confirm → ParseID = %d\n", parsed)
+	fmt.Printf("\n✅ Round-trip success: send → confirm → ParseID = %d\n", parsed)
 }
