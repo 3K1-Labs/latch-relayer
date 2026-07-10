@@ -40,7 +40,7 @@ var backoffs = []time.Duration{
 }
 
 // Forward processes one inbound payment end-to-end.
-// It inserts the forward record, resolves the C-address, and submits the outbound tx.
+// It inserts the forward record, resolves the C-address from the intent, and submits the outbound tx.
 // On 3 consecutive failures it marks the record pending_retry for the background worker.
 // Safe to call in a goroutine — the SSE watcher does exactly that.
 func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, fromAddress, amount, asset string) {
@@ -50,12 +50,18 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 		return
 	}
 
-	reg, err := f.store.GetRegistration(ctx, memoID)
+	intent, err := f.store.GetIntentByMemoID(ctx, memoID)
 	if err != nil {
-		// Unknown memo_id — sweep to recovery and log.
 		slog.Warn("forwarder: unknown memo_id, sweeping to recovery", "tx_hash", txHash, "memo_id", memoID)
 		f.sweep(ctx, txHash, amount, asset)
 		_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusFailed, "unknown memo_id — swept to recovery")
+		return
+	}
+
+	if intent.Status == store.IntentExpired {
+		slog.Warn("forwarder: intent expired, sweeping to recovery", "tx_hash", txHash, "memo_id", memoID)
+		f.sweep(ctx, txHash, amount, asset)
+		_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusFailed, "intent expired — swept to recovery")
 		return
 	}
 
@@ -69,9 +75,10 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 			}
 		}
 
-		outboundHash, err := f.submit(ctx, reg, amount, asset, txHash)
+		outboundHash, err := f.submit(ctx, intent.CAddress, intent.PoolAddress, amount, asset)
 		if err == nil {
 			_ = f.store.MarkForwardDone(ctx, txHash, outboundHash)
+			_ = f.store.CompleteIntent(ctx, memoID)
 			slog.Info("forwarder: forwarded",
 				"inbound", txHash, "outbound", outboundHash,
 				"memo_id", memoID, "amount", amount)
@@ -89,29 +96,29 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 // Retry is called by the background retry worker for pending_retry forwards.
 // One final attempt — marks done or failed, no further queuing.
 func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
-	reg, err := f.store.GetRegistration(ctx, fwd.MemoID)
+	intent, err := f.store.GetIntentByMemoID(ctx, fwd.MemoID)
 	if err != nil {
-		_ = f.store.MarkForwardFailed(ctx, fwd.TxHash, store.StatusFailed, "registration not found")
-		slog.Error("forwarder: retry — registration not found", "tx_hash", fwd.TxHash)
+		_ = f.store.MarkForwardFailed(ctx, fwd.TxHash, store.StatusFailed, "intent not found")
+		slog.Error("forwarder: retry — intent not found", "tx_hash", fwd.TxHash)
 		return
 	}
 
-	outboundHash, err := f.submit(ctx, reg, fwd.Amount, fwd.Asset, fwd.TxHash)
+	outboundHash, err := f.submit(ctx, intent.CAddress, intent.PoolAddress, fwd.Amount, fwd.Asset)
 	if err != nil {
 		_ = f.store.MarkForwardFailed(ctx, fwd.TxHash, store.StatusFailed, err.Error())
+		_ = f.store.FailIntent(ctx, fwd.MemoID)
 		slog.Error("forwarder: retry failed", "tx_hash", fwd.TxHash, "err", err)
 		return
 	}
 
 	_ = f.store.MarkForwardDone(ctx, fwd.TxHash, outboundHash)
+	_ = f.store.CompleteIntent(ctx, fwd.MemoID)
 	slog.Info("forwarder: retry succeeded", "inbound", fwd.TxHash, "outbound", outboundHash)
 }
 
 // submit builds, signs, and submits the outbound payment for one forward.
-// The inbound tx hash is embedded as MEMO_HASH so the outbound tx is traceable
-// back to the original deposit without storing extra data.
-func (f *Forwarder) submit(ctx context.Context, reg *store.Registration, amount, asset, inboundHash string) (string, error) {
-	kp, err := f.keypairFor(reg.PoolAddress)
+func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, asset string) (string, error) {
+	kp, err := f.keypairFor(poolAddress)
 	if err != nil {
 		return "", err
 	}
@@ -119,7 +126,7 @@ func (f *Forwarder) submit(ctx context.Context, reg *store.Registration, amount,
 	// Fresh sequence number every attempt — a previous failed submission may have
 	// incremented the sequence on Horizon even if we got a timeout error back.
 	sourceAccount, err := f.horizon.AccountDetail(
-		horizonclient.AccountRequest{AccountID: reg.PoolAddress},
+		horizonclient.AccountRequest{AccountID: poolAddress},
 	)
 	if err != nil {
 		return "", fmt.Errorf("fetch pool account: %w", err)
@@ -133,10 +140,10 @@ func (f *Forwarder) submit(ctx context.Context, reg *store.Registration, amount,
 	// must be paid via the native XLM SAC's transfer function instead.
 	op, err := txnbuild.NewPaymentToContract(txnbuild.PaymentToContractParams{
 		NetworkPassphrase: f.config.NetworkPassphrase,
-		Destination:       reg.CAddress,
+		Destination:       cAddress,
 		Amount:            amount,
 		Asset:             txnbuild.NativeAsset{},
-		SourceAccount:     reg.PoolAddress,
+		SourceAccount:     poolAddress,
 	})
 	if err != nil {
 		return "", fmt.Errorf("build payment-to-contract: %w", err)

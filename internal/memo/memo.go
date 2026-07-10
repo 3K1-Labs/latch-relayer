@@ -1,7 +1,6 @@
 package memo
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"strconv"
@@ -10,9 +9,9 @@ import (
 )
 
 var (
-	ErrNotMemoID      = errors.New("memo type is not MEMO_ID")
-	ErrInvalidMemoID  = errors.New("memo value is not a valid uint64")
-	ErrInvalidAddress = errors.New("invalid Stellar G-address")
+	ErrNotMemoID       = errors.New("memo type is not MEMO_ID")
+	ErrInvalidMemoID   = errors.New("memo value is not a valid uint64")
+	ErrInvalidAddress  = errors.New("invalid Stellar G-address")
 	ErrInvalidCAddress = errors.New("invalid Soroban C-address")
 )
 
@@ -22,14 +21,6 @@ func ValidateCAddress(addr string) error {
 		return ErrInvalidCAddress
 	}
 	return nil
-}
-
-// DeriveID deterministically derives a uint64 memo ID from a Soroban C-address.
-// It takes the first 8 bytes of the SHA-256 hash of the address string.
-// The same C-address always produces the same memo ID — no DB needed to re-derive it.
-func DeriveID(cAddress string) uint64 {
-	hash := sha256.Sum256([]byte(cAddress))
-	return binary.BigEndian.Uint64(hash[:8])
 }
 
 // ParseID parses a memo ID from a Horizon payment event.

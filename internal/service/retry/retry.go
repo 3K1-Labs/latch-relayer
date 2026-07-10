@@ -38,8 +38,14 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
-// tick fetches all pending_retry rows and retries each one.
+// tick expires stale intents and retries any pending_retry forwards.
 func (w *Worker) tick(ctx context.Context) {
+	if n, err := w.store.ExpireStaleIntents(ctx); err != nil {
+		slog.Error("retry worker: expire stale intents", "err", err)
+	} else if n > 0 {
+		slog.Info("retry worker: expired stale intents", "count", n)
+	}
+
 	forwards, err := w.store.GetPendingRetries(ctx)
 	if err != nil {
 		slog.Error("retry worker: fetch pending retries", "err", err)
@@ -51,9 +57,7 @@ func (w *Worker) tick(ctx context.Context) {
 
 	slog.Info("retry worker: retrying", "count", len(forwards))
 	for _, fwd := range forwards {
-		// Each retry is synchronous inside the tick — we're already background.
-		// If the pool has concurrency issues under high load this can be goroutine-per-forward,
-		// but for now sequential is simpler and avoids sequence number conflicts.
+		// Sequential to avoid Stellar sequence number conflicts under load.
 		w.forwarder.Retry(ctx, fwd)
 	}
 }
