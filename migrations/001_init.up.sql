@@ -1,11 +1,22 @@
--- registrations: maps a C-address to its derived memo_id and pool account.
--- memo_id is stored as BIGINT (signed). Go casts uint64 ↔ int64 preserving bits.
-CREATE TABLE IF NOT EXISTS registrations (
-    memo_id      BIGINT      PRIMARY KEY,
-    c_address    TEXT        NOT NULL UNIQUE,
+-- intents: one row per funding session.
+-- memo_id is a random uint64 stored as BIGINT (Go casts uint64 ↔ int64, preserving bits).
+CREATE TABLE IF NOT EXISTS intents (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    memo_id      BIGINT      NOT NULL UNIQUE,
+    c_address    TEXT        NOT NULL,
     pool_address TEXT        NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    expected_amt TEXT,
+    expires_at   TIMESTAMPTZ NOT NULL,
+    status       TEXT        NOT NULL DEFAULT 'pending'
+                             CHECK (status IN ('pending', 'completed', 'expired', 'failed')),
+    external_id  TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS intents_memo_id_idx    ON intents (memo_id);
+CREATE INDEX IF NOT EXISTS intents_status_idx     ON intents (status);
+CREATE INDEX IF NOT EXISTS intents_expires_at_idx ON intents (expires_at);
 
 -- forwards: one row per inbound payment seen by the watcher.
 -- tx_hash is the idempotency key — ON CONFLICT DO NOTHING on insert.

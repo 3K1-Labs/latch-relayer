@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -17,12 +18,28 @@ const (
 	StatusPendingRetry = "pending_retry"
 )
 
-// Registration is a row from the registrations table.
-type Registration struct {
+// Status values for the intents table.
+const (
+	IntentPending   = "pending"
+	IntentCompleted = "completed"
+	IntentExpired   = "expired"
+	IntentFailed    = "failed"
+)
+
+// Intent is a row from the intents table.
+// Each represents one funding session: a unique memo_id that routes a deposit
+// to a specific C-address, valid until ExpiresAt.
+type Intent struct {
+	ID          string
 	MemoID      uint64
 	CAddress    string
 	PoolAddress string
+	ExpectedAmt *string
+	ExpiresAt   time.Time
+	Status      string
+	ExternalID  *string
 	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // Forward is a row from the forwards table.
@@ -51,35 +68,99 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-// ── Registrations ────────────────────────────────────────────────────────────
+// ── Intents ───────────────────────────────────────────────────────────────────
 
-// RegisterAccount inserts a new memo_id → c_address mapping.
-// Returns an error if the memo_id or c_address already exists.
-func (s *Store) RegisterAccount(ctx context.Context, memoID uint64, cAddress, poolAddress string) error {
+// CreateIntent generates a unique random memo_id and inserts an intent row.
+// Retries up to 5 times on memo_id collision (astronomically unlikely in practice).
+func (s *Store) CreateIntent(ctx context.Context, cAddress, poolAddress string, expectedAmt *string, expiresAt time.Time, externalID *string) (*Intent, error) {
+	for range 5 {
+		// rand.Int64 returns a non-negative int64 — safe to store in BIGINT and cast to uint64.
+		memoID := uint64(rand.Int64())
+
+		var id string
+		err := s.pool.QueryRow(ctx, `
+			INSERT INTO intents (memo_id, c_address, pool_address, expected_amt, expires_at, external_id)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (memo_id) DO NOTHING
+			RETURNING id
+		`, int64(memoID), cAddress, poolAddress, expectedAmt, expiresAt, externalID).Scan(&id)
+
+		if err == pgx.ErrNoRows {
+			continue // memo_id collision, regenerate
+		}
+		if err != nil {
+			return nil, fmt.Errorf("create intent: %w", err)
+		}
+
+		return &Intent{
+			ID:          id,
+			MemoID:      memoID,
+			CAddress:    cAddress,
+			PoolAddress: poolAddress,
+			ExpectedAmt: expectedAmt,
+			ExpiresAt:   expiresAt,
+			Status:      IntentPending,
+			ExternalID:  externalID,
+		}, nil
+	}
+	return nil, fmt.Errorf("create intent: could not generate unique memo_id")
+}
+
+// GetIntentByMemoID returns the intent for a given memo_id, or pgx.ErrNoRows.
+func (s *Store) GetIntentByMemoID(ctx context.Context, memoID uint64) (*Intent, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, memo_id, c_address, pool_address, expected_amt,
+		       expires_at, status, external_id, created_at, updated_at
+		FROM intents WHERE memo_id = $1
+	`, int64(memoID))
+
+	var i Intent
+	var rawID int64
+	if err := row.Scan(
+		&i.ID, &rawID, &i.CAddress, &i.PoolAddress, &i.ExpectedAmt,
+		&i.ExpiresAt, &i.Status, &i.ExternalID, &i.CreatedAt, &i.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	i.MemoID = uint64(rawID)
+	return &i, nil
+}
+
+// CompleteIntent marks a pending intent as completed (deposit forwarded successfully).
+func (s *Store) CompleteIntent(ctx context.Context, memoID uint64) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO registrations (memo_id, c_address, pool_address)
-		VALUES ($1, $2, $3)
-	`, int64(memoID), cAddress, poolAddress)
+		UPDATE intents SET status = $1, updated_at = NOW()
+		WHERE memo_id = $2 AND status = 'pending'
+	`, IntentCompleted, int64(memoID))
 	if err != nil {
-		return fmt.Errorf("register account: %w", err)
+		return fmt.Errorf("complete intent: %w", err)
 	}
 	return nil
 }
 
-// GetRegistration returns the registration for a given memo_id, or pgx.ErrNoRows.
-func (s *Store) GetRegistration(ctx context.Context, memoID uint64) (*Registration, error) {
-	row := s.pool.QueryRow(ctx, `
-		SELECT memo_id, c_address, pool_address, created_at
-		FROM registrations WHERE memo_id = $1
-	`, int64(memoID))
-
-	var r Registration
-	var rawID int64
-	if err := row.Scan(&rawID, &r.CAddress, &r.PoolAddress, &r.CreatedAt); err != nil {
-		return nil, err // pgx.ErrNoRows flows through as-is
+// FailIntent marks a pending intent as permanently failed (all retries exhausted).
+func (s *Store) FailIntent(ctx context.Context, memoID uint64) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE intents SET status = $1, updated_at = NOW()
+		WHERE memo_id = $2 AND status = 'pending'
+	`, IntentFailed, int64(memoID))
+	if err != nil {
+		return fmt.Errorf("fail intent: %w", err)
 	}
-	r.MemoID = uint64(rawID)
-	return &r, nil
+	return nil
+}
+
+// ExpireStaleIntents marks all pending intents past their expires_at as expired.
+// Called by the retry worker on each tick.
+func (s *Store) ExpireStaleIntents(ctx context.Context) (int64, error) {
+	result, err := s.pool.Exec(ctx, `
+		UPDATE intents SET status = 'expired', updated_at = NOW()
+		WHERE status = 'pending' AND expires_at < NOW()
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("expire stale intents: %w", err)
+	}
+	return result.RowsAffected(), nil
 }
 
 // ── Forwards ─────────────────────────────────────────────────────────────────
@@ -112,7 +193,6 @@ func (s *Store) MarkForwardDone(ctx context.Context, txHash, forwardTx string) e
 }
 
 // MarkForwardFailed sets the status and records the error message.
-// If retries < 3 the caller passes StatusPendingRetry; after 3 it passes StatusFailed.
 func (s *Store) MarkForwardFailed(ctx context.Context, txHash, status, errMsg string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE forwards
