@@ -1,0 +1,155 @@
+---
+description: Go coding standards for the Latch Relayer project
+globs:
+  - "**/*.go"
+alwaysApply: true
+---
+
+# Formatting
+
+- Format all code with `gofmt` / `goimports`. Never work around it — rearrange code instead.
+- Opening brace must be on the same line as the control structure, never the next line.
+- Tabs for indentation. No line length limit — wrap long lines with an extra tab if needed.
+
+# Naming
+
+- Package names: lowercase, single-word, no underscores or mixedCaps (e.g. `forwarder`, `store`, `memo`).
+- Exported names: `PascalCase`. Unexported names: `camelCase`. Constants: `SCREAMING_SNAKE_CASE`.
+- Multiword names use MixedCaps, never underscores (`txHash`, not `tx_hash`).
+- Getters: omit "Get" — use `Owner()` not `GetOwner()`. Setters use "Set": `SetOwner()`.
+- Constructors: `New(...)` returning a pointer to the struct.
+- Single-method interfaces: name = method + `-er` suffix (e.g. `Reader`, `Writer`, `Forwarder`).
+- Reuse canonical method names when semantics match: `Read`, `Write`, `Close`, `String`.
+
+# Commentary
+
+- Write comments only for *why*, never *what* — the code shows what.
+- All exported functions, types, and packages must have a doc comment. First sentence starts with the declared name.
+- No multi-line comment blocks for internal (unexported) code — one short line max.
+
+# Error Handling
+
+- Never ignore errors. Always check and either return or log them.
+- Return errors up the call stack with `fmt.Errorf("package: operation: %w", err)` — lowercase, colon-separated context, wrap with `%w` so callers can use `errors.Is`.
+- Error strings should identify their origin — prefix with the package or operation name.
+- Do not use `panic` in application code. Reserve it for truly unrecoverable programmer mistakes, never for runtime conditions.
+- `recover()` only in deferred functions. Use it to prevent a misbehaving goroutine from killing the whole process — log the panic and continue.
+- Sentinel errors live in `store` or the package that owns the concept; callers unwrap with `errors.Is` / `errors.As`.
+
+# Control Flow
+
+- Omit unnecessary `else` — if the `if` body ends with `return`, `break`, or `continue`, drop the `else` and let the success path continue down the page.
+  ```go
+  // correct
+  if err != nil {
+      return err
+  }
+  doNextThing()
+
+  // avoid
+  if err != nil {
+      return err
+  } else {
+      doNextThing()
+  }
+  ```
+- Guard against error conditions early (guard clauses at the top). The happy path reads linearly down the function.
+- Use short initialisation in `if` conditions to scope variables tightly: `if err := f(); err != nil { ... }`.
+- Use `range` for all iteration over slices, maps, strings, and channels. Do not use manual index loops unless the index itself is needed for non-trivial arithmetic.
+- Use `switch` instead of if-else-if chains. Cases are not fall-through by default.
+
+# Functions & Return Values
+
+- Use named return values when a function returns multiple values of the same type and naming them aids clarity.
+- Use `defer` for all guaranteed cleanup: closing files, releasing connections, unlocking mutexes. Defer runs even if the function panics.
+  ```go
+  f, err := os.Open(path)
+  if err != nil {
+      return err
+  }
+  defer f.Close()
+  ```
+- Multiple return values are idiomatic — prefer `(value, error)` over in-band sentinel values (e.g. -1 for "not found").
+
+# Data & Types
+
+- Design structs so the zero value is useful without additional initialisation where possible.
+- Use composite literals for initialisation: `&Forwarder{store: st, config: cfg}`. Missing fields get zero values.
+- Use `make` for slices, maps, and channels. Use `new` only when a zeroed pointer is specifically needed.
+- Implement `String() string` on types that need a human-readable representation — they then work automatically with `%v` in `fmt` calls.
+- Use pointer receivers if the method modifies the receiver or if the type is large. Use value receivers for small, immutable types.
+
+# Interfaces
+
+- Define interfaces at the point of use (in the package that needs the abstraction), not at the point of implementation.
+- Keep interfaces small — one or two methods is idiomatic. Large interfaces are hard to satisfy and test.
+- Embed types for composition, not inheritance. Methods of embedded types promote to the outer type automatically.
+
+# Logging
+
+- Use `log/slog` for all logging. Never use `fmt.Println`, `log.Printf`, or any other logger.
+- Always log with structured key-value pairs: `slog.Error("forwarder: insert failed", "tx_hash", txHash, "err", err)`.
+- Log prefix pattern: `"package: operation"` — matches error wrapping style so logs and errors are grep-able together.
+- Log levels: `slog.Error` for anything requiring attention, `slog.Warn` for expected degraded paths (unknown memo_id, sweep), `slog.Info` for lifecycle events (server start, watcher reconnect), `slog.Debug` for verbose tracing.
+
+# Concurrency
+
+- Do not communicate by sharing memory — share memory by communicating (via channels).
+- `context.Context` is always the first argument of functions that do I/O. Always propagate it; never discard it.
+- The watcher dispatches each payment to `forwarder.Forward` in a goroutine: `go f.Forward(ctx, ...)`.
+- Do not share mutable state across goroutines without synchronisation (`sync.Mutex` or channels).
+- Prefer buffered channels as semaphores to limit concurrency rather than spinning.
+
+# Package Layout
+
+- `cmd/serve/` — entry point only. Wire dependencies, start server. No business logic.
+- `internal/config/` — load and validate env vars. Config is read-only after startup.
+- `internal/db/` — pgxpool setup only.
+- `internal/store/` — all database queries. No business logic, no HTTP concerns.
+- `internal/handler/` — HTTP layer only. Parse request, call service or store, write response. No Stellar SDK calls.
+- `internal/service/forwarder/` — build, sign, simulate, and submit the outbound Soroban payment.
+- `internal/service/watcher/` — Horizon SSE listener. Detects inbound payments, dispatches to forwarder.
+- `internal/service/retry/` — background worker that retries `pending_retry` forwards.
+- `internal/memo/` — memo_id generation and validation logic.
+- `migrations/` — embed and apply SQL migrations at startup.
+- `scripts/` — standalone runnable scripts (e2e, keygen, sweep_test). Not imported by the main binary.
+
+# Dependency Injection
+
+- Dependencies flow down via struct fields, not package-level globals.
+- A struct only holds the dependencies it directly uses — do not pass the whole `Config` if only one field is needed.
+
+# HTTP Handlers
+
+- All handler methods live on `*Handler` and are registered in `RegisterRoutes`.
+- Write error responses with `Content-Type: application/json` and log the error before responding.
+- Decode request bodies with `json.NewDecoder(r.Body).Decode(&req)`.
+- Return 400 for client errors, 404 for not found, 500 for server errors. Never leak internal error messages in 500 responses.
+
+# Database
+
+- Use `pgx/v5` with `pgxpool`. Never use `database/sql`.
+- All queries use parameterised arguments (`$1`, `$2`). No string concatenation in SQL ever.
+- DB operations belong in `internal/store/`. Services call store methods by name — no inline SQL strings in service code.
+- Use `pgx.ErrNoRows` (not `sql.ErrNoRows`) to detect not-found conditions.
+
+# Imports
+
+- Group imports in three blocks separated by blank lines: stdlib, external packages, internal (`github.com/latch/relayer/...`).
+- Use blank identifier imports (`import _ "package"`) only for side-effect initialisation (e.g. registering drivers). Add a comment explaining why.
+- Never use dot imports (`import . "package"`) — it pollutes the namespace and makes the origin of names unclear.
+
+# Testing
+
+- Test files live next to the code they test (`_test.go` suffix). Same package for white-box tests, `_test` package suffix for black-box.
+- Tests must not require a live database or network unless they are integration tests in `scripts/`.
+- Use table-driven tests for functions with multiple input/output cases.
+- Test observable behaviour (return value, error type, DB state) — not implementation details.
+- Use blank identifier to explicitly discard unused return values when intent matters: `_, err := f()` is clearer than letting linter complain.
+
+# Stellar SDK
+
+- Use `github.com/stellar/go-stellar-sdk` (not the older `github.com/stellar/go` monorepo).
+- Network passphrase must come from `config.NetworkPassphrase` — never hardcode it.
+- Always simulate a Soroban transaction before submitting. Parse resource fees from the simulation response before building the final transaction.
+- Fee amounts are in stroops (1 XLM = 10,000,000 stroops). Use named constants, never magic numbers.

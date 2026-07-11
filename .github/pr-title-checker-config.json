@@ -1,0 +1,14 @@
+{
+  "LABEL": {
+    "name": "PR title needs attention",
+    "color": "EEEEEE"
+  },
+  "CHECKS": {
+    "regexp": "^(fix|feat|docs|chore|refactor|style|ci|revert|test)!?(\\(.*\\))?!?:.*"
+  },
+  "MESSAGES": {
+    "success": "PR title follows conventional commit format",
+    "failure": "PR title does not follow conventional commit format",
+    "notice": "Title must match: ^(fix|feat|docs|chore|refactor|style|ci|revert|test)!?(\\(.*\\))?!?:.*"
+  }
+}
