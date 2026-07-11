@@ -10,14 +10,19 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o latch-relayer ./cmd/serve
 
-# Runtime stage — minimal Alpine image (~10 MB total)
-FROM alpine:3.19
+# Runtime stage — minimal Alpine image
+FROM alpine:3.21
 
-RUN apk --no-cache add ca-certificates tzdata
+# ca-certificates: needed for TLS calls to Horizon and Stellar RPC
+RUN apk add --no-cache ca-certificates
+
+# Run as non-root — principle of least privilege
+RUN addgroup -S nonroot && adduser -S nonroot -G nonroot
+USER nonroot
 
 WORKDIR /app
-COPY --from=builder /app/latch-relayer .
+COPY --from=builder --chown=nonroot:nonroot /app/latch-relayer .
 
 EXPOSE 4000
 
-ENTRYPOINT ["./latch-relayer"]
+ENTRYPOINT ["/app/latch-relayer"]
