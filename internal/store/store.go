@@ -192,7 +192,8 @@ func (s *Store) MarkForwardDone(ctx context.Context, txHash, forwardTx string) e
 	return nil
 }
 
-// MarkForwardFailed sets the status and records the error message.
+// MarkForwardFailed sets the status and records the error message, incrementing retries.
+// Use for transient failures that should go back into pending_retry.
 func (s *Store) MarkForwardFailed(ctx context.Context, txHash, status, errMsg string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE forwards
@@ -201,6 +202,21 @@ func (s *Store) MarkForwardFailed(ctx context.Context, txHash, status, errMsg st
 	`, status, errMsg, txHash)
 	if err != nil {
 		return fmt.Errorf("mark forward failed: %w", err)
+	}
+	return nil
+}
+
+// PermanentlyFail marks a forward as permanently failed without incrementing retries.
+// Use when the retry ceiling is hit or a permanent error is detected, so the final
+// error message is recorded cleanly without inflating the counter.
+func (s *Store) PermanentlyFail(ctx context.Context, txHash, errMsg string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE forwards
+		SET status = 'failed', error = $1, updated_at = NOW()
+		WHERE tx_hash = $2
+	`, errMsg, txHash)
+	if err != nil {
+		return fmt.Errorf("permanently fail forward: %w", err)
 	}
 	return nil
 }
@@ -220,14 +236,20 @@ func (s *Store) GetForwardByMemoID(ctx context.Context, memoID uint64) ([]Forwar
 	return scanForwards(rows)
 }
 
-// GetPendingRetries returns all forwards that need to be retried by the background worker.
+// GetPendingRetries returns all forwards the background worker should attempt.
+// This covers two cases:
+//   - pending_retry: explicit retry queue after Forward() exhausted its in-process attempts
+//   - pending older than 5 minutes: crash-recovery for forwards whose goroutine was killed
+//     before submit() ran, leaving the row stuck in the initial pending state (Gap 5)
 func (s *Store) GetPendingRetries(ctx context.Context) ([]Forward, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, tx_hash, memo_id, from_address, amount, asset,
 		       forward_tx, status, retries, error, created_at, updated_at
-		FROM forwards WHERE status = $1
+		FROM forwards
+		WHERE status = 'pending_retry'
+		   OR (status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes')
 		ORDER BY created_at ASC
-	`, StatusPendingRetry)
+	`)
 	if err != nil {
 		return nil, fmt.Errorf("get pending retries: %w", err)
 	}
