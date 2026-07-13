@@ -1,4 +1,18 @@
+# Secrets
 .env
 *.env
+
+# macOS
 .DS_Store
+
+# Go build output — prevent accidentally committing compiled binaries
+/latch-relayer
+/sweep_test
+/e2e_test
+
+# Test coverage output
+*.out
+coverage.out
+
+# Local directories not for version control
 learning/

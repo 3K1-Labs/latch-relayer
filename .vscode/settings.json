@@ -1,0 +1,15 @@
+{
+  "[go]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "golang.go",
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    }
+  },
+  "go.lintTool": "golangci-lint",
+  "go.lintOnSave": "package",
+  "go.vetOnSave": "package",
+  "go.testFlags": ["-v", "-count=1"],
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true
+}
