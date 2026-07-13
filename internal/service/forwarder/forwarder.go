@@ -11,6 +11,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	"github.com/stellar/go-stellar-sdk/keypair"
+	hProtocol "github.com/stellar/go-stellar-sdk/protocols/horizon"
 	rpcprotocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -18,6 +19,31 @@ import (
 	"github.com/latch/relayer/internal/config"
 	"github.com/latch/relayer/internal/store"
 )
+
+// forwardStore is the subset of store.Store that Forwarder calls.
+// Narrow interface keeps test mocks small.
+type forwardStore interface {
+	InsertForward(ctx context.Context, txHash string, memoID uint64, fromAddress, amount, asset string) error
+	GetIntentByMemoID(ctx context.Context, memoID uint64) (*store.Intent, error)
+	MarkForwardDone(ctx context.Context, txHash, forwardTx string) error
+	CompleteIntent(ctx context.Context, memoID uint64) error
+	MarkForwardFailed(ctx context.Context, txHash, status, errMsg string) error
+	PermanentlyFail(ctx context.Context, txHash, errMsg string) error
+	FailIntent(ctx context.Context, memoID uint64) error
+}
+
+// horizonClient is the subset of horizonclient.Client used by Forwarder.
+type horizonClient interface {
+	AccountDetail(request horizonclient.AccountRequest) (hProtocol.Account, error)
+	SubmitTransaction(transaction *txnbuild.Transaction) (hProtocol.Transaction, error)
+}
+
+// rpcClient is the subset of rpcclient.Client used by Forwarder.
+type rpcClient interface {
+	SimulateTransaction(ctx context.Context, request rpcprotocol.SimulateTransactionRequest) (rpcprotocol.SimulateTransactionResponse, error)
+	SendTransaction(ctx context.Context, request rpcprotocol.SendTransactionRequest) (rpcprotocol.SendTransactionResponse, error)
+	PollTransaction(ctx context.Context, txHash string) (rpcprotocol.GetTransactionResponse, error)
+}
 
 const (
 	// maxRetries is the ceiling of MarkForwardFailed calls before permanent failure.
@@ -44,10 +70,10 @@ const (
 
 // Forwarder builds, signs, and submits the outbound payment for each inbound deposit.
 type Forwarder struct {
-	store   *store.Store
+	store   forwardStore
 	config  *config.Config
-	horizon *horizonclient.Client
-	rpc     *rpcclient.Client
+	horizon horizonClient
+	rpc     rpcClient
 }
 
 func New(st *store.Store, cfg *config.Config, hz *horizonclient.Client, rpc *rpcclient.Client) *Forwarder {
