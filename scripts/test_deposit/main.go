@@ -41,7 +41,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("fetch account: %v", err)
 	}
-	fmt.Printf("Depositor sequence: %s\n", sourceAccount.Sequence)
+	fmt.Printf("Depositor sequence: %d\n", sourceAccount.Sequence)
 
 	// ── 4. Build the transaction ─────────────────────────────────────────────
 	tx, err := txnbuild.NewTransaction(
