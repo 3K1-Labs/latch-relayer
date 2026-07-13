@@ -257,6 +257,11 @@ func (s *Store) GetPendingRetries(ctx context.Context) ([]Forward, error) {
 	return scanForwards(rows)
 }
 
+// Ping checks that the DB connection is alive. Used by the health endpoint.
+func (s *Store) Ping(ctx context.Context) error {
+	return s.pool.Ping(ctx)
+}
+
 // ── Cursors ──────────────────────────────────────────────────────────────────
 
 // GetCursor returns the last saved Horizon SSE cursor for a pool address.

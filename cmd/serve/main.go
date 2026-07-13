@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -55,8 +56,21 @@ func main() {
 
 	// ── 4. Core services ──────────────────────────────────────────────────────
 	st := store.New(pool)
-	hz := &horizonclient.Client{HorizonURL: cfg.HorizonURL}
-	rpc := rpcclient.NewClient(cfg.RPCURL, nil)
+
+	// Shared HTTP client with explicit timeouts for all outbound Stellar calls.
+	// OZ constants: connect 2s, request 10s, keep-alive 30s.
+	stellarHTTP := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   2 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		},
+	}
+
+	hz := &horizonclient.Client{HorizonURL: cfg.HorizonURL, HTTP: stellarHTTP}
+	rpc := rpcclient.NewClient(cfg.RPCURL, stellarHTTP)
 	defer rpc.Close()
 	fwd := forwarder.New(st, cfg, hz, rpc)
 
