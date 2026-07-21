@@ -59,14 +59,15 @@ func main() {
 
 	// Shared HTTP client with explicit timeouts for all outbound Stellar calls.
 	// OZ constants: connect 2s, request 10s, keep-alive 30s.
+	stellarTransport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   2 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
 	stellarHTTP := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   2 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-		},
+		Timeout:   10 * time.Second,
+		Transport: stellarTransport,
 	}
 
 	hz := &horizonclient.Client{HorizonURL: cfg.HorizonURL, HTTP: stellarHTTP}
@@ -74,13 +75,23 @@ func main() {
 	defer rpc.Close()
 	fwd := forwarder.New(st, cfg, hz, rpc)
 
+	// Horizon's SSE stream is long-lived and idles between payments, so it can't
+	// share stellarHTTP's 10s Timeout — that applies to the whole request,
+	// including reading the streaming body, and would abort a healthy stream
+	// after 10s of inactivity. Reuse the transport (dial/keep-alive settings)
+	// but rely on ctx cancellation, not a fixed deadline, to bound the stream.
+	hzStream := &horizonclient.Client{
+		HorizonURL: cfg.HorizonURL,
+		HTTP:       &http.Client{Transport: stellarTransport},
+	}
+
 	// ── 5. Background workers ─────────────────────────────────────────────────
 	// Retry worker polls every 30s for pending_retry forwards.
 	go retry.NewWorker(st, fwd, 30*time.Second).Run(ctx)
 
 	// One SSE watcher goroutine per pool address.
 	for _, pa := range cfg.PoolAccounts {
-		go watcher.New(pa, st, fwd, hz).Run(ctx)
+		go watcher.New(pa, st, fwd, hzStream).Run(ctx)
 	}
 
 	// ── 6. HTTP server ────────────────────────────────────────────────────────
