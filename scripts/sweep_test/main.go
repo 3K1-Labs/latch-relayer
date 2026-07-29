@@ -69,10 +69,11 @@ func main() {
 	poolAddress := intentResp.PoolAddress
 	fmt.Printf("  ✓ pool_address: %s\n\n", poolAddress)
 
-	// ── Case 1: MEMO_TEXT (wrong memo type) ───────────────────────────────────
-	// The watcher calls ParseID → ErrNotMemoID → forwarder.Forward(..., memoID=0)
+	// ── Case 1: non-numeric MEMO_TEXT ─────────────────────────────────────────
+	// A numeric MEMO_TEXT is a valid tag, so this case uses a non-numeric one:
+	// ParseID → ErrInvalidMemoID → forwarder.Forward(..., memoID=0)
 	// → GetIntentByMemoID(0) → no rows → sweep + mark forward failed.
-	fmt.Println("Step 2: Sending deposit with MEMO_TEXT \"sweep-test\" (wrong memo type)...")
+	fmt.Println("Step 2: Sending deposit with MEMO_TEXT \"sweep-test\" (non-numeric)...")
 	acc1, err := client.AccountDetail(horizonclient.AccountRequest{AccountID: depositor.Address()})
 	if err != nil {
 		log.Fatalf("fetch account: %v", err)
@@ -83,8 +84,8 @@ func main() {
 		Operations: []txnbuild.Operation{
 			&txnbuild.Payment{Destination: poolAddress, Amount: depositAmount, Asset: txnbuild.NativeAsset{}},
 		},
-		Memo:    txnbuild.MemoText("sweep-test"),
-		BaseFee: txnbuild.MinBaseFee,
+		Memo:          txnbuild.MemoText("sweep-test"),
+		BaseFee:       txnbuild.MinBaseFee,
 		Preconditions: txnbuild.Preconditions{TimeBounds: txnbuild.NewTimeout(300)},
 	})
 	if err != nil {
@@ -116,8 +117,8 @@ func main() {
 		Operations: []txnbuild.Operation{
 			&txnbuild.Payment{Destination: poolAddress, Amount: depositAmount, Asset: txnbuild.NativeAsset{}},
 		},
-		Memo:    txnbuild.MemoID(unknownMemoID),
-		BaseFee: txnbuild.MinBaseFee,
+		Memo:          txnbuild.MemoID(unknownMemoID),
+		BaseFee:       txnbuild.MinBaseFee,
 		Preconditions: txnbuild.Preconditions{TimeBounds: txnbuild.NewTimeout(300)},
 	})
 	if err != nil {
@@ -141,7 +142,7 @@ func main() {
 
 	// ── Check both forward records in the DB ──────────────────────────────────
 	fmt.Println("Step 5: Verifying forward records in DB...")
-	ok1 := checkForward(ctx, dbPool, txHash1, "MEMO_TEXT (wrong type)")
+	ok1 := checkForward(ctx, dbPool, txHash1, "MEMO_TEXT (non-numeric)")
 	ok2 := checkForward(ctx, dbPool, txHash2, fmt.Sprintf("unknown MEMO_ID %d", unknownMemoID))
 
 	fmt.Println()

@@ -119,11 +119,21 @@ SSE stream → dispatch goroutine (non-blocking)
             failure: mark forward failed + intent failed
 ```
 
+### Accepted Memo Types
+`memo.ParseID` accepts **both `MEMO_ID` and `MEMO_TEXT`**, provided the value parses as a `uint64`.
+
+Text is accepted because on-ramps and wallet UIs routinely send the tag as text even when the digits are a valid uint64 — MoonPay documents the XLM tag only as "alpha-numeric" — and a memo refused here is swept to recovery instead of credited to the depositor. The same applies to a human picking "Text" rather than "ID" in their sending wallet, which is the likeliest way a real deposit is lost.
+
+Verified: Horizon renders a text memo as the raw UTF-8 string in `memo` (the base64 form is a separate `memo_bytes` field), so the digits reach `ParseUint` verbatim. Memo IDs are random uint64s, so a text memo colliding with a live intent is not a realistic concern.
+
+`hash` and `return` memos are still rejected — those are binary, and treating base64 as a tag would be meaningless.
+
 ### Missing / Invalid Memo Handling
-- No memo or wrong type (not `MEMO_ID`) → sweep to recovery G-address
+- No memo, or a `hash`/`return` memo → sweep to recovery G-address (`ErrUnsupportedMemoType`)
+- `id`/`text` memo whose value is not a `uint64` → sweep to recovery (`ErrInvalidMemoID`)
 - Unknown `memo_id` (not in intents table) → sweep to recovery
 - Expired intent → sweep to recovery
-- All three cases logged in `forwards` table with status `failed`
+- All cases logged in `forwards` table with status `failed`
 
 ### Architecture Split
 - **Relayer** owns the deposit hot path: Horizon SSE → memo parse → intent lookup → forward

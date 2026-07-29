@@ -93,7 +93,7 @@ func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
 	}
 	tx := payment.Transaction
 
-	// Parse the memo — must be MEMO_ID type.
+	// Parse the memo — MEMO_ID or a numeric MEMO_TEXT.
 	memoID, err := memo.ParseID(tx.MemoType, tx.Memo)
 	if err != nil {
 		// No memo or wrong type — sweep to recovery via the forwarder.
