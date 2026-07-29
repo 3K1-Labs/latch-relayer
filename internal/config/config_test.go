@@ -13,6 +13,7 @@ func validEnv(t *testing.T) {
 	t.Setenv("RECOVERY_ADDRESS", "GBXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
 	t.Setenv("POOL_ADDRESS_1", "GB3AETG6Q5SYNM36TPHULYXPP364EC77YJJBDMNKDA5CF4QYP3XHJ6I5")
 	t.Setenv("POOL_PRIVATE_KEY_1", "SDUCBCFL3QJXQM4EGZWW7UUJYEDLXD3OYXJ3JAA3VPNNOINFLPT6R7G6")
+	t.Setenv("RELAYER_API_KEY", "0123456789abcdef0123456789abcdef")
 }
 
 func TestLoad_Success(t *testing.T) {
@@ -51,6 +52,28 @@ func TestLoad_MissingRecoveryAddress(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Fatal("expected error for missing RECOVERY_ADDRESS")
+	}
+}
+
+// The relayer must refuse to start without a key rather than fall back to
+// serving unauthenticated — that fallback is how it ends up publicly mintable.
+func TestLoad_MissingAPIKey(t *testing.T) {
+	validEnv(t)
+	t.Setenv("RELAYER_API_KEY", "")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for missing RELAYER_API_KEY")
+	}
+}
+
+func TestLoad_ShortAPIKey(t *testing.T) {
+	validEnv(t)
+	t.Setenv("RELAYER_API_KEY", "too-short")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for a RELAYER_API_KEY under 32 characters")
 	}
 }
 

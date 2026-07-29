@@ -96,11 +96,14 @@ func main() {
 
 	// ── 6. HTTP server ────────────────────────────────────────────────────────
 	mux := http.NewServeMux()
-	handler.New(st, cfg).RegisterRoutes(mux)
+	h := handler.New(st, cfg)
+	h.RegisterRoutes(mux)
 
 	srv := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      mux,
+		Addr: ":" + cfg.Port,
+		// Auth wraps the whole mux rather than individual routes, so a route added
+		// later is authenticated by default instead of by remembering to opt in.
+		Handler:      h.RequireAPIKey(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,6 +66,7 @@ type permanentlyFailCall struct{ txHash, errMsg string }
 
 type mockStore struct {
 	insertErr    error
+	insertDup    bool // InsertForward reports the row already existed
 	intent       *store.Intent
 	intentErr    error
 
@@ -75,8 +77,11 @@ type mockStore struct {
 	failIntentCalls     []uint64
 }
 
-func (m *mockStore) InsertForward(_ context.Context, _ string, _ uint64, _, _, _ string) error {
-	return m.insertErr
+func (m *mockStore) InsertForward(_ context.Context, _ string, _ uint64, _, _, _ string) (bool, error) {
+	if m.insertErr != nil {
+		return false, m.insertErr
+	}
+	return !m.insertDup, nil
 }
 func (m *mockStore) GetIntentByMemoID(_ context.Context, _ uint64) (*store.Intent, error) {
 	return m.intent, m.intentErr
@@ -407,6 +412,118 @@ func TestForward_expiredIntent(t *testing.T) {
 	c := st.markFailedCalls[0]
 	if c.status != store.StatusFailed {
 		t.Errorf("want StatusFailed, got %q", c.status)
+	}
+}
+
+// A replayed SSE event (crash before the cursor was saved, or a second instance
+// on the same pool) must not pay the C-address twice for one deposit.
+func TestForward_duplicateTxHash(t *testing.T) {
+	kp := newTestKeypair(t)
+	st := &mockStore{insertDup: true, intent: testIntent(kp.Address())}
+	hz := &mockHorizon{account: hProtocol.Account{AccountID: kp.Address(), Sequence: 100}}
+	f := &Forwarder{
+		store:   st,
+		config:  testConfigWithKeypair(t, kp),
+		horizon: hz,
+		rpc:     successRPC(t, "out-dup"),
+	}
+
+	f.Forward(context.Background(), "in-dup", 1, "GABC", "10.0000000", "native")
+
+	if len(st.doneCalls) != 0 || len(st.completeIntentCalls) != 0 {
+		t.Errorf("duplicate tx_hash was forwarded again: done=%v complete=%v",
+			st.doneCalls, st.completeIntentCalls)
+	}
+	// Skipping is not a failure — the first dispatch owns this row's outcome.
+	if len(st.markFailedCalls) != 0 || len(st.permFailCalls) != 0 {
+		t.Errorf("duplicate tx_hash should be skipped silently: failed=%v perm=%v",
+			st.markFailedCalls, st.permFailCalls)
+	}
+}
+
+// The intent's TTL has elapsed but the retry worker has not ticked yet, so the
+// status is still 'pending'. Crediting must not depend on that worker's timing.
+func TestForward_intentPastExpiryButStillPending(t *testing.T) {
+	st := &mockStore{intent: &store.Intent{
+		MemoID:    77,
+		CAddress:  testCAddress,
+		Status:    store.IntentPending,
+		ExpiresAt: time.Now().Add(-1 * time.Minute),
+	}}
+	f := &Forwarder{store: st, config: testConfig(t), horizon: &mockHorizon{}, rpc: &mockRPC{}}
+
+	f.Forward(context.Background(), "in-late", 77, "GABC", "5.0", "native")
+
+	if len(st.doneCalls) != 0 {
+		t.Errorf("deposit past expires_at was credited: %v", st.doneCalls)
+	}
+	if len(st.markFailedCalls) != 1 {
+		t.Fatalf("want 1 MarkForwardFailed, got %d", len(st.markFailedCalls))
+	}
+	c := st.markFailedCalls[0]
+	if c.status != store.StatusFailed {
+		t.Errorf("status = %q, want StatusFailed", c.status)
+	}
+	// Assert the reason, not just the status: falling through to submit() also
+	// fails this forward, so a status-only check passes even without the guard.
+	if !strings.Contains(c.errMsg, "intent expired") {
+		t.Errorf("errMsg = %q, want the expiry sweep reason", c.errMsg)
+	}
+}
+
+func TestMismatchesExpected(t *testing.T) {
+	cases := []struct {
+		name              string
+		expected, received string
+		want              bool
+	}{
+		{"exact match", "10.0000000", "10.0000000", false},
+		{"within tolerance — provider fee", "10.0000000", "9.6000000", false},
+		{"at the tolerance edge", "10.0000000", "9.5000000", false},
+		{"short by half", "10.0000000", "5.0000000", true},
+		{"double", "10.0000000", "20.0000000", true},
+		// expected_amt is free-form; an unusable value is a caller bug, and must
+		// not be reported as a suspicious deposit.
+		{"unparseable expected", "fifty dollars", "10.0000000", false},
+		{"empty expected", "", "10.0000000", false},
+		{"zero expected", "0", "10.0000000", false},
+		{"unparseable received", "10.0000000", "", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mismatchesExpected(tc.expected, tc.received); got != tc.want {
+				t.Errorf("mismatchesExpected(%q, %q) = %v, want %v",
+					tc.expected, tc.received, got, tc.want)
+			}
+		})
+	}
+}
+
+// A deposit that misses expected_amt is still the user's money and still gets
+// credited — the mismatch is logged, never enforced.
+func TestForward_amountMismatchStillCredits(t *testing.T) {
+	kp := newTestKeypair(t)
+	intent := testIntent(kp.Address())
+	expected := "100.0000000"
+	intent.ExpectedAmt = &expected
+
+	st := &mockStore{intent: intent}
+	hz := &mockHorizon{account: hProtocol.Account{AccountID: kp.Address(), Sequence: 100}}
+	f := &Forwarder{
+		store:   st,
+		config:  testConfigWithKeypair(t, kp),
+		horizon: hz,
+		rpc:     successRPC(t, "out-mismatch"),
+	}
+
+	f.Forward(context.Background(), "in-mismatch", 1, "GABC", "10.0000000", "native")
+
+	if len(st.doneCalls) != 1 {
+		t.Fatalf("want the deposit credited despite the mismatch, got %d done calls", len(st.doneCalls))
+	}
+	if len(st.markFailedCalls) != 0 {
+		t.Errorf("amount mismatch must not fail the forward: %v", st.markFailedCalls)
 	}
 }
 

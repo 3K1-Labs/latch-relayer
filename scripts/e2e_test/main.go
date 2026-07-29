@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -32,7 +33,7 @@ func main() {
 	// ── 1. Create a funding intent ───────────────────────────────────────────
 	fmt.Printf("Step 1: Create intent for C-address %s\n", cAddress)
 	intentBody := fmt.Sprintf(`{"c_address":"%s","expected_amt":"%s","expires_in":3600}`, cAddress, depositAmount)
-	resp, err := http.Post(relayerURL+"/intents", "application/json", strings.NewReader(intentBody))
+	resp, err := relayerPost(relayerURL+"/intents", intentBody)
 	if err != nil {
 		log.Fatalf("POST /intents: %v", err)
 	}
@@ -106,7 +107,7 @@ func main() {
 	for attempt := 1; attempt <= 12; attempt++ {
 		time.Sleep(5 * time.Second)
 
-		statusResp, err := http.Get(statusURL)
+		statusResp, err := relayerGet(statusURL)
 		if err != nil {
 			fmt.Printf("  [%ds] poll error: %v\n", attempt*5, err)
 			continue
@@ -154,4 +155,35 @@ func main() {
 	}
 
 	log.Fatal("timed out waiting for intent to complete (60s)")
+}
+
+// ── Relayer HTTP helpers ──────────────────────────────────────────────────────
+//
+// Every route but /health requires the shared secret, so this script needs
+// RELAYER_API_KEY set to the same value the server was started with.
+
+func relayerAuth(req *http.Request) *http.Request {
+	key := os.Getenv("RELAYER_API_KEY")
+	if key == "" {
+		log.Fatal("RELAYER_API_KEY is not set — the relayer will reject every request")
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	return req
+}
+
+func relayerPost(url, body string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return http.DefaultClient.Do(relayerAuth(req))
+}
+
+func relayerGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return http.DefaultClient.Do(relayerAuth(req))
 }

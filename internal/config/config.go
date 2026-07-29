@@ -34,6 +34,11 @@ type Config struct {
 
 	// HTTP server
 	Port string
+
+	// Shared secret every caller but /health must present as a bearer token.
+	// latch-api is the only intended caller — this is service-to-service, not a
+	// user credential.
+	APIKey string
 }
 
 // Load reads environment variables (and an optional .env file), validates all
@@ -48,6 +53,7 @@ func Load() (*Config, error) {
 		RecoveryAddress: os.Getenv("RECOVERY_ADDRESS"),
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		Port:            getEnv("PORT", "4000"),
+		APIKey:          os.Getenv("RELAYER_API_KEY"),
 	}
 
 	// Set network passphrase from NETWORK env var
@@ -64,6 +70,11 @@ func Load() (*Config, error) {
 	}
 	if cfg.RecoveryAddress == "" {
 		return nil, errors.New("RECOVERY_ADDRESS is required")
+	}
+	// Fail closed. Defaulting to "no auth" when the var is unset is how an
+	// internal service ends up publicly mintable after one bad deploy.
+	if len(cfg.APIKey) < 32 {
+		return nil, errors.New("RELAYER_API_KEY is required and must be at least 32 characters")
 	}
 
 	// Load pool accounts — indexed as POOL_ADDRESS_1 / POOL_PRIVATE_KEY_1, etc.
