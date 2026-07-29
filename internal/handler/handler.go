@@ -30,6 +30,7 @@ func New(st *store.Store, cfg *config.Config) *Handler {
 // RegisterRoutes wires all routes onto mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /intents", h.CreateIntent)
+	mux.HandleFunc("PATCH /intents/{memo_id}", h.SetExternalID)
 	mux.HandleFunc("GET /deposit/status/{memo_id}", h.DepositStatus)
 	mux.HandleFunc("GET /health", h.Health)
 }
@@ -51,13 +52,23 @@ type createIntentResponse struct {
 }
 
 type depositStatusResponse struct {
-	IntentID    string          `json:"intent_id"`
-	MemoID      string          `json:"memo_id"`
-	CAddress    string          `json:"c_address"`
-	PoolAddress string          `json:"pool_address"`
-	Status      string          `json:"status"`
-	ExpiresAt   string          `json:"expires_at"`
+	IntentID    string `json:"intent_id"`
+	MemoID      string `json:"memo_id"`
+	CAddress    string `json:"c_address"`
+	PoolAddress string `json:"pool_address"`
+	Status      string `json:"status"`
+	ExpiresAt   string `json:"expires_at"`
+	// Reconciliation fields. Both are advisory and may be null: expected_amt is
+	// whatever the caller quoted at mint time, external_id is attached later via
+	// PATCH. Surfaced so support can compare them against the forwards below
+	// without a database session.
+	ExpectedAmt *string          `json:"expected_amt"`
+	ExternalID  *string          `json:"external_id"`
 	Forwards    []forwardSummary `json:"forwards"`
+}
+
+type setExternalIDRequest struct {
+	ExternalID string `json:"external_id"`
 }
 
 type forwardSummary struct {
@@ -188,7 +199,56 @@ func (h *Handler) DepositStatus(w http.ResponseWriter, r *http.Request) {
 		PoolAddress: intent.PoolAddress,
 		Status:      intent.Status,
 		ExpiresAt:   intent.ExpiresAt.UTC().Format(time.RFC3339),
+		ExpectedAmt: intent.ExpectedAmt,
+		ExternalID:  intent.ExternalID,
 		Forwards:    summaries,
+	})
+}
+
+// SetExternalID binds an on-ramp provider's order ID to an existing intent.
+//
+// Split from CreateIntent because the ID does not exist yet at mint time: MoonPay
+// issues one only after the user completes checkout. The webhook receiver calls
+// this to close the loop between our memo and the provider's order.
+//
+//	PATCH /intents/{memo_id}
+//	{ "external_id": "moonpay-tx-uuid" }
+//	→ 200 { "memo_id": "...", "external_id": "..." }
+//	→ 409 when the intent is already bound to a different order
+func (h *Handler) SetExternalID(w http.ResponseWriter, r *http.Request) {
+	memoID, err := strconv.ParseUint(r.PathValue("memo_id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "memo_id must be a valid integer")
+		return
+	}
+
+	var req setExternalIDRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.ExternalID == "" {
+		writeError(w, http.StatusBadRequest, "external_id is required")
+		return
+	}
+
+	switch err := h.store.SetIntentExternalID(r.Context(), memoID, req.ExternalID); {
+	case err == nil:
+	case errors.Is(err, pgx.ErrNoRows):
+		writeError(w, http.StatusNotFound, "memo_id not found")
+		return
+	case errors.Is(err, store.ErrExternalIDConflict):
+		writeError(w, http.StatusConflict, "intent is already bound to a different external_id")
+		return
+	default:
+		slog.Error("set external_id", "memo_id", memoID, "err", err)
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"memo_id":     strconv.FormatUint(memoID, 10),
+		"external_id": req.ExternalID,
 	})
 }
 
