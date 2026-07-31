@@ -17,17 +17,26 @@ import (
 )
 
 const (
-	relayerURL    = "http://localhost:4000"
-	depositorSeed = "SAHTDBI4OCTAP6XAVG3F5FDYEX5S36DXMT36LRIUAZQPWKANX4ETLA2A"
-	cAddress      = "CCOX4AG3XESDAZC7L27AMQZ6KKMUWEU2KCHFXJ2PXNAXMDUCL225MN2P"
-	depositAmount = "5"
+	defaultRelayerURL    = "http://localhost:4000"
+	defaultDepositorSeed = "SAHTDBI4OCTAP6XAVG3F5FDYEX5S36DXMT36LRIUAZQPWKANX4ETLA2A"
+	defaultCAddress      = "CCOX4AG3XESDAZC7L27AMQZ6KKMUWEU2KCHFXJ2PXNAXMDUCL225MN2P"
+	defaultDepositAmount = "5"
 )
 
 func main() {
+	relayerURL := envOrDefault("RELAYER_URL", defaultRelayerURL)
+	depositorSeed := envOrDefault("DEPOSITOR_SEED", defaultDepositorSeed)
+	cAddress := envOrDefault("C_ADDRESS", defaultCAddress)
+	depositAmount := envOrDefault("DEPOSIT_AMOUNT", defaultDepositAmount)
+
 	client := horizonclient.DefaultTestNetClient
-	depositor, _ := keypair.ParseFull(depositorSeed)
+	depositor, err := keypair.ParseFull(depositorSeed)
+	if err != nil {
+		log.Fatalf("parse DEPOSITOR_SEED: %v", err)
+	}
 
 	fmt.Println("=== Latch Relayer — End-to-End Testnet Test ===")
+	fmt.Printf("Relayer URL: %s\n", relayerURL)
 	fmt.Println()
 
 	// ── 1. Create a funding intent ───────────────────────────────────────────
@@ -39,6 +48,9 @@ func main() {
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated {
+		log.Fatalf("POST /intents returned %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+	}
 
 	var intentResp struct {
 		IntentID    string `json:"intent_id"`
@@ -114,6 +126,10 @@ func main() {
 		}
 		body, _ := io.ReadAll(statusResp.Body)
 		statusResp.Body.Close()
+		if statusResp.StatusCode != http.StatusOK {
+			fmt.Printf("  [%ds] status returned %s: %s\n", attempt*5, statusResp.Status, strings.TrimSpace(string(body)))
+			continue
+		}
 
 		var status struct {
 			IntentID string `json:"intent_id"`
@@ -142,7 +158,9 @@ func main() {
 			fmt.Println("=== ✅ END-TO-END SUCCESS ===")
 			fmt.Printf("  Intent ID:    %s\n", status.IntentID)
 			fmt.Printf("  Deposit tx:   %s\n", fwd.TxHash)
-			fmt.Printf("  Forward tx:   %s\n", *fwd.ForwardTx)
+			if fwd.ForwardTx != nil {
+				fmt.Printf("  Forward tx:   %s\n", *fwd.ForwardTx)
+			}
 			fmt.Printf("  Amount:       %s XLM\n", fwd.Amount)
 			fmt.Printf("  C-address:    %s\n", status.CAddress)
 			fmt.Printf("  Memo ID:      %s\n", status.MemoID)
@@ -186,4 +204,10 @@ func relayerGet(url string) (*http.Response, error) {
 		return nil, err
 	}
 	return http.DefaultClient.Do(relayerAuth(req))
+}
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
