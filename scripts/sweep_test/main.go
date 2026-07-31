@@ -51,7 +51,7 @@ func main() {
 	// ── Get pool address from a throwaway intent ──────────────────────────────
 	fmt.Println("Step 1: Fetching pool address from relayer...")
 	body := fmt.Sprintf(`{"c_address":"%s","expires_in":60}`, cAddress)
-	resp, err := http.Post(relayerURL+"/intents", "application/json", strings.NewReader(body))
+	resp, err := relayerPost(relayerURL+"/intents", body)
 	if err != nil {
 		log.Fatalf("POST /intents: %v", err)
 	}
@@ -173,4 +173,20 @@ func checkForward(ctx context.Context, pool *pgxpool.Pool, txHash, label string)
 	}
 	fmt.Printf("  ✓ [%s] status=failed, error=%q\n", label, errStr)
 	return true
+}
+
+// relayerPost posts to the relayer with the shared secret every route but
+// /health now requires. RELAYER_API_KEY must match the running server's.
+func relayerPost(url, body string) (*http.Response, error) {
+	key := os.Getenv("RELAYER_API_KEY")
+	if key == "" {
+		log.Fatal("RELAYER_API_KEY is not set — the relayer will reject every request")
+	}
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+key)
+	return http.DefaultClient.Do(req)
 }

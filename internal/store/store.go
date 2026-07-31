@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"time"
@@ -126,6 +127,42 @@ func (s *Store) GetIntentByMemoID(ctx context.Context, memoID uint64) (*Intent, 
 	return &i, nil
 }
 
+// ErrExternalIDConflict is returned when an intent is already bound to a
+// different provider order.
+var ErrExternalIDConflict = errors.New("intent already bound to a different external_id")
+
+// SetIntentExternalID binds an on-ramp provider's order ID to an existing intent.
+//
+// The ID cannot be supplied at mint time — MoonPay only issues one once the user
+// completes checkout, long after the widget URL was built — so it has to be
+// attached afterwards by whoever receives the provider's webhook.
+//
+// Re-binding to a different order is refused rather than overwritten: an intent
+// silently re-pointed from order A to order B would reconcile A's deposit against
+// B's record. Setting the same ID twice succeeds, so a redelivered webhook is safe.
+func (s *Store) SetIntentExternalID(ctx context.Context, memoID uint64, externalID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE intents SET external_id = $1, updated_at = NOW()
+		WHERE memo_id = $2 AND (external_id IS NULL OR external_id = $1)
+	`, externalID, int64(memoID))
+	if err != nil {
+		return fmt.Errorf("set intent external_id: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+
+	// No row updated: either the intent does not exist, or it is bound to another
+	// order. Distinguish so the caller can answer 404 rather than 409.
+	var existing *string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT external_id FROM intents WHERE memo_id = $1`, int64(memoID),
+	).Scan(&existing); err != nil {
+		return err // pgx.ErrNoRows when the intent does not exist
+	}
+	return ErrExternalIDConflict
+}
+
 // CompleteIntent marks a pending intent as completed (deposit forwarded successfully).
 func (s *Store) CompleteIntent(ctx context.Context, memoID uint64) error {
 	_, err := s.pool.Exec(ctx, `
@@ -166,17 +203,21 @@ func (s *Store) ExpireStaleIntents(ctx context.Context) (int64, error) {
 // ── Forwards ─────────────────────────────────────────────────────────────────
 
 // InsertForward records an inbound payment seen by the watcher.
-// Uses ON CONFLICT DO NOTHING so replaying the same tx_hash is safe.
-func (s *Store) InsertForward(ctx context.Context, txHash string, memoID uint64, fromAddress, amount, asset string) error {
-	_, err := s.pool.Exec(ctx, `
+//
+// Returns true when this call created the row, false when one already existed
+// for txHash. Callers must stop on false: ON CONFLICT DO NOTHING makes the
+// insert idempotent, but it does not make the outbound transfer idempotent, and
+// the same deposit reaching submit() twice pays the C-address twice.
+func (s *Store) InsertForward(ctx context.Context, txHash string, memoID uint64, fromAddress, amount, asset string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO forwards (tx_hash, memo_id, from_address, amount, asset)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (tx_hash) DO NOTHING
 	`, txHash, int64(memoID), fromAddress, amount, asset)
 	if err != nil {
-		return fmt.Errorf("insert forward: %w", err)
+		return false, fmt.Errorf("insert forward: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() == 1, nil
 }
 
 // MarkForwardDone records the outbound tx hash and flips status to done.

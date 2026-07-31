@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
+	sdkamount "github.com/stellar/go-stellar-sdk/amount"
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	"github.com/stellar/go-stellar-sdk/keypair"
@@ -23,7 +25,7 @@ import (
 // forwardStore is the subset of store.Store that Forwarder calls.
 // Narrow interface keeps test mocks small.
 type forwardStore interface {
-	InsertForward(ctx context.Context, txHash string, memoID uint64, fromAddress, amount, asset string) error
+	InsertForward(ctx context.Context, txHash string, memoID uint64, fromAddress, amount, asset string) (bool, error)
 	GetIntentByMemoID(ctx context.Context, memoID uint64) (*store.Intent, error)
 	MarkForwardDone(ctx context.Context, txHash, forwardTx string) error
 	CompleteIntent(ctx context.Context, memoID uint64) error
@@ -123,8 +125,20 @@ var backoffs = []time.Duration{
 
 // Forward processes one inbound payment end-to-end. Safe to call in a goroutine.
 func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, fromAddress, amount, asset string) {
-	if err := f.store.InsertForward(ctx, txHash, memoID, fromAddress, amount, asset); err != nil {
+	inserted, err := f.store.InsertForward(ctx, txHash, memoID, fromAddress, amount, asset)
+	if err != nil {
 		slog.Error("forwarder: insert forward", "tx_hash", txHash, "err", err)
+		return
+	}
+
+	// A row already existed, so this payment was dispatched before — by a run that
+	// died before saving the SSE cursor, or by a second instance streaming the same
+	// pool. Forwarding again would pay the C-address twice for one deposit. Dropping
+	// it here is safe: if that earlier dispatch never reached submit(), the row is
+	// still `pending` and GetPendingRetries sweeps it up after five minutes.
+	if !inserted {
+		slog.Warn("forwarder: duplicate tx_hash, already dispatched — skipping",
+			"tx_hash", txHash, "memo_id", memoID)
 		return
 	}
 
@@ -136,11 +150,30 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 		return
 	}
 
-	if intent.Status == store.IntentExpired {
-		slog.Warn("forwarder: intent expired, sweeping to recovery", "tx_hash", txHash, "memo_id", memoID)
+	// Two ways to be past the window: the retry worker already flipped the status,
+	// or the TTL elapsed since its last tick. Testing the status alone makes
+	// crediting depend on when that worker last ran, so a deposit landing in the gap
+	// is forwarded against an intent the client already shows as dead — the mobile
+	// app's isDepositIntentExpired keys off expires_at directly.
+	if intent.Status == store.IntentExpired || time.Now().After(intent.ExpiresAt) {
+		slog.Warn("forwarder: intent expired, sweeping to recovery",
+			"tx_hash", txHash, "memo_id", memoID,
+			"status", intent.Status, "expires_at", intent.ExpiresAt)
 		f.sweep(ctx, txHash, amount, asset)
 		_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusFailed, "intent expired — swept to recovery")
 		return
+	}
+
+	// expected_amt is advisory and deliberately does not gate the forward. An
+	// on-ramp deposit legitimately lands off-quote — provider fees, FX movement
+	// between quote and settlement, partial fills — and by the time we see it the
+	// money is already on-chain. Sweeping or holding over a mismatch would burn a
+	// real user's funds to enforce a number nothing validates at mint time. Log it
+	// so reconciliation has a signal; credit what actually arrived.
+	if intent.ExpectedAmt != nil && mismatchesExpected(*intent.ExpectedAmt, amount) {
+		slog.Warn("forwarder: deposit differs from expected amount",
+			"tx_hash", txHash, "memo_id", memoID,
+			"expected", *intent.ExpectedAmt, "received", amount)
 	}
 
 	var lastErr error
@@ -178,6 +211,31 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 	slog.Error("forwarder: all attempts failed, queued for retry", "tx_hash", txHash, "err", lastErr)
 }
 
+// amountTolerance is how far a received amount may drift from the intent's
+// expected_amt before it is logged as a mismatch. Loose on purpose: provider fees
+// and FX are applied after the quote the caller minted the intent with.
+const amountTolerance = 0.05
+
+// mismatchesExpected reports whether received drifts from expected by more than
+// amountTolerance. Both are Stellar amount strings denominated in the deposit's
+// own asset — expected_amt is NOT a fiat figure, and comparing one against an XLM
+// amount would warn on every deposit.
+//
+// Returns false when either value fails to parse. expected_amt is free-form and
+// nothing validates it at mint time, so an unparseable field is a caller bug, not
+// evidence of a bad deposit.
+func mismatchesExpected(expected, received string) bool {
+	exp, err := sdkamount.ParseInt64(expected)
+	if err != nil || exp <= 0 {
+		return false
+	}
+	got, err := sdkamount.ParseInt64(received)
+	if err != nil {
+		return false
+	}
+	return math.Abs(float64(got-exp))/float64(exp) > amountTolerance
+}
+
 // ── Retry ─────────────────────────────────────────────────────────────────────
 
 // Retry is called by the background retry worker for pending_retry forwards.
@@ -198,6 +256,10 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 		slog.Error("forwarder: retry — intent not found", "tx_hash", fwd.TxHash)
 		return
 	}
+
+	// Deliberately no expiry check here, unlike Forward. This deposit arrived while
+	// the intent was live; only our submission failed. Sweeping it now would punish
+	// the depositor for the relayer's own retry latency.
 
 	outboundHash, err := f.submit(ctx, intent.CAddress, intent.PoolAddress, fwd.Amount, fwd.Asset)
 	if err != nil {
