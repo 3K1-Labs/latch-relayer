@@ -94,10 +94,10 @@ curl https://latch-relayer.onrender.com/health
 ```
 
 ```bash
-curl -X POST https://latch-relayer.onrender.com/register \
+curl -X POST https://latch-relayer.onrender.com/intents \
   -H "Content-Type: application/json" \
-  -d '{"c_address":"CCOX4AG3XESDAZC7L27AMQZ6KKMUWEU2KCHFXJ2PXNAXMDUCL225MN2P"}'
-# Expected: {"memo_id":"...","pool_address":"..."}
+  -d '{"c_address":"CCOX4AG3XESDAZC7L27AMQZ6KKMUWEU2KCHFXJ2PXNAXMDUCL225MN2P","expected_amt":"5","expires_in":3600}'
+# Expected: {"intent_id":"...","memo_id":"...","pool_address":"...","expires_at":"..."}
 ```
 
 ---

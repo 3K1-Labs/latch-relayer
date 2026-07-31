@@ -16,3 +16,4 @@ coverage.out
 
 # Local directories not for version control
 learning/
+/.claude/
