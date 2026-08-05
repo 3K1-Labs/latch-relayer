@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"time"
 
 	sdkamount "github.com/stellar/go-stellar-sdk/amount"
@@ -286,6 +287,25 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 
 // submit builds, simulates, signs, and submits one outbound Soroban payment.
 // Errors are tagged permanent or transient so callers can route accordingly.
+// parseAsset converts the watcher's compact asset identifier back into an asset
+// the SDK can build operations with. The identifier is produced by
+// watcher.assetID: "native" for XLM, "CODE:ISSUER" for everything else.
+//
+// Issued assets (USDC in particular) reach the pool whenever an on-ramp
+// delivers something other than XLM, so refusing them here strands real funds:
+// the forward fails permanently and the sweep cannot move them either, leaving
+// the balance in the pool until someone signs for it by hand.
+func parseAsset(asset string) (txnbuild.Asset, error) {
+	if asset == "native" {
+		return txnbuild.NativeAsset{}, nil
+	}
+	code, issuer, found := strings.Cut(asset, ":")
+	if !found || code == "" || issuer == "" {
+		return nil, fmt.Errorf("unparseable asset %q", asset)
+	}
+	return txnbuild.CreditAsset{Code: code, Issuer: issuer}, nil
+}
+
 func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, asset string) (string, error) {
 	kp, err := f.keypairFor(poolAddress)
 	if err != nil {
@@ -301,17 +321,18 @@ func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, a
 		return "", transient(fmt.Errorf("fetch pool account: %w", err))
 	}
 
-	if asset != "native" {
-		return "", permanent(fmt.Errorf("unsupported asset %q", asset))
+	parsedAsset, err := parseAsset(asset)
+	if err != nil {
+		return "", permanent(err)
 	}
 
 	// Classic Payment only accepts G-addresses. C-addresses (Soroban contracts)
-	// must be paid via the native XLM SAC's transfer function instead.
+	// must be paid via the asset's SAC transfer function instead.
 	op, err := txnbuild.NewPaymentToContract(txnbuild.PaymentToContractParams{
 		NetworkPassphrase: f.config.NetworkPassphrase,
 		Destination:       cAddress,
 		Amount:            amount,
-		Asset:             txnbuild.NativeAsset{},
+		Asset:             parsedAsset,
 		SourceAccount:     poolAddress,
 	})
 	if err != nil {
@@ -529,8 +550,8 @@ func classifyResultXDR(resultXDR string) error {
 
 	// ── Transient — a fresh attempt may succeed ────────────────────────────────
 	case xdr.TransactionResultCodeTxTooEarly,
-		xdr.TransactionResultCodeTxTooLate,   // time bounds expired; retry builds a fresh tx
-		xdr.TransactionResultCodeTxBadSeq,    // sequence race; retry fetches a fresh sequence
+		xdr.TransactionResultCodeTxTooLate, // time bounds expired; retry builds a fresh tx
+		xdr.TransactionResultCodeTxBadSeq,  // sequence race; retry fetches a fresh sequence
 		xdr.TransactionResultCodeTxInternalError:
 		return transient(fmt.Errorf("transaction rejected with transient code %s", code.String()))
 
@@ -547,8 +568,10 @@ func (f *Forwarder) sweep(ctx context.Context, inboundHash, amount, asset string
 		slog.Warn("forwarder: no recovery address configured, funds remain in pool", "tx_hash", inboundHash)
 		return
 	}
-	if asset != "native" {
-		slog.Warn("forwarder: sweep only supports native asset", "tx_hash", inboundHash, "asset", asset)
+	parsedAsset, err := parseAsset(asset)
+	if err != nil {
+		slog.Error("forwarder: sweep cannot parse asset, funds remain in pool",
+			"tx_hash", inboundHash, "asset", asset, "err", err)
 		return
 	}
 
@@ -568,7 +591,11 @@ func (f *Forwarder) sweep(ctx context.Context, inboundHash, amount, asset string
 			&txnbuild.Payment{
 				Destination: f.config.RecoveryAddress,
 				Amount:      amount,
-				Asset:       txnbuild.NativeAsset{},
+				// Sweeping an issued asset needs the recovery account to hold a
+				// trustline for it; without one Horizon rejects the payment and
+				// the balance stays in the pool. Keep the recovery account's
+				// trustlines in step with the assets the pool accepts.
+				Asset: parsedAsset,
 			},
 		},
 		Memo:    txnbuild.MemoText("unknown-memo"),
