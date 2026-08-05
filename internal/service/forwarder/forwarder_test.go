@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	hProtocol "github.com/stellar/go-stellar-sdk/protocols/horizon"
-	rpcprotocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/keypair"
 	"github.com/stellar/go-stellar-sdk/network"
+	hProtocol "github.com/stellar/go-stellar-sdk/protocols/horizon"
+	rpcprotocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
@@ -65,10 +65,10 @@ type markFailedCall struct{ txHash, status, errMsg string }
 type permanentlyFailCall struct{ txHash, errMsg string }
 
 type mockStore struct {
-	insertErr    error
-	insertDup    bool // InsertForward reports the row already existed
-	intent       *store.Intent
-	intentErr    error
+	insertErr error
+	insertDup bool // InsertForward reports the row already existed
+	intent    *store.Intent
+	intentErr error
 
 	doneCalls           [][2]string
 	completeIntentCalls []uint64
@@ -398,8 +398,8 @@ func TestForward_unknownMemoID(t *testing.T) {
 
 func TestForward_expiredIntent(t *testing.T) {
 	st := &mockStore{intent: &store.Intent{
-		MemoID:  55,
-		Status:  store.IntentExpired,
+		MemoID:   55,
+		Status:   store.IntentExpired,
 		CAddress: testCAddress,
 	}}
 	f := &Forwarder{store: st, config: testConfig(t), horizon: &mockHorizon{}, rpc: &mockRPC{}}
@@ -473,9 +473,9 @@ func TestForward_intentPastExpiryButStillPending(t *testing.T) {
 
 func TestMismatchesExpected(t *testing.T) {
 	cases := []struct {
-		name              string
+		name               string
 		expected, received string
-		want              bool
+		want               bool
 	}{
 		{"exact match", "10.0000000", "10.0000000", false},
 		{"within tolerance — provider fee", "10.0000000", "9.6000000", false},
@@ -584,6 +584,90 @@ func TestForward_success(t *testing.T) {
 	}
 	if len(st.markFailedCalls) != 0 {
 		t.Errorf("want no MarkForwardFailed on success, got %d", len(st.markFailedCalls))
+	}
+}
+
+// ── issued assets ─────────────────────────────────────────────────────────────
+
+// An on-ramp delivering anything but XLM lands an issued asset in the pool.
+// Refusing it here strands real funds: the forward fails permanently and the
+// sweep cannot move them either.
+func TestParseAsset(t *testing.T) {
+	usdcIssuer := "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+
+	cases := []struct {
+		name    string
+		asset   string
+		want    txnbuild.Asset
+		wantErr bool
+	}{
+		{"native", "native", txnbuild.NativeAsset{}, false},
+		{"usdc", "USDC:" + usdcIssuer, txnbuild.CreditAsset{Code: "USDC", Issuer: usdcIssuer}, false},
+		{"four-char code", "yXLM:" + usdcIssuer, txnbuild.CreditAsset{Code: "yXLM", Issuer: usdcIssuer}, false},
+		{"no separator", "USDC", nil, true},
+		{"empty code", ":" + usdcIssuer, nil, true},
+		{"empty issuer", "USDC:", nil, true},
+		{"empty string", "", nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseAsset(tc.asset)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseAsset(%q) = %v, want error", tc.asset, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseAsset(%q): %v", tc.asset, err)
+			}
+			if got != tc.want {
+				t.Errorf("parseAsset(%q) = %v, want %v", tc.asset, got, tc.want)
+			}
+		})
+	}
+}
+
+// A USDC deposit against a live intent must forward, not fail permanently.
+func TestForward_issuedAssetSucceeds(t *testing.T) {
+	kp := newTestKeypair(t)
+	st := &mockStore{intent: testIntent(kp.Address())}
+	hz := &mockHorizon{account: hProtocol.Account{AccountID: kp.Address(), Sequence: 100}}
+	rpc := successRPC(t, "out-hash-usdc")
+	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: rpc}
+
+	f.Forward(context.Background(), "in-hash-usdc", 1, "GABC", "25.0000000",
+		"USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
+
+	if len(st.doneCalls) != 1 {
+		t.Fatalf("want 1 MarkForwardDone for an issued asset, got %d (markFailed: %v)",
+			len(st.doneCalls), st.markFailedCalls)
+	}
+	if len(st.completeIntentCalls) != 1 {
+		t.Errorf("want 1 CompleteIntent, got %d", len(st.completeIntentCalls))
+	}
+}
+
+// An asset identifier the watcher could not have produced is still permanent —
+// retrying cannot make it parse.
+func TestForward_unparseableAssetIsPermanent(t *testing.T) {
+	kp := newTestKeypair(t)
+	st := &mockStore{intent: testIntent(kp.Address())}
+	hz := &mockHorizon{account: hProtocol.Account{AccountID: kp.Address(), Sequence: 100}}
+	rpc := successRPC(t, "unused")
+	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: rpc}
+
+	f.Forward(context.Background(), "in-hash-bad", 1, "GABC", "1.0000000", "NOTANASSET")
+
+	if len(st.doneCalls) != 0 {
+		t.Fatalf("want no MarkForwardDone for an unparseable asset, got %d", len(st.doneCalls))
+	}
+	if len(st.markFailedCalls) != 1 {
+		t.Fatalf("want 1 MarkForwardFailed, got %d", len(st.markFailedCalls))
+	}
+	if st.markFailedCalls[0].status != store.StatusFailed {
+		t.Errorf("status = %q, want %q (permanent, not queued for retry)",
+			st.markFailedCalls[0].status, store.StatusFailed)
 	}
 }
 
