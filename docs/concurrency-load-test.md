@@ -34,6 +34,21 @@ And the same five-pool setup at two hundred, to check the rate holds:
 | Setup | Credited | Rate | p50 | p95 | Slowest |
 |---|---|---|---|---|---|
 | Five pools, n=200 | 200/200 | 35.3/min | 2m20s | 4m50s | 5m40s |
+| Five pools, after the gap fixes | 50/50 | 37.5/min | 40s | 1m10s | 1m20s |
+
+The last row is with contention no longer charged to the retry budget and the
+retry sweep at 10s instead of 30s. The metrics from that run:
+
+```
+relayer_forwards_total{outcome="done"}  50
+relayer_pool_contention_total            3
+relayer_pending_retry_depth              0
+```
+
+Three deposits lost the race for a pool slot and were retried without being
+charged. Under the old rule those three each spent one of five lives for
+something that was not their fault — harmless at this size, and the mechanism
+that permanently fails good deposits when the system is busiest.
 
 Every deposit was credited in every run. Nothing was swept to recovery and
 nothing failed permanently. The problem was never correctness; it was speed.
@@ -104,9 +119,19 @@ least-retried first.
 
 ## What this means for a thousand
 
-At 33 a minute, a thousand deposits take about half an hour. To absorb a
-thousand inside ten minutes — a hundred a minute — you need roughly **nine to
-ten pool accounts**, assuming the same efficiency we measured.
+At 35 a minute, a thousand deposits take about half an hour. To absorb a
+thousand inside ten minutes — a hundred a minute — you need roughly **fourteen
+to sixteen pool accounts** at the efficiency we measured (about 7/min per pool
+in practice, against a theoretical 12).
+
+Closing that efficiency gap is the cheaper move, and there are two places to
+look. Deposits are assigned a pool when the intent is minted but arrive minutes
+later in a different order, so some pools receive several deposits in one ledger
+while others sit idle with their slot unused. And the retry worker ticks every
+30 seconds ([main.go:90](../cmd/serve/main.go), hardcoded), so any straggler
+waits up to half a minute for a slot that may already be free. Getting per-pool
+utilisation from 7/min closer to 12 would cut the accounts needed from ~15 to
+~9.
 
 That is a real operational cost, not just a config value. Each pool account is a
 funded account with its own signing key that has to be held securely, monitored
@@ -136,6 +161,46 @@ The harness funds a separate depositor account per run from friendbot. That
 matters more than it looks: sharing one depositor serialises every payment
 behind that account's own sequence number, the pool never sees concurrent
 arrivals, and the test reports a clean result while measuring nothing.
+
+## Confirmed directly (`scripts/batch_probe`)
+
+The conclusions above rested on an inference from timing, so both halves were
+then tested against live testnet.
+
+**Batching is impossible.** Simulating a transfer transaction with two
+operations returns `Transaction contains more than one operation`. Soroban
+transactions carry exactly one operation — a protocol rule, not a resource
+limit, so no amount of tuning changes it. That rules out the obvious
+optimisation of packing several deposits into each ledger slot.
+
+**One transaction per account at a time, confirmed.** Sending two
+consecutively-sequenced Soroban transactions back to back from one pool
+account, three times over:
+
+```
+tx 1: 97468017fbdf  SUCCESS  ledger 4127011
+tx 2: SEND FAILED — TRY_AGAIN_LATER
+
+tx 1: eb7d4cc9a3dd  SUCCESS  ledger 4127016
+tx 2: SEND FAILED — ERROR, result code -5 (txBAD_SEQ)
+
+tx 1: 39d118c0b5a5  SUCCESS  ledger 4127018
+tx 2: SEND FAILED — TRY_AGAIN_LATER
+```
+
+The second is always refused while the first is in flight — either the queue
+declines it outright, or its sequence is rejected because the first has not been
+applied yet.
+
+That second failure mode is the important one, because it explains why the
+in-process sequencer could not lift the ceiling. Handing out the next sequence
+number early does not help: the account's sequence only advances when the
+previous transaction is *applied on-chain*, which takes a ledger. The sequencer
+is still worth keeping — it removed the collision churn and the retry-queue
+detour — but it was never going to raise throughput.
+
+So the ceiling is real, it is the network's, and pool accounts are the only
+lever.
 
 ## A caution about pool accounts
 

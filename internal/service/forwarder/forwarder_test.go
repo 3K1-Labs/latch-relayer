@@ -73,6 +73,7 @@ type mockStore struct {
 	doneCalls           [][2]string
 	completeIntentCalls []uint64
 	markFailedCalls     []markFailedCall
+	requeueCalls        []markFailedCall
 	permFailCalls       []permanentlyFailCall
 	failIntentCalls     []uint64
 }
@@ -96,6 +97,10 @@ func (m *mockStore) CompleteIntent(_ context.Context, memoID uint64) error {
 }
 func (m *mockStore) MarkForwardFailed(_ context.Context, txHash, status, errMsg string) error {
 	m.markFailedCalls = append(m.markFailedCalls, markFailedCall{txHash, status, errMsg})
+	return nil
+}
+func (m *mockStore) RequeueForContention(_ context.Context, txHash, errMsg string) error {
+	m.requeueCalls = append(m.requeueCalls, markFailedCall{txHash, "pending_retry", errMsg})
 	return nil
 }
 func (m *mockStore) PermanentlyFail(_ context.Context, txHash, errMsg string) error {

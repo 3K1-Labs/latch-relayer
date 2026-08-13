@@ -135,3 +135,23 @@ func duplicates(seen map[int64]int) []int64 {
 	}
 	return out
 }
+
+// Losing the race for a pool account's ledger slot must not consume the retry
+// budget. Counting it means a busy period permanently fails deposits that had
+// nothing wrong with them — the more load, the more likely, which is backwards.
+func TestContention_DoesNotChargeTheRetryBudget(t *testing.T) {
+	err := contention(errTest)
+
+	if !isContention(err) {
+		t.Fatal("contention error should be recognised as contention")
+	}
+	if isPermanent(err) {
+		t.Fatal("contention must never be permanent — the deposit is waiting, not failing")
+	}
+}
+
+var errTest = &testErr{}
+
+type testErr struct{}
+
+func (e *testErr) Error() string { return "pool slot taken" }

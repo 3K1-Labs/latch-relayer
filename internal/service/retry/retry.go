@@ -2,6 +2,7 @@ package retry
 
 import (
 	"context"
+	"github.com/latch/relayer/internal/metrics"
 	"log/slog"
 	"time"
 
@@ -52,8 +53,14 @@ func (w *Worker) tick(ctx context.Context) {
 		return
 	}
 	if len(forwards) == 0 {
+		metrics.PendingRetryDepth.Set(0)
 		return
 	}
+
+	// Sampled here rather than continuously: this is the one place that already
+	// knows the true backlog, and a rising line is the signal that deposits are
+	// arriving faster than the pool accounts can forward them.
+	metrics.PendingRetryDepth.Set(float64(len(forwards)))
 
 	slog.Info("retry worker: retrying", "count", len(forwards))
 	for _, fwd := range forwards {

@@ -247,6 +247,23 @@ func (s *Store) MarkForwardFailed(ctx context.Context, txHash, status, errMsg st
 	return nil
 }
 
+// RequeueForContention puts a forward back in the retry queue without charging
+// the retry budget. Used when the failure was losing the race for the pool
+// account's ledger slot rather than anything wrong with the transaction: the
+// deposit is waiting its turn, not failing, and counting it would permanently
+// fail good deposits precisely when the system is busiest.
+func (s *Store) RequeueForContention(ctx context.Context, txHash, errMsg string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE forwards
+		SET status = $1, error = $2, updated_at = NOW()
+		WHERE tx_hash = $3
+	`, StatusPendingRetry, errMsg, txHash)
+	if err != nil {
+		return fmt.Errorf("requeue for contention: %w", err)
+	}
+	return nil
+}
+
 // PermanentlyFail marks a forward as permanently failed without incrementing retries.
 // Use when the retry ceiling is hit or a permanent error is detected, so the final
 // error message is recorded cleanly without inflating the counter.

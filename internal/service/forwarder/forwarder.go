@@ -21,6 +21,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/latch/relayer/internal/config"
+	"github.com/latch/relayer/internal/metrics"
 	"github.com/latch/relayer/internal/store"
 )
 
@@ -32,6 +33,7 @@ type forwardStore interface {
 	MarkForwardDone(ctx context.Context, txHash, forwardTx string) error
 	CompleteIntent(ctx context.Context, memoID uint64) error
 	MarkForwardFailed(ctx context.Context, txHash, status, errMsg string) error
+	RequeueForContention(ctx context.Context, txHash, errMsg string) error
 	PermanentlyFail(ctx context.Context, txHash, errMsg string) error
 	FailIntent(ctx context.Context, memoID uint64) error
 }
@@ -108,8 +110,9 @@ func (f *Forwarder) seq() *sequencer {
 // Transient errors are safe to retry (network timeout, sequence race, fee congestion,
 // RPC overload). On transient failure the forward goes to pending_retry.
 type submitError struct {
-	permanent bool
-	err       error
+	permanent  bool
+	contention bool
+	err        error
 }
 
 func (e *submitError) Error() string { return e.err.Error() }
@@ -117,6 +120,21 @@ func (e *submitError) Unwrap() error { return e.err }
 
 func permanent(err error) error { return &submitError{permanent: true, err: err} }
 func transient(err error) error { return &submitError{permanent: false, err: err} }
+
+// contention marks a transient failure caused by another transaction holding the
+// pool account's slot rather than by anything wrong with this one.
+//
+// It matters because it must not consume the retry budget. A deposit that is
+// merely waiting its turn is not a deposit that is failing, and letting
+// contention count toward maxRetries means a busy period can permanently fail
+// forwards that are holding real customer funds — the more load, the more
+// likely, which is exactly backwards.
+func contention(err error) error { return &submitError{contention: true, err: err} }
+
+func isContention(err error) bool {
+	var se *submitError
+	return errors.As(err, &se) && se.contention
+}
 
 func isPermanent(err error) bool {
 	var se *submitError
@@ -141,6 +159,10 @@ var backoffs = []time.Duration{
 
 // Forward processes one inbound payment end-to-end. Safe to call in a goroutine.
 func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, fromAddress, amount, asset string) {
+	// Measured from when we first see the deposit rather than from submission,
+	// so the number reflects what the customer waits for.
+	started := time.Now()
+
 	inserted, err := f.store.InsertForward(ctx, txHash, memoID, fromAddress, amount, asset)
 	if err != nil {
 		slog.Error("forwarder: insert forward", "tx_hash", txHash, "err", err)
@@ -160,6 +182,10 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 
 	intent, err := f.store.GetIntentByMemoID(ctx, memoID)
 	if err != nil {
+		// The alertable outcome: a deposit carrying a reference this relayer never
+		// issued. It is swept to recovery rather than credited, so any sustained
+		// rate here means customers are paying and not being paid.
+		metrics.ForwardsTotal.WithLabelValues("unknown_memo").Inc()
 		slog.Warn("forwarder: unknown memo_id, sweeping to recovery", "tx_hash", txHash, "memo_id", memoID)
 		f.sweep(ctx, txHash, amount, asset)
 		_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusFailed, "unknown memo_id — swept to recovery")
@@ -172,6 +198,7 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 	// is forwarded against an intent the client already shows as dead — the mobile
 	// app's isDepositIntentExpired keys off expires_at directly.
 	if intent.Status == store.IntentExpired || time.Now().After(intent.ExpiresAt) {
+		metrics.ForwardsTotal.WithLabelValues("expired").Inc()
 		slog.Warn("forwarder: intent expired, sweeping to recovery",
 			"tx_hash", txHash, "memo_id", memoID,
 			"status", intent.Status, "expires_at", intent.ExpiresAt)
@@ -206,6 +233,8 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 		if err == nil {
 			_ = f.store.MarkForwardDone(ctx, txHash, outboundHash)
 			_ = f.store.CompleteIntent(ctx, memoID)
+			metrics.ForwardsTotal.WithLabelValues("done").Inc()
+			metrics.DepositToCreditSeconds.Observe(time.Since(started).Seconds())
 			slog.Info("forwarder: forwarded",
 				"inbound", txHash, "outbound", outboundHash,
 				"memo_id", memoID, "amount", amount)
@@ -215,12 +244,24 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 		// Permanent errors cannot succeed on retry — fail immediately.
 		if isPermanent(err) {
 			_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusFailed, err.Error())
+			metrics.ForwardsTotal.WithLabelValues("permanent_failure").Inc()
 			slog.Error("forwarder: permanent failure, not retrying", "tx_hash", txHash, "err", err)
 			return
 		}
 
 		lastErr = err
 		slog.Warn("forwarder: attempt failed", "tx_hash", txHash, "attempt", attempt+1, "err", err)
+	}
+
+	// Same rule as Retry: losing the race for the pool's ledger slot is not this
+	// deposit failing, so it must not consume the budget that decides whether a
+	// deposit is abandoned.
+	if isContention(lastErr) {
+		metrics.ContentionTotal.Inc()
+		_ = f.store.RequeueForContention(ctx, txHash, lastErr.Error())
+		slog.Warn("forwarder: lost the pool slot, queued for retry without charge",
+			"tx_hash", txHash, "err", lastErr)
+		return
 	}
 
 	_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusPendingRetry, lastErr.Error())
@@ -286,6 +327,17 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 			slog.Error("forwarder: retry permanent failure", "tx_hash", fwd.TxHash, "err", err)
 			return
 		}
+		// Contention — the pool account was busy. Re-queue without charging the
+		// budget, or a busy period would permanently fail deposits that never
+		// had anything wrong with them.
+		if isContention(err) {
+			metrics.ContentionTotal.Inc()
+			_ = f.store.RequeueForContention(ctx, fwd.TxHash, err.Error())
+			slog.Warn("forwarder: retry lost the pool slot, re-queued without charge",
+				"tx_hash", fwd.TxHash, "retries", fwd.Retries, "err", err)
+			return
+		}
+
 		// Transient — increment retries and put back in the queue.
 		_ = f.store.MarkForwardFailed(ctx, fwd.TxHash, store.StatusPendingRetry, err.Error())
 		slog.Error("forwarder: retry failed (transient), re-queued",
@@ -295,6 +347,8 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 
 	_ = f.store.MarkForwardDone(ctx, fwd.TxHash, outboundHash)
 	_ = f.store.CompleteIntent(ctx, fwd.MemoID)
+	metrics.ForwardsTotal.WithLabelValues("done").Inc()
+	metrics.DepositToCreditSeconds.Observe(time.Since(fwd.CreatedAt).Seconds())
 	slog.Info("forwarder: retry succeeded", "inbound", fwd.TxHash, "outbound", outboundHash)
 }
 
@@ -596,10 +650,16 @@ func classifyResultXDR(resultXDR string) error {
 	case xdr.TransactionResultCodeTxInsufficientFee:
 		return &feeError{msg: fmt.Sprintf("tx_insufficient_fee (result code %d)", int32(code))}
 
+	// ── Contention — the account was busy, this transaction was fine ───────────
+	// An account can only land one Soroban transaction per ledger, so under load
+	// a perfectly good transaction loses the race. Retry it without charging the
+	// budget.
+	case xdr.TransactionResultCodeTxBadSeq:
+		return contention(fmt.Errorf("transaction rejected with contention code %s", code.String()))
+
 	// ── Transient — a fresh attempt may succeed ────────────────────────────────
 	case xdr.TransactionResultCodeTxTooEarly,
 		xdr.TransactionResultCodeTxTooLate, // time bounds expired; retry builds a fresh tx
-		xdr.TransactionResultCodeTxBadSeq,  // sequence race; retry fetches a fresh sequence
 		xdr.TransactionResultCodeTxInternalError:
 		return transient(fmt.Errorf("transaction rejected with transient code %s", code.String()))
 

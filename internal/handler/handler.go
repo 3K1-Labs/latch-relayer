@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -55,6 +56,11 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /intents/{memo_id}", h.SetExternalID)
 	mux.HandleFunc("GET /deposit/status/{memo_id}", h.DepositStatus)
 	mux.HandleFunc("GET /health", h.Health)
+	// Behind the API key, unlike /health. This deployment is reachable from the
+	// internet, and the counters here describe deposit volume and failure rates —
+	// not customer data, but not something to publish either. Prometheus sends
+	// the same bearer token via `authorization` in the scrape config.
+	mux.Handle("GET /metrics", promhttp.Handler())
 }
 
 // ── Request / Response types ─────────────────────────────────────────────────
