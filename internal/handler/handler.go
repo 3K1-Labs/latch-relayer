@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -21,10 +22,31 @@ import (
 type Handler struct {
 	store  *store.Store
 	config *config.Config
+
+	// nextPool round-robins intents across the configured pool accounts.
+	//
+	// Stellar Core admits at most one Soroban transaction per source account per
+	// ledger, so a pool account can forward roughly one deposit every five
+	// seconds no matter how much concurrency the relayer has internally.
+	// Measured on testnet that is ~12 credits/minute for a single pool. Spreading
+	// intents across pools is therefore the only thing that raises the ceiling:
+	// throughput scales with the number of pools.
+	//
+	// Which pool a deposit lands on is fixed at intent creation, because the
+	// address is what the depositor is told to pay.
+	nextPool atomic.Uint64
 }
 
 func New(st *store.Store, cfg *config.Config) *Handler {
 	return &Handler{store: st, config: cfg}
+}
+
+// pickPool returns the next pool account in rotation. Even distribution matters
+// more than stickiness: each pool is an independent per-ledger slot, so an
+// unbalanced spread wastes the slots on the idle ones.
+func (h *Handler) pickPool() config.PoolAccount {
+	n := h.nextPool.Add(1) - 1
+	return h.config.PoolAccounts[n%uint64(len(h.config.PoolAccounts))]
 }
 
 // RegisterRoutes wires all routes onto mux.
@@ -133,7 +155,7 @@ func (h *Handler) CreateIntent(w http.ResponseWriter, r *http.Request) {
 		externalID = &req.ExternalID
 	}
 
-	pool := h.config.PoolAccounts[0]
+	pool := h.pickPool()
 
 	intent, err := h.store.CreateIntent(r.Context(), req.CAddress, pool.Address, expectedAmt, expiresAt, externalID)
 	if err != nil {

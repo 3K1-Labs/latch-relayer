@@ -289,7 +289,8 @@ func (s *Store) GetPendingRetries(ctx context.Context) ([]Forward, error) {
 		FROM forwards
 		WHERE status = 'pending_retry'
 		   OR (status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes')
-		ORDER BY created_at ASC
+		ORDER BY retries ASC, created_at ASC
+		LIMIT 200
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("get pending retries: %w", err)

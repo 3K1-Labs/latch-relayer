@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	sdkamount "github.com/stellar/go-stellar-sdk/amount"
@@ -77,10 +78,24 @@ type Forwarder struct {
 	config  *config.Config
 	horizon horizonClient
 	rpc     rpcClient
+
+	seqOnce   sync.Once
+	sequencer *sequencer
 }
 
 func New(st *store.Store, cfg *config.Config, hz *horizonclient.Client, rpc *rpcclient.Client) *Forwarder {
 	return &Forwarder{store: st, config: cfg, horizon: hz, rpc: rpc}
+}
+
+// seq returns the shared sequencer, building it on first use so a Forwarder
+// assembled as a struct literal (as the tests do) behaves like one from New.
+func (f *Forwarder) seq() *sequencer {
+	f.seqOnce.Do(func() {
+		if f.sequencer == nil {
+			f.sequencer = newSequencer(f.horizon)
+		}
+	})
+	return f.sequencer
 }
 
 // ── Error classification ─────────────────────────────────────────────
@@ -306,20 +321,44 @@ func parseAsset(asset string) (txnbuild.Asset, error) {
 	return txnbuild.CreditAsset{Code: code, Issuer: issuer}, nil
 }
 
-func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, asset string) (string, error) {
+func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, asset string) (hash string, err error) {
 	kp, err := f.keypairFor(poolAddress)
 	if err != nil {
 		return "", permanent(err)
 	}
 
-	// Fresh sequence number every attempt — a previous failed submission may have
-	// consumed the sequence on Horizon even if we received a timeout back.
-	sourceAccount, err := f.horizon.AccountDetail(
-		horizonclient.AccountRequest{AccountID: poolAddress},
-	)
+	// Sequence comes from the shared sequencer, not a per-attempt Horizon read.
+	// Horizon reports the account as of the last closed ledger, so concurrent
+	// forwards used to read one number, build one sequence, and lose all but one
+	// to txBadSeq. Consecutive numbers let a burst settle together instead.
+	//
+	// Any failure below must resync: the number handed out here goes unused, and
+	// everything queued behind the gap is invalid until the account is re-read.
+	// Serialise the ordered window: everything from drawing the sequence to the
+	// network accepting the transaction. Released before the confirmation poll.
+	unlockSend := f.seq().lockSend(poolAddress)
+	sendDone := false
+	defer func() {
+		if !sendDone {
+			unlockSend()
+		}
+	}()
+
+	seq, err := f.seq().next(poolAddress)
 	if err != nil {
-		return "", transient(fmt.Errorf("fetch pool account: %w", err))
+		return "", transient(err)
 	}
+	sourceAccount := &txnbuild.SimpleAccount{AccountID: poolAddress, Sequence: seq}
+	defer func() {
+		// Resync only when the send itself failed, leaving this number unused and
+		// everything queued behind it stranded. A failure *after* the network
+		// accepted the transaction is a confirmation problem: the sequence is
+		// spent, and re-reading Horizon while the transaction is still settling
+		// would report the older value and hand the number out a second time.
+		if err != nil && !sendDone {
+			f.seq().resync(poolAddress)
+		}
+	}()
 
 	parsedAsset, err := parseAsset(asset)
 	if err != nil {
@@ -342,8 +381,10 @@ func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, a
 	// Build with placeholder fee for simulation — Stellar RPC ignores the fee value
 	// during simulation and returns the true minimum resource fee in the response.
 	tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
-		SourceAccount:        &sourceAccount,
-		IncrementSequenceNum: true,
+		SourceAccount: sourceAccount,
+		// The sequencer already returned the exact number this transaction must
+		// carry, so txnbuild must not advance it again.
+		IncrementSequenceNum: false,
 		Operations:           []txnbuild.Operation{&op},
 		BaseFee:              txnbuild.MinBaseFee,
 		Preconditions: txnbuild.Preconditions{
@@ -389,9 +430,13 @@ func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, a
 	// fee portion changes. detect tx_insufficient_fee and double the fee.
 	inclusionFee := uint32(txnbuild.MinBaseFee)
 	for feeAttempt := range maxFeeRetries + 1 {
-		hash, err := f.signAndSend(ctx, kp, env, sorobanData, simResp.MinResourceFee, inclusionFee)
+		hash, err = f.signAndSend(ctx, kp, env, sorobanData, simResp.MinResourceFee, inclusionFee)
 		if err == nil {
-			return hash, nil
+			// Accepted by the network, so this sequence number is spent and the
+			// next forward may proceed. Confirmation is polled without the lock.
+			unlockSend()
+			sendDone = true
+			return f.pollResult(ctx, hash)
 		}
 
 		var fe *feeError
@@ -479,12 +524,15 @@ func (f *Forwarder) signAndSend(
 
 		switch resp.Status {
 		case "PENDING":
-			// Transaction accepted by Stellar Core — poll until ledger inclusion.
-			return f.pollResult(ctx, resp.Hash)
+			// Accepted by Stellar Core. Return without polling so the caller can
+			// release the send lock first — confirmation takes far longer than
+			// submission and holding the lock through it would serialise the
+			// whole pipeline on ledger close.
+			return resp.Hash, nil
 		case "DUPLICATE":
 			// Already submitted (e.g. a previous attempt that timed out on our side
 			// but succeeded on the network). Poll for the existing result.
-			return f.pollResult(ctx, resp.Hash)
+			return resp.Hash, nil
 		case "TRY_AGAIN_LATER":
 			slog.Warn("forwarder: TRY_AGAIN_LATER, sleeping one ledger",
 				"attempt", attempt+1, "max", maxTryAgain)
@@ -575,18 +623,27 @@ func (f *Forwarder) sweep(ctx context.Context, inboundHash, amount, asset string
 		return
 	}
 
+	// The sweep signs as the same pool account as the forward path, so it has to
+	// draw from the same sequencer. Reading Horizon here instead would hand this
+	// transaction a number the forward path has already spent, and the collision
+	// this sequencer exists to remove would come straight back through the
+	// recovery path.
 	pool := f.config.PoolAccounts[0]
-	sourceAccount, err := f.horizon.AccountDetail(
-		horizonclient.AccountRequest{AccountID: pool.Address},
-	)
+	seq, err := f.seq().next(pool.Address)
 	if err != nil {
-		slog.Error("forwarder: sweep fetch account", "err", err)
+		slog.Error("forwarder: sweep sequence", "err", err)
 		return
 	}
+	sourceAccount := &txnbuild.SimpleAccount{AccountID: pool.Address, Sequence: seq}
+	defer func() {
+		if err != nil {
+			f.seq().resync(pool.Address)
+		}
+	}()
 
 	tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
-		SourceAccount:        &sourceAccount,
-		IncrementSequenceNum: true,
+		SourceAccount:        sourceAccount,
+		IncrementSequenceNum: false,
 		Operations: []txnbuild.Operation{
 			&txnbuild.Payment{
 				Destination: f.config.RecoveryAddress,

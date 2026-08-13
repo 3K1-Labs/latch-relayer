@@ -3,6 +3,7 @@ package watcher
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
@@ -14,23 +15,88 @@ import (
 	"github.com/latch/relayer/internal/store"
 )
 
-// Watcher opens a Horizon SSE stream for one pool address and dispatches each
-// inbound payment to the forwarder in its own goroutine.
+// forwardWorkers is how many forwards run at once per pool account.
+//
+// Previously every inbound payment got its own goroutine with no ceiling, so a
+// burst of deposits produced a burst of concurrent submissions on one account.
+// A bound still matters: unbounded goroutines against a rate-limited Soroban
+// RPC produce TRY_AGAIN_LATER storms rather than throughput. Sends are already
+// serialised per pool by the sequencer, so these workers overlap the slow part
+// — simulation and the confirmation poll — and the number mainly sets how many
+// forwards may sit waiting for ledger inclusion at once.
+const forwardWorkers = 32
+
+// forwardQueue bounds how many payments can wait for a worker. Horizon replays
+// from the saved cursor on reconnect, so a full queue means the stream blocks
+// briefly rather than events being dropped.
+const forwardQueue = 256
+
+// Watcher opens a Horizon SSE stream for one pool address and hands each inbound
+// payment to a bounded pool of forwarder workers.
 type Watcher struct {
 	pool      config.PoolAccount
 	store     *store.Store
 	forwarder *forwarder.Forwarder
 	horizon   *horizonclient.Client
+
+	jobs chan forwardJob
+}
+
+// forwardJob is one inbound payment waiting to be forwarded.
+type forwardJob struct {
+	txHash string
+	memoID uint64
+	from   string
+	amount string
+	asset  string
 }
 
 func New(pool config.PoolAccount, st *store.Store, fwd *forwarder.Forwarder, hz *horizonclient.Client) *Watcher {
-	return &Watcher{pool: pool, store: st, forwarder: fwd, horizon: hz}
+	return &Watcher{
+		pool:      pool,
+		store:     st,
+		forwarder: fwd,
+		horizon:   hz,
+		jobs:      make(chan forwardJob, forwardQueue),
+	}
+}
+
+// dispatch queues a payment for a worker. It blocks only when the queue is full,
+// which applies back-pressure to the stream instead of spawning without limit.
+func (w *Watcher) dispatch(ctx context.Context, job forwardJob) {
+	select {
+	case w.jobs <- job:
+	case <-ctx.Done():
+	}
+}
+
+// startWorkers launches the forward workers and returns a function that waits
+// for them to drain. Workers stop when ctx is cancelled.
+func (w *Watcher) startWorkers(ctx context.Context) func() {
+	var wg sync.WaitGroup
+	for range forwardWorkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job := <-w.jobs:
+					w.forwarder.Forward(ctx, job.txHash, job.memoID, job.from, job.amount, job.asset)
+				}
+			}
+		}()
+	}
+	return wg.Wait
 }
 
 // Run starts the SSE stream and reconnects automatically on any error.
 // Call in a goroutine: go watcher.Run(ctx).
 func (w *Watcher) Run(ctx context.Context) {
-	slog.Info("watcher: starting", "pool", w.pool.Address)
+	slog.Info("watcher: starting", "pool", w.pool.Address, "workers", forwardWorkers)
+	waitWorkers := w.startWorkers(ctx)
+	defer waitWorkers()
 	for {
 		if err := w.stream(ctx); err != nil {
 			slog.Error("watcher: stream error, reconnecting in 5s", "pool", w.pool.Address, "err", err)
@@ -99,10 +165,12 @@ func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
 		// No memo or wrong type — sweep to recovery via the forwarder.
 		slog.Warn("watcher: invalid memo, dispatching to forwarder for sweep",
 			"tx_hash", payment.TransactionHash, "memo_type", tx.MemoType, "memo", tx.Memo)
-		go w.forwarder.Forward(ctx,
-			payment.TransactionHash, 0,
-			payment.From, payment.Amount, assetID(payment),
-		)
+		w.dispatch(ctx, forwardJob{
+			txHash: payment.TransactionHash,
+			from:   payment.From,
+			amount: payment.Amount,
+			asset:  assetID(payment),
+		})
 		w.saveCursor(ctx, op.PagingToken())
 		return
 	}
@@ -111,12 +179,15 @@ func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
 		"tx_hash", payment.TransactionHash, "memo_id", memoID,
 		"from", payment.From, "amount", payment.Amount)
 
-	// Dispatch in a goroutine so the stream is never blocked.
+	// Hand off to a worker so the stream is not blocked by submission latency.
 	// The forwarder owns all retry logic and DB updates.
-	go w.forwarder.Forward(ctx,
-		payment.TransactionHash, memoID,
-		payment.From, payment.Amount, assetID(payment),
-	)
+	w.dispatch(ctx, forwardJob{
+		txHash: payment.TransactionHash,
+		memoID: memoID,
+		from:   payment.From,
+		amount: payment.Amount,
+		asset:  assetID(payment),
+	})
 
 	w.saveCursor(ctx, op.PagingToken())
 }

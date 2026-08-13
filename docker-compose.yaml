@@ -21,7 +21,10 @@ services:
       POSTGRES_PASSWORD: latch
       POSTGRES_DB: latch_relayer
     ports:
-      - "5432:5432"
+      # 5433 on the host: latch-api's own compose stack publishes its Postgres
+      # on 5432, and running both locally is the normal case when testing the
+      # two services together. The in-network port stays 5432.
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
