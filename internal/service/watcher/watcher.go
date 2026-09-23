@@ -3,13 +3,13 @@ package watcher
 import (
 	"context"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/protocols/horizon/operations"
 
 	"github.com/latch/relayer/internal/config"
+	"github.com/latch/relayer/internal/lifecycle"
 	"github.com/latch/relayer/internal/memo"
 	"github.com/latch/relayer/internal/service/forwarder"
 	"github.com/latch/relayer/internal/store"
@@ -38,6 +38,7 @@ type Watcher struct {
 	store     *store.Store
 	forwarder *forwarder.Forwarder
 	horizon   *horizonclient.Client
+	work      *lifecycle.Tracker
 
 	jobs chan forwardJob
 }
@@ -51,54 +52,75 @@ type forwardJob struct {
 	asset  string
 }
 
-func New(pool config.PoolAccount, st *store.Store, fwd *forwarder.Forwarder, hz *horizonclient.Client) *Watcher {
+// New builds a watcher. Its workers run on work rather than the stream's
+// context, so a shutdown stops new events without abandoning forwards already
+// in flight or payments already queued.
+func New(pool config.PoolAccount, st *store.Store, fwd *forwarder.Forwarder, hz *horizonclient.Client, work *lifecycle.Tracker) *Watcher {
 	return &Watcher{
 		pool:      pool,
 		store:     st,
 		forwarder: fwd,
 		horizon:   hz,
+		work:      work,
 		jobs:      make(chan forwardJob, forwardQueue),
 	}
 }
 
-// dispatch queues a payment for a worker. It blocks only when the queue is full,
-// which applies back-pressure to the stream instead of spawning without limit.
-func (w *Watcher) dispatch(ctx context.Context, job forwardJob) {
+// dispatch queues a payment for a worker, blocking only while the queue is
+// full — back-pressure on the stream instead of spawning without limit.
+// Reports false when intake stopped first; the caller must then not save the
+// cursor, so the payment is replayed from Horizon after restart.
+func (w *Watcher) dispatch(ctx context.Context, job forwardJob) bool {
 	select {
 	case w.jobs <- job:
+		return true
 	case <-ctx.Done():
+		return false
 	}
 }
 
-// startWorkers launches the forward workers and returns a function that waits
-// for them to drain. Workers stop when ctx is cancelled.
-func (w *Watcher) startWorkers(ctx context.Context) func() {
-	var wg sync.WaitGroup
+// startWorkers launches the forward workers on the lifecycle tracker.
+//
+// intake is the stream's context: when it is cancelled no new payments arrive,
+// and each worker finishes whatever is already queued before exiting. That
+// matters because a queued payment's cursor is already saved — dropping it
+// would mean it is never forwarded. Each forward runs on the tracker's
+// context, which the shutdown signal doesn't cancel, so a transaction already
+// submitted is followed to completion. Drain bounds all of this by the
+// shutdown deadline.
+func (w *Watcher) startWorkers(intake context.Context) {
 	for range forwardWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		w.work.Go(func(workCtx context.Context) {
 			for {
 				select {
-				case <-ctx.Done():
-					return
 				case job := <-w.jobs:
-					// This watcher only sees payments to its own pool, so that is
-					// the pool holding the money for every job it dispatches.
-					w.forwarder.Forward(ctx, w.pool.Address, job.txHash, job.memoID, job.from, job.amount, job.asset)
+					w.forward(workCtx, job)
+				case <-intake.Done():
+					for {
+						select {
+						case job := <-w.jobs:
+							w.forward(workCtx, job)
+						default:
+							return
+						}
+					}
 				}
 			}
-		}()
+		})
 	}
-	return wg.Wait
+}
+
+// forward runs one job. This watcher only sees payments to its own pool, so
+// that is the pool holding the money for every job it dispatches.
+func (w *Watcher) forward(ctx context.Context, job forwardJob) {
+	w.forwarder.Forward(ctx, w.pool.Address, job.txHash, job.memoID, job.from, job.amount, job.asset)
 }
 
 // Run starts the SSE stream and reconnects automatically on any error.
 // Call in a goroutine: go watcher.Run(ctx).
 func (w *Watcher) Run(ctx context.Context) {
 	slog.Info("watcher: starting", "pool", w.pool.Address, "workers", forwardWorkers)
-	waitWorkers := w.startWorkers(ctx)
-	defer waitWorkers()
+	w.startWorkers(ctx)
 	for {
 		if err := w.stream(ctx); err != nil {
 			slog.Error("watcher: stream error, reconnecting in 5s", "pool", w.pool.Address, "err", err)
@@ -161,36 +183,32 @@ func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
 	}
 	tx := payment.Transaction
 
-	// Parse the memo — MEMO_ID or a numeric MEMO_TEXT.
-	memoID, err := memo.ParseID(tx.MemoType, tx.Memo)
-	if err != nil {
-		// No memo or wrong type — sweep to recovery via the forwarder.
-		slog.Warn("watcher: invalid memo, dispatching to forwarder for sweep",
-			"tx_hash", payment.TransactionHash, "memo_type", tx.MemoType, "memo", tx.Memo)
-		w.dispatch(ctx, forwardJob{
-			txHash: payment.TransactionHash,
-			from:   payment.From,
-			amount: payment.Amount,
-			asset:  assetID(payment),
-		})
-		w.saveCursor(ctx, op.PagingToken())
-		return
-	}
-
-	slog.Info("watcher: dispatching forward",
-		"tx_hash", payment.TransactionHash, "memo_id", memoID,
-		"from", payment.From, "amount", payment.Amount)
-
-	// Hand off to a worker so the stream is not blocked by submission latency.
-	// The forwarder owns all retry logic and DB updates.
-	w.dispatch(ctx, forwardJob{
+	job := forwardJob{
 		txHash: payment.TransactionHash,
-		memoID: memoID,
 		from:   payment.From,
 		amount: payment.Amount,
 		asset:  assetID(payment),
-	})
+	}
 
+	// Parse the memo — MEMO_ID or a numeric MEMO_TEXT.
+	memoID, err := memo.ParseID(tx.MemoType, tx.Memo)
+	if err != nil {
+		// No memo or wrong type — memo 0 matches no intent, so the forwarder
+		// sweeps it to recovery.
+		slog.Warn("watcher: invalid memo, dispatching to forwarder for sweep",
+			"tx_hash", payment.TransactionHash, "memo_type", tx.MemoType, "memo", tx.Memo)
+	} else {
+		job.memoID = memoID
+		slog.Info("watcher: dispatching forward",
+			"tx_hash", payment.TransactionHash, "memo_id", memoID,
+			"from", payment.From, "amount", payment.Amount)
+	}
+
+	// Hand off to a worker so the stream is not blocked by submission latency.
+	// The forwarder owns all retry logic and DB updates.
+	if !w.dispatch(ctx, job) {
+		return
+	}
 	w.saveCursor(ctx, op.PagingToken())
 }
 

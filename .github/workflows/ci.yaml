@@ -46,6 +46,24 @@ jobs:
     name: Test
     if: ${{ github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
+    # DB-backed tests (migrations, store) skip without TEST_DATABASE_URL, so
+    # CI provides a real Postgres rather than letting them silently skip.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: relayer
+          POSTGRES_PASSWORD: relayer
+          POSTGRES_DB: relayer_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relayer"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://relayer:relayer@localhost:5432/relayer_test?sslmode=disable
     steps:
       - uses: actions/checkout@v7
 

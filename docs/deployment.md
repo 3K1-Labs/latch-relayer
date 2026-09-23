@@ -31,7 +31,7 @@ No Redis needed here — unlike latch-api, latch-relayer has no OTP/rate-limit/p
    ```
 4. Save this as `DATABASE_URL`.
 
-**Unlike latch-api, there's no separate migrate step.** `latch-relayer` embeds its schema (`migrations/001_init.up.sql` via `//go:embed`) and applies it automatically on every boot (`IF NOT EXISTS` throughout, so it's safe to run on every restart). The first deploy will create the schema itself.
+**Unlike latch-api, there's no separate migrate step.** `latch-relayer` embeds its schema (`migrations/deposit/*.up.sql` via `//go:embed`) and applies it automatically on every boot. Applied files are recorded in a `schema_migrations` table, so each file runs once; an advisory lock stops two instances booting together from racing. The first deploy will create the schema itself.
 
 ---
 

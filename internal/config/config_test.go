@@ -2,6 +2,7 @@ package config
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/network"
 )
@@ -109,6 +110,64 @@ func TestLoad_MainnetPassphrase(t *testing.T) {
 	}
 	if cfg.NetworkPassphrase != network.PublicNetworkPassphrase {
 		t.Fatalf("expected mainnet passphrase, got: %s", cfg.NetworkPassphrase)
+	}
+}
+
+func TestLoad_CapacityDefaults(t *testing.T) {
+	validEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.DBMaxConns != 20 || cfg.DBMinConns != 2 || cfg.MaxInflight != 500 ||
+		cfg.RateLimitRPS != 100 || cfg.RateLimitBurst != 300 ||
+		cfg.RPCTimeout != 15*time.Second || cfg.ShutdownDrain != 30*time.Second {
+		t.Fatalf("unexpected capacity defaults: %+v", cfg)
+	}
+}
+
+func TestLoad_CapacityOverrides(t *testing.T) {
+	validEnv(t)
+	t.Setenv("DB_MAX_CONNS", "40")
+	t.Setenv("MAX_INFLIGHT_REQUESTS", "1000")
+	t.Setenv("RATE_LIMIT_RPS", "12.5")
+	t.Setenv("RPC_TIMEOUT_MS", "2500")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.DBMaxConns != 40 || cfg.MaxInflight != 1000 || cfg.RateLimitRPS != 12.5 || cfg.RPCTimeout != 2500*time.Millisecond {
+		t.Fatalf("overrides not applied: %+v", cfg)
+	}
+}
+
+func TestLoad_InvalidCapacityValues(t *testing.T) {
+	cases := map[string]string{
+		"DB_MAX_CONNS":           "zero",
+		"MAX_INFLIGHT_REQUESTS":  "-5",
+		"RATE_LIMIT_RPS":         "0",
+		"SHUTDOWN_DRAIN_SECONDS": "1.5",
+	}
+	for key, val := range cases {
+		t.Run(key, func(t *testing.T) {
+			validEnv(t)
+			t.Setenv(key, val)
+			if _, err := Load(); err == nil {
+				t.Fatalf("expected error for %s=%q", key, val)
+			}
+		})
+	}
+}
+
+func TestLoad_MinConnsAboveMax(t *testing.T) {
+	validEnv(t)
+	t.Setenv("DB_MAX_CONNS", "5")
+	t.Setenv("DB_MIN_CONNS", "6")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error when DB_MIN_CONNS > DB_MAX_CONNS")
 	}
 }
 
