@@ -19,8 +19,14 @@ import (
 //go:embed deposit/*.up.sql
 var depositFiles embed.FS
 
+//go:embed gasless/*.up.sql
+var gaslessFiles embed.FS
+
 // Deposit is the deposit bridge's schema (intents, forwards, cursors).
 var Deposit = Set{Name: "deposit", FS: mustSub(depositFiles, "deposit")}
+
+// Gasless is the gasless sponsor's schema (channel accounts, quotes, sponsored txs).
+var Gasless = Set{Name: "gasless", FS: mustSub(gaslessFiles, "gasless")}
 
 // Set is one service's migrations: `NNN_name.up.sql` files at the FS root.
 type Set struct {

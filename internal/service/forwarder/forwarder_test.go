@@ -713,7 +713,7 @@ func testConfig(t *testing.T) *config.Config {
 func testConfigWithKeypair(t *testing.T, kp *keypair.Full) *config.Config {
 	t.Helper()
 	return &config.Config{
-		NetworkPassphrase: network.TestNetworkPassphrase,
+		Common: config.Common{NetworkPassphrase: network.TestNetworkPassphrase},
 		PoolAccounts: []config.PoolAccount{
 			{Address: kp.Address(), Keypair: kp},
 		},

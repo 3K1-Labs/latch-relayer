@@ -14,6 +14,23 @@ services:
     security_opt:
       - no-new-privileges
 
+  # Gasless sponsorship service — separate process, env file, database and key.
+  gasless:
+    build:
+      context: .
+      dockerfile: Dockerfile.gasless
+    ports:
+      - "4001:4001"
+    env_file: gasless.env
+    environment:
+      DATABASE_URL: postgres://latch:latch@postgres:5432/latch_gasless?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure:3
+    security_opt:
+      - no-new-privileges
+
   postgres:
     image: postgres:17-alpine
     environment:
@@ -27,6 +44,7 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./scripts/docker/init-gasless-db.sql:/docker-entrypoint-initdb.d/init-gasless-db.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U latch -d latch_relayer"]
       interval: 5s
