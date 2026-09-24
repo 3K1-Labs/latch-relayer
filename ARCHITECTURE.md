@@ -85,7 +85,7 @@ Implementation: `txnbuild.NewPaymentToContract` builds an `InvokeHostFunction` o
 1. Build tx with placeholder fee
 2. `SimulateTransaction` via Stellar RPC → get real footprint + `MinResourceFee`
 3. Apply simulation result to XDR (`SorobanData` ext + updated fee)
-4. Re-parse, sign, submit via Horizon
+4. Re-parse, sign, record the hash on the forward row, submit via Stellar RPC `sendTransaction`, then poll `getTransaction` (see Idempotency)
 
 **Soroban transactions do not support memos** — the outbound forwarding tx carries no memo. Traceability is via the `forwards` table (`tx_hash` → `forward_tx`).
 
@@ -100,7 +100,7 @@ Not needed. The relay controls the pooled G-address and is both the signer and f
 - wallet-backend is NOT used for the deposit hot path
 
 ### Multiple Pooled Addresses
-Config supports `POOL_ADDRESS_N` / `POOL_PRIVATE_KEY_N` for N pool accounts. One watcher goroutine per pool. Currently intent creation always picks `PoolAccounts[0]` — round-robin or least-loaded assignment is a future improvement.
+Config supports `POOL_ADDRESS_N` / `POOL_PRIVATE_KEY_N` for N pool accounts. One watcher goroutine per pool. Intent creation round-robins across the pools (`internal/handler/handler.go`). Each pool account still lands at most one transaction per ledger (Stellar Core holds one pending transaction per source account), so scaling throughput with channel accounts rather than more pool keys is tracked in #48.
 
 ### Idempotency
 Incoming deposit `tx_hash` is unique on Stellar. `INSERT ... ON CONFLICT (tx_hash) DO NOTHING` ensures replaying the same SSE event is safe.
