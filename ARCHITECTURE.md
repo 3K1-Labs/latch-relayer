@@ -105,6 +105,15 @@ Config supports `POOL_ADDRESS_N` / `POOL_PRIVATE_KEY_N` for N pool accounts. One
 ### Idempotency
 Incoming deposit `tx_hash` is unique on Stellar. `INSERT ... ON CONFLICT (tx_hash) DO NOTHING` ensures replaying the same SSE event is safe.
 
+The outbound transfer is guarded separately. The signed transaction's hash and max time are written to `forwards.submitted_tx` and `submitted_until` **before** it is sent.
+
+After that point, an unknown outcome is never retried by building a new transfer. That covers a send error, a poll timeout and a crash. The retry worker looks the recorded hash up first:
+- `SUCCESS` marks the forward done.
+- `FAILED` closes the forward if the cause is permanent, otherwise rebuilds it.
+- `NOT_FOUND` waits until RPC has ingested a ledger past the max time, then rebuilds. If RPC's history no longer covers the submission, the forward is failed for manual reconciliation instead.
+
+Forwards are valid for 2 minutes, so an unresolved one is settled within a few minutes. See #50.
+
 ### Retry Strategy
 ```
 SSE stream → dispatch goroutine (non-blocking)

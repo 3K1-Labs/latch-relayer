@@ -78,6 +78,14 @@ type mockStore struct {
 	requeueCalls        []markFailedCall
 	permFailCalls       []permanentlyFailCall
 	failIntentCalls     []uint64
+	recordCalls         []recordCall
+	clearCalls          []string
+	recordErr           error
+}
+
+type recordCall struct {
+	txHash, submittedTx string
+	until               time.Time
 }
 
 func (m *mockStore) InsertForward(_ context.Context, _ string, _ uint64, poolAddress, _, _, _ string) (bool, error) {
@@ -114,6 +122,17 @@ func (m *mockStore) FailIntent(_ context.Context, memoID uint64) error {
 	m.failIntentCalls = append(m.failIntentCalls, memoID)
 	return nil
 }
+func (m *mockStore) RecordSubmission(_ context.Context, txHash, submittedTx string, until time.Time) error {
+	if m.recordErr != nil {
+		return m.recordErr
+	}
+	m.recordCalls = append(m.recordCalls, recordCall{txHash, submittedTx, until})
+	return nil
+}
+func (m *mockStore) ClearSubmission(_ context.Context, txHash string) error {
+	m.clearCalls = append(m.clearCalls, txHash)
+	return nil
+}
 
 type mockHorizon struct {
 	account    hProtocol.Account
@@ -145,8 +164,12 @@ type mockRPC struct {
 	sendErr  error
 	pollResp rpcprotocol.GetTransactionResponse
 	pollErr  error
+	getResp  rpcprotocol.GetTransactionResponse
+	getErr   error
 
 	simulated []string // transaction XDR of each simulation request
+	sent      int      // SendTransaction calls
+	looked    []string // hashes passed to GetTransaction
 }
 
 func (m *mockRPC) SimulateTransaction(_ context.Context, req rpcprotocol.SimulateTransactionRequest) (rpcprotocol.SimulateTransactionResponse, error) {
@@ -154,7 +177,12 @@ func (m *mockRPC) SimulateTransaction(_ context.Context, req rpcprotocol.Simulat
 	return m.simResp, m.simErr
 }
 func (m *mockRPC) SendTransaction(_ context.Context, _ rpcprotocol.SendTransactionRequest) (rpcprotocol.SendTransactionResponse, error) {
+	m.sent++
 	return m.sendResp, m.sendErr
+}
+func (m *mockRPC) GetTransaction(_ context.Context, req rpcprotocol.GetTransactionRequest) (rpcprotocol.GetTransactionResponse, error) {
+	m.looked = append(m.looked, req.Hash)
+	return m.getResp, m.getErr
 }
 func (m *mockRPC) PollTransaction(_ context.Context, _ string) (rpcprotocol.GetTransactionResponse, error) {
 	return m.pollResp, m.pollErr

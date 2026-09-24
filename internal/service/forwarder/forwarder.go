@@ -36,6 +36,8 @@ type forwardStore interface {
 	RequeueForContention(ctx context.Context, txHash, errMsg string) error
 	PermanentlyFail(ctx context.Context, txHash, errMsg string) error
 	FailIntent(ctx context.Context, memoID uint64) error
+	RecordSubmission(ctx context.Context, txHash, submittedTx string, until time.Time) error
+	ClearSubmission(ctx context.Context, txHash string) error
 }
 
 // horizonClient is the subset of horizonclient.Client used by Forwarder.
@@ -49,6 +51,7 @@ type rpcClient interface {
 	SimulateTransaction(ctx context.Context, request rpcprotocol.SimulateTransactionRequest) (rpcprotocol.SimulateTransactionResponse, error)
 	SendTransaction(ctx context.Context, request rpcprotocol.SendTransactionRequest) (rpcprotocol.SendTransactionResponse, error)
 	PollTransaction(ctx context.Context, txHash string) (rpcprotocol.GetTransactionResponse, error)
+	GetTransaction(ctx context.Context, request rpcprotocol.GetTransactionRequest) (rpcprotocol.GetTransactionResponse, error)
 }
 
 const (
@@ -70,8 +73,21 @@ const (
 	ledgerTime = 5 * time.Second
 
 	// pollTimeout is the max time we wait for a PENDING transaction to reach a
-	// terminal state on-chain before declaring a transient failure.
+	// terminal state on-chain before handing it to the retry worker to resolve.
 	pollTimeout = 60 * time.Second
+
+	// txValidity is how long an outbound forward stays valid (its time bounds).
+	// It is also how long a forward whose outcome is unknown must wait before it
+	// may be built again: until then the first transaction can still land, and a
+	// second one would pay the C-address twice. Long enough to cover simulation,
+	// the TRY_AGAIN_LATER loop and the poll; short enough that an unresolved
+	// forward is retried within a few minutes.
+	txValidity = 2 * time.Minute
+
+	// landingGrace is added to a transaction's max time before treating "not
+	// found" as "never landed", to absorb clock skew against ledger close times
+	// and RPC ingestion lag.
+	landingGrace = 30 * time.Second
 )
 
 // Forwarder builds, signs, and submits the outbound payment for each inbound deposit.
@@ -110,9 +126,10 @@ func (f *Forwarder) seq() *sequencer {
 // Transient errors are safe to retry (network timeout, sequence race, fee congestion,
 // RPC overload). On transient failure the forward goes to pending_retry.
 type submitError struct {
-	permanent  bool
-	contention bool
-	err        error
+	permanent   bool
+	contention  bool
+	unconfirmed bool
+	err         error
 }
 
 func (e *submitError) Error() string { return e.err.Error() }
@@ -130,6 +147,18 @@ func transient(err error) error { return &submitError{permanent: false, err: err
 // forwards that are holding real customer funds — the more load, the more
 // likely, which is exactly backwards.
 func contention(err error) error { return &submitError{contention: true, err: err} }
+
+// unconfirmed marks a failure after which the transaction may still land: the
+// send call errored, or it was accepted and never seen to settle. Retrying such a
+// forward means resolving the recorded transaction, never building a new one —
+// the first can be included until its time bounds pass, so a second transfer
+// would pay the C-address twice for one deposit.
+func unconfirmed(err error) error { return &submitError{unconfirmed: true, err: err} }
+
+func isUnconfirmed(err error) bool {
+	var se *submitError
+	return errors.As(err, &se) && se.unconfirmed
+}
 
 func isContention(err error) bool {
 	var se *submitError
@@ -243,7 +272,7 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 			}
 		}
 
-		outboundHash, err := f.submit(ctx, intent.CAddress, poolAddress, amount, asset)
+		outboundHash, err := f.submit(ctx, txHash, intent.CAddress, poolAddress, amount, asset)
 		if err == nil {
 			_ = f.store.MarkForwardDone(ctx, txHash, outboundHash)
 			_ = f.store.CompleteIntent(ctx, memoID)
@@ -252,6 +281,16 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 			slog.Info("forwarder: forwarded",
 				"inbound", txHash, "outbound", outboundHash,
 				"memo_id", memoID, "amount", amount)
+			return
+		}
+
+		// The transfer may be in flight, so another attempt here could pay twice.
+		// Hand it to the retry worker, which resolves the recorded transaction
+		// before it will build a new one. Not charged: nothing has failed yet.
+		if isUnconfirmed(err) {
+			_ = f.store.RequeueForContention(ctx, txHash, err.Error())
+			slog.Warn("forwarder: outcome unknown, left for the retry worker to resolve",
+				"tx_hash", txHash, "err", err)
 			return
 		}
 
@@ -311,6 +350,15 @@ func mismatchesExpected(expected, received string) bool {
 
 // Retry is called by the background retry worker for pending_retry forwards.
 func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
+	// A transfer already put on the network is resolved before anything else —
+	// ahead of the ceiling too, since one that landed must be recorded as done,
+	// not failed.
+	if fwd.SubmittedTx != nil {
+		if settled := f.resolveSubmitted(ctx, fwd); settled {
+			return
+		}
+	}
+
 	// enforce retry ceiling — a forward that has already failed maxRetries
 	// times will never succeed and must be permanently closed.
 	if fwd.Retries >= maxRetries {
@@ -340,8 +388,15 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 		poolAddress = intent.PoolAddress
 	}
 
-	outboundHash, err := f.submit(ctx, intent.CAddress, poolAddress, fwd.Amount, fwd.Asset)
+	outboundHash, err := f.submit(ctx, fwd.TxHash, intent.CAddress, poolAddress, fwd.Amount, fwd.Asset)
 	if err != nil {
+		// May be in flight — the next tick resolves it. Not charged.
+		if isUnconfirmed(err) {
+			_ = f.store.RequeueForContention(ctx, fwd.TxHash, err.Error())
+			slog.Warn("forwarder: retry outcome unknown, will resolve next tick",
+				"tx_hash", fwd.TxHash, "err", err)
+			return
+		}
 		// Permanent error — do not re-queue, close the forward for good.
 		if isPermanent(err) {
 			_ = f.store.PermanentlyFail(ctx, fwd.TxHash, err.Error())
@@ -367,11 +422,105 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 		return
 	}
 
+	f.completeRetried(ctx, fwd, outboundHash)
+	slog.Info("forwarder: retry succeeded", "inbound", fwd.TxHash, "outbound", outboundHash)
+}
+
+func (f *Forwarder) completeRetried(ctx context.Context, fwd store.Forward, outboundHash string) {
 	_ = f.store.MarkForwardDone(ctx, fwd.TxHash, outboundHash)
 	_ = f.store.CompleteIntent(ctx, fwd.MemoID)
 	metrics.ForwardsTotal.WithLabelValues("done").Inc()
 	metrics.DepositToCreditSeconds.Observe(time.Since(fwd.CreatedAt).Seconds())
-	slog.Info("forwarder: retry succeeded", "inbound", fwd.TxHash, "outbound", outboundHash)
+}
+
+// resolveSubmitted settles a forward whose earlier transfer was put on the
+// network with its outcome unknown. It reports true when the forward is settled
+// or must keep waiting, and false only when that transfer is known never to have
+// moved funds — the one case in which building a new transfer is safe.
+func (f *Forwarder) resolveSubmitted(ctx context.Context, fwd store.Forward) bool {
+	hash := *fwd.SubmittedTx
+	resp, err := f.rpc.GetTransaction(ctx, rpcprotocol.GetTransactionRequest{Hash: hash})
+	if err != nil {
+		_ = f.store.RequeueForContention(ctx, fwd.TxHash, fmt.Sprintf("resolve %s: %v", hash, err))
+		slog.Warn("forwarder: cannot resolve in-flight transfer yet",
+			"tx_hash", fwd.TxHash, "submitted_tx", hash, "err", err)
+		return true
+	}
+
+	switch resp.Status {
+	case rpcprotocol.TransactionStatusSuccess:
+		f.completeRetried(ctx, fwd, hash)
+		slog.Info("forwarder: in-flight transfer had landed", "inbound", fwd.TxHash, "outbound", hash)
+		return true
+
+	case rpcprotocol.TransactionStatusFailed:
+		// Included but failed: the transfer did not happen. A permanent cause
+		// would fail again, so close it; otherwise it is safe to build anew.
+		cause := classifyResultXDR(resp.ResultXDR)
+		if isPermanent(cause) {
+			_ = f.store.PermanentlyFail(ctx, fwd.TxHash, cause.Error())
+			_ = f.store.FailIntent(ctx, fwd.MemoID)
+			slog.Error("forwarder: in-flight transfer failed on-chain, permanent",
+				"tx_hash", fwd.TxHash, "submitted_tx", hash, "err", cause)
+			return true
+		}
+		return !f.forgetSubmission(ctx, fwd.TxHash)
+
+	default: // NOT_FOUND
+		// Not seen yet. It can still land until its max time has passed, so wait
+		// that out rather than risk a second transfer.
+		until := fwd.UpdatedAt.Add(txValidity)
+		if fwd.SubmittedUntil != nil {
+			until = *fwd.SubmittedUntil
+		}
+		if !pastMaxTime(resp, until) {
+			_ = f.store.RequeueForContention(ctx, fwd.TxHash,
+				fmt.Sprintf("awaiting %s (valid until %s)", hash, until.UTC().Format(time.RFC3339)))
+			return true
+		}
+
+		// "Not found" only proves it never landed if RPC still holds every ledger
+		// it could have landed in. After an outage longer than RPC's retention a
+		// transfer that did land also reads as not found, and rebuilding would pay
+		// twice. Close it for a human to reconcile instead; the intent is left as
+		// is, since the deposit may well have been credited.
+		sent := until.Add(-txValidity)
+		if resp.OldestLedgerCloseTime != 0 && time.Unix(resp.OldestLedgerCloseTime, 0).After(sent) {
+			_ = f.store.PermanentlyFail(ctx, fwd.TxHash, fmt.Sprintf(
+				"outcome of %s unknown: older than RPC history — reconcile on-chain before re-forwarding", hash))
+			slog.Error("forwarder: in-flight transfer outside RPC history, needs manual reconciliation",
+				"tx_hash", fwd.TxHash, "submitted_tx", hash, "sent", sent,
+				"rpc_oldest", time.Unix(resp.OldestLedgerCloseTime, 0))
+			return true
+		}
+
+		slog.Warn("forwarder: in-flight transfer expired without landing, rebuilding",
+			"tx_hash", fwd.TxHash, "submitted_tx", hash)
+		return !f.forgetSubmission(ctx, fwd.TxHash)
+	}
+}
+
+// pastMaxTime reports whether a transaction valid until `until` can no longer be
+// included. The network's own clock decides that — no ledger closing after the
+// max time can include it — so it uses the latest ledger RPC has ingested,
+// which also absorbs RPC ingestion lag. Only when RPC does not report one does
+// it fall back to the local clock plus landingGrace.
+func pastMaxTime(resp rpcprotocol.GetTransactionResponse, until time.Time) bool {
+	if resp.LatestLedgerCloseTime != 0 {
+		return time.Unix(resp.LatestLedgerCloseTime, 0).After(until)
+	}
+	return time.Now().After(until.Add(landingGrace))
+}
+
+// forgetSubmission clears a forward's in-flight transaction once it is known
+// never to transfer funds. It reports whether that succeeded; if not, the hash
+// stays recorded and the next resolution simply finds it expired again.
+func (f *Forwarder) forgetSubmission(ctx context.Context, txHash string) bool {
+	if err := f.store.ClearSubmission(ctx, txHash); err != nil {
+		slog.Error("forwarder: clear submission", "tx_hash", txHash, "err", err)
+		return false
+	}
+	return true
 }
 
 // ── Submit pipeline ───────────────────────────────────────────────────────────
@@ -397,7 +546,9 @@ func parseAsset(asset string) (txnbuild.Asset, error) {
 	return txnbuild.CreditAsset{Code: code, Issuer: issuer}, nil
 }
 
-func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, asset string) (hash string, err error) {
+// inboundHash identifies the forward row the transfer is recorded against
+// before it is sent; see RecordSubmission.
+func (f *Forwarder) submit(ctx context.Context, inboundHash, cAddress, poolAddress, amount, asset string) (hash string, err error) {
 	kp, err := f.keypairFor(poolAddress)
 	if err != nil {
 		return "", permanent(err)
@@ -441,6 +592,9 @@ func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, a
 		return "", permanent(err)
 	}
 
+	// Whole seconds, so the recorded deadline is exactly the max time on-chain.
+	validUntil := time.Now().Add(txValidity).Truncate(time.Second)
+
 	// Classic Payment only accepts G-addresses. C-addresses (Soroban contracts)
 	// must be paid via the asset's SAC transfer function instead.
 	op, err := txnbuild.NewPaymentToContract(txnbuild.PaymentToContractParams{
@@ -464,7 +618,7 @@ func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, a
 		Operations:           []txnbuild.Operation{&op},
 		BaseFee:              txnbuild.MinBaseFee,
 		Preconditions: txnbuild.Preconditions{
-			TimeBounds: txnbuild.NewTimeout(300),
+			TimeBounds: txnbuild.NewTimebounds(0, validUntil.Unix()),
 		},
 	})
 	if err != nil {
@@ -506,13 +660,18 @@ func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, a
 	// fee portion changes. detect tx_insufficient_fee and double the fee.
 	inclusionFee := uint32(txnbuild.MinBaseFee)
 	for feeAttempt := range maxFeeRetries + 1 {
-		hash, err = f.signAndSend(ctx, kp, env, sorobanData, simResp.MinResourceFee, inclusionFee)
+		hash, err = f.signAndSend(ctx, inboundHash, kp, env, sorobanData, simResp.MinResourceFee, inclusionFee, validUntil)
 		if err == nil {
 			// Accepted by the network, so this sequence number is spent and the
 			// next forward may proceed. Confirmation is polled without the lock.
 			unlockSend()
 			sendDone = true
-			return f.pollResult(ctx, hash)
+			hash, err = f.pollResult(ctx, hash)
+			if err != nil && !isUnconfirmed(err) {
+				// Settled as failed: this transaction moved nothing.
+				f.forgetSubmission(ctx, inboundHash)
+			}
+			return hash, err
 		}
 
 		var fe *feeError
@@ -541,13 +700,21 @@ func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, a
 // Stellar-native status codes including TRY_AGAIN_LATER and ERROR result codes.
 //
 // retries on TRY_AGAIN_LATER up to maxTryAgain times with a one-ledger sleep.
+//
+// The signed transaction's hash is recorded against the forward before the first
+// send, so a crash or a lost response after this point is resolved by looking
+// that hash up rather than by paying again. Every return that means "never
+// queued" clears it again; every return that means "may be queued" is
+// unconfirmed and leaves it in place.
 func (f *Forwarder) signAndSend(
 	ctx context.Context,
+	inboundHash string,
 	kp *keypair.Full,
 	env xdr.TransactionEnvelope,
 	sorobanData xdr.SorobanTransactionData,
 	minResourceFee int64,
 	inclusionFee uint32,
+	validUntil time.Time,
 ) (string, error) {
 	// Apply the simulation footprint and total fee.
 	// total = inclusion (per-op base fee) + resource (from simulation) + buffer.
@@ -579,6 +746,16 @@ func (f *Forwarder) signAndSend(
 	}
 	signedB64 := base64.StdEncoding.EncodeToString(signedBytes)
 
+	txHash, err := tx.HashHex(f.config.NetworkPassphrase)
+	if err != nil {
+		return "", permanent(fmt.Errorf("hash tx: %w", err))
+	}
+	if err := f.store.RecordSubmission(ctx, inboundHash, txHash, validUntil); err != nil {
+		// Nothing sent: without the record, a lost response could not be told
+		// apart from a transfer that never happened.
+		return "", transient(err)
+	}
+
 	// TRY_AGAIN_LATER retry loop — Stellar Core's mempool can be temporarily full.
 	// The correct response is to wait one ledger cycle (~5s) and resubmit the same
 	// signed envelope. We do not count these as failures.
@@ -586,6 +763,8 @@ func (f *Forwarder) signAndSend(
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
+				// An earlier attempt got TRY_AGAIN_LATER, so nothing is queued.
+				f.forgetSubmission(ctx, inboundHash)
 				return "", transient(ctx.Err())
 			case <-time.After(ledgerTime):
 			}
@@ -595,7 +774,8 @@ func (f *Forwarder) signAndSend(
 			Transaction: signedB64,
 		})
 		if err != nil {
-			return "", transient(fmt.Errorf("send transaction: %w", err))
+			// The request may have reached the network before the error.
+			return "", unconfirmed(fmt.Errorf("send transaction %s: %w", txHash, err))
 		}
 
 		switch resp.Status {
@@ -614,12 +794,16 @@ func (f *Forwarder) signAndSend(
 				"attempt", attempt+1, "max", maxTryAgain)
 			continue
 		case "ERROR":
+			// Rejected before entering the queue: it can never land.
+			f.forgetSubmission(ctx, inboundHash)
 			return "", classifyResultXDR(resp.ErrorResultXDR)
 		default:
-			return "", transient(fmt.Errorf("unknown send status: %s", resp.Status))
+			return "", unconfirmed(fmt.Errorf("unknown send status %s for %s", resp.Status, txHash))
 		}
 	}
 
+	// TRY_AGAIN_LATER means not queued, every time.
+	f.forgetSubmission(ctx, inboundHash)
 	return "", transient(fmt.Errorf("TRY_AGAIN_LATER after %d retries", maxTryAgain))
 }
 
@@ -631,7 +815,8 @@ func (f *Forwarder) pollResult(ctx context.Context, hash string) (string, error)
 
 	result, err := f.rpc.PollTransaction(pollCtx, hash)
 	if err != nil {
-		return "", transient(fmt.Errorf("poll transaction %s: %w", hash, err))
+		// Accepted but not seen to settle; it may still land.
+		return "", unconfirmed(fmt.Errorf("poll transaction %s: %w", hash, err))
 	}
 
 	switch result.Status {
@@ -641,7 +826,7 @@ func (f *Forwarder) pollResult(ctx context.Context, hash string) (string, error)
 		// Classify the on-chain failure to decide whether retry makes sense.
 		return "", classifyResultXDR(result.ResultXDR)
 	default:
-		return "", transient(fmt.Errorf("unexpected poll status %s for %s", result.Status, hash))
+		return "", unconfirmed(fmt.Errorf("unexpected poll status %s for %s", result.Status, hash))
 	}
 }
 

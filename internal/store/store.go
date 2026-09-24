@@ -60,6 +60,11 @@ type Forward struct {
 	// PoolAddress is the pool account that received the inbound payment; "" for
 	// rows recorded before it was tracked.
 	PoolAddress string
+	// SubmittedTx is the outbound transaction put on the network but not yet
+	// seen to settle, and SubmittedUntil the time after which it can no longer
+	// land. Both are nil when no transfer is in flight.
+	SubmittedTx    *string
+	SubmittedUntil *time.Time
 }
 
 // Store wraps a pgxpool and exposes all database operations the relayer needs.
@@ -227,11 +232,44 @@ func (s *Store) InsertForward(ctx context.Context, txHash string, memoID uint64,
 func (s *Store) MarkForwardDone(ctx context.Context, txHash, forwardTx string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE forwards
-		SET status = $1, forward_tx = $2, updated_at = NOW()
+		SET status = $1, forward_tx = $2,
+		    submitted_tx = NULL, submitted_until = NULL, updated_at = NOW()
 		WHERE tx_hash = $3
 	`, StatusDone, forwardTx, txHash)
 	if err != nil {
 		return fmt.Errorf("mark forward done: %w", err)
+	}
+	return nil
+}
+
+// RecordSubmission notes the outbound transaction about to be sent for a
+// forward, and the time after which it can no longer land. It must be written
+// before the transaction is sent: from then on the transfer may be in flight,
+// and anything that retries this forward has to resolve this hash rather than
+// build a second transfer.
+func (s *Store) RecordSubmission(ctx context.Context, txHash, submittedTx string, until time.Time) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE forwards
+		SET submitted_tx = $1, submitted_until = $2, updated_at = NOW()
+		WHERE tx_hash = $3
+	`, submittedTx, until, txHash)
+	if err != nil {
+		return fmt.Errorf("record submission: %w", err)
+	}
+	return nil
+}
+
+// ClearSubmission forgets a forward's in-flight transaction once it is known it
+// will never transfer anything — rejected before entering the queue, failed
+// on-chain, or expired without landing — so the forward may be built again.
+func (s *Store) ClearSubmission(ctx context.Context, txHash string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE forwards
+		SET submitted_tx = NULL, submitted_until = NULL, updated_at = NOW()
+		WHERE tx_hash = $1
+	`, txHash)
+	if err != nil {
+		return fmt.Errorf("clear submission: %w", err)
 	}
 	return nil
 }
@@ -287,7 +325,7 @@ func (s *Store) GetForwardByMemoID(ctx context.Context, memoID uint64) ([]Forwar
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, tx_hash, memo_id, from_address, amount, asset,
 		       forward_tx, status, retries, error, created_at, updated_at,
-		       COALESCE(pool_address, '')
+		       COALESCE(pool_address, ''), submitted_tx, submitted_until
 		FROM forwards WHERE memo_id = $1
 		ORDER BY created_at DESC
 	`, int64(memoID))
@@ -307,7 +345,7 @@ func (s *Store) GetPendingRetries(ctx context.Context) ([]Forward, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, tx_hash, memo_id, from_address, amount, asset,
 		       forward_tx, status, retries, error, created_at, updated_at,
-		       COALESCE(pool_address, '')
+		       COALESCE(pool_address, ''), submitted_tx, submitted_until
 		FROM forwards
 		WHERE status = 'pending_retry'
 		   OR (status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes')
@@ -369,6 +407,7 @@ func scanForwards(rows pgx.Rows) ([]Forward, error) {
 			&f.ID, &f.TxHash, &rawID, &f.FromAddress, &f.Amount, &f.Asset,
 			&f.ForwardTx, &f.Status, &f.Retries, &f.Error,
 			&f.CreatedAt, &f.UpdatedAt, &f.PoolAddress,
+			&f.SubmittedTx, &f.SubmittedUntil,
 		); err != nil {
 			return nil, fmt.Errorf("scan forward: %w", err)
 		}
