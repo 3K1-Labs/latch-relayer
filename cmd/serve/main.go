@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -69,22 +66,8 @@ func main() {
 	// ── 4. Core services ──────────────────────────────────────────────────────
 	st := store.New(pool)
 
-	// Shared transport for all outbound Stellar calls.
-	// OZ constants: connect 2s, keep-alive 30s. The stdlib default keeps only 2
-	// idle connections per host, so under concurrent load every extra call to
-	// RPC/Horizon would open a fresh TCP+TLS connection.
-	stellarTransport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   2 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        256,
-		MaxIdleConnsPerHost: 64,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 5 * time.Second,
-	}
+	// Shared transport (connection pool) for all outbound Stellar calls.
+	stellarTransport := httpx.OutboundTransport()
 	horizonHTTP := &http.Client{Timeout: 10 * time.Second, Transport: stellarTransport}
 	// RPC gets its own timeout: simulating a Soroban call that runs a smart
 	// account's __check_auth can legitimately take longer than a Horizon read.
@@ -132,7 +115,7 @@ func main() {
 	// after auth so only a valid caller ever gets a bucket. Metrics must reach
 	// the mux without a request copy in between to see the route pattern.
 	var root http.Handler = mux
-	root = limiter.Middleware(callerKey, m.Rejected)(root)
+	root = limiter.Middleware(httpx.CallerKey, m.Rejected)(root)
 	root = h.RequireAPIKey(root)
 	root = httpx.LimitInflight(cfg.MaxInflight, draining, m.Rejected)(root)
 	root = m.Middleware(root)
@@ -193,12 +176,4 @@ func main() {
 	}
 
 	slog.Info("shutdown complete")
-}
-
-// callerKey identifies the caller for rate limiting. Runs after auth, so the
-// bearer token is always a valid key here; hashing keeps the secret itself out
-// of the limiter's map.
-func callerKey(r *http.Request) string {
-	sum := sha256.Sum256([]byte(r.Header.Get("Authorization")))
-	return hex.EncodeToString(sum[:8])
 }

@@ -13,7 +13,7 @@ const testAPIKey = "0123456789abcdef0123456789abcdef"
 // authTestHandler returns a Handler wired with only the config the middleware
 // touches. The store is nil: RequireAPIKey must reject before anything reaches it.
 func authTestHandler() *Handler {
-	return New(nil, &config.Config{APIKey: testAPIKey})
+	return New(nil, &config.Config{Common: config.Common{APIKey: testAPIKey}})
 }
 
 func TestRequireAPIKey(t *testing.T) {
@@ -90,24 +90,5 @@ func TestRequireAPIKey(t *testing.T) {
 				t.Errorf("next called = %v, want %v", called, tc.wantCalled)
 			}
 		})
-	}
-}
-
-func TestBearerToken(t *testing.T) {
-	cases := []struct{ header, want string }{
-		{"Bearer abc", "abc"},
-		{"bearer abc", "abc"}, // scheme is case-insensitive per RFC 7235
-		{"Bearer  abc ", "abc"},
-		{"", ""},
-		{"Bearer", ""},
-		{"Bearer ", ""},
-		{"Basic abc", ""},
-		{"abc", ""},
-	}
-
-	for _, tc := range cases {
-		if got := bearerToken(tc.header); got != tc.want {
-			t.Errorf("bearerToken(%q) = %q, want %q", tc.header, got, tc.want)
-		}
 	}
 }

@@ -1,0 +1,31 @@
+# Gasless sponsorship service (cmd/gasless). Same shape as ./Dockerfile, which
+# builds the deposit bridge (cmd/serve); each is its own Render service.
+
+# Build stage
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /app
+
+# Cache dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o latch-gasless ./cmd/gasless
+
+# Runtime stage — minimal Alpine image
+FROM alpine:3.21
+
+# ca-certificates: needed for TLS calls to Stellar RPC
+RUN apk add --no-cache ca-certificates
+
+# Run as non-root — principle of least privilege
+RUN addgroup -S nonroot && adduser -S nonroot -G nonroot
+USER nonroot
+
+WORKDIR /app
+COPY --from=builder --chown=nonroot:nonroot /app/latch-gasless .
+
+EXPOSE 4001
+
+ENTRYPOINT ["/app/latch-gasless"]

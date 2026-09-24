@@ -183,3 +183,21 @@ func TestLoad_DefaultPort(t *testing.T) {
 		t.Fatalf("expected default port 4000, got %s", cfg.Port)
 	}
 }
+
+func TestLoad_RetryInterval(t *testing.T) {
+	validEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.RetryInterval != 10*time.Second {
+		t.Fatalf("default RetryInterval = %v, want 10s", cfg.RetryInterval)
+	}
+
+	// A typo fails the boot like every other setting, rather than silently
+	// running with the default.
+	t.Setenv("RETRY_INTERVAL_SEC", "ten")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for a non-numeric RETRY_INTERVAL_SEC")
+	}
+}
