@@ -83,7 +83,9 @@ func (w *Watcher) startWorkers(ctx context.Context) func() {
 				case <-ctx.Done():
 					return
 				case job := <-w.jobs:
-					w.forwarder.Forward(ctx, job.txHash, job.memoID, job.from, job.amount, job.asset)
+					// This watcher only sees payments to its own pool, so that is
+					// the pool holding the money for every job it dispatches.
+					w.forwarder.Forward(ctx, w.pool.Address, job.txHash, job.memoID, job.from, job.amount, job.asset)
 				}
 			}
 		}()

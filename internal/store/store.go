@@ -57,6 +57,9 @@ type Forward struct {
 	Error       *string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+	// PoolAddress is the pool account that received the inbound payment; "" for
+	// rows recorded before it was tracked.
+	PoolAddress string
 }
 
 // Store wraps a pgxpool and exposes all database operations the relayer needs.
@@ -208,12 +211,12 @@ func (s *Store) ExpireStaleIntents(ctx context.Context) (int64, error) {
 // for txHash. Callers must stop on false: ON CONFLICT DO NOTHING makes the
 // insert idempotent, but it does not make the outbound transfer idempotent, and
 // the same deposit reaching submit() twice pays the C-address twice.
-func (s *Store) InsertForward(ctx context.Context, txHash string, memoID uint64, fromAddress, amount, asset string) (bool, error) {
+func (s *Store) InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO forwards (tx_hash, memo_id, from_address, amount, asset)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO forwards (tx_hash, memo_id, pool_address, from_address, amount, asset)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (tx_hash) DO NOTHING
-	`, txHash, int64(memoID), fromAddress, amount, asset)
+	`, txHash, int64(memoID), poolAddress, fromAddress, amount, asset)
 	if err != nil {
 		return false, fmt.Errorf("insert forward: %w", err)
 	}
@@ -283,7 +286,8 @@ func (s *Store) PermanentlyFail(ctx context.Context, txHash, errMsg string) erro
 func (s *Store) GetForwardByMemoID(ctx context.Context, memoID uint64) ([]Forward, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, tx_hash, memo_id, from_address, amount, asset,
-		       forward_tx, status, retries, error, created_at, updated_at
+		       forward_tx, status, retries, error, created_at, updated_at,
+		       COALESCE(pool_address, '')
 		FROM forwards WHERE memo_id = $1
 		ORDER BY created_at DESC
 	`, int64(memoID))
@@ -302,7 +306,8 @@ func (s *Store) GetForwardByMemoID(ctx context.Context, memoID uint64) ([]Forwar
 func (s *Store) GetPendingRetries(ctx context.Context) ([]Forward, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, tx_hash, memo_id, from_address, amount, asset,
-		       forward_tx, status, retries, error, created_at, updated_at
+		       forward_tx, status, retries, error, created_at, updated_at,
+		       COALESCE(pool_address, '')
 		FROM forwards
 		WHERE status = 'pending_retry'
 		   OR (status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes')
@@ -363,7 +368,7 @@ func scanForwards(rows pgx.Rows) ([]Forward, error) {
 		if err := rows.Scan(
 			&f.ID, &f.TxHash, &rawID, &f.FromAddress, &f.Amount, &f.Asset,
 			&f.ForwardTx, &f.Status, &f.Retries, &f.Error,
-			&f.CreatedAt, &f.UpdatedAt,
+			&f.CreatedAt, &f.UpdatedAt, &f.PoolAddress,
 		); err != nil {
 			return nil, fmt.Errorf("scan forward: %w", err)
 		}

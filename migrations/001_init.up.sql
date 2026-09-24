@@ -46,3 +46,11 @@ CREATE TABLE IF NOT EXISTS cursors (
     cursor       TEXT        NOT NULL,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- The pool account that actually received each inbound payment. Deposits are
+-- spread across pools (round-robin at intent creation), and a depositor can pay
+-- a different pool than the one their intent named, so the forward and any
+-- recovery sweep must move money out of the pool that holds it — not the
+-- intent's pool, and never a fixed PoolAccounts[0]. NULL on rows recorded
+-- before this column existed; those fall back to the intent's pool.
+ALTER TABLE forwards ADD COLUMN IF NOT EXISTS pool_address TEXT;

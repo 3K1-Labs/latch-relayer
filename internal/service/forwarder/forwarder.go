@@ -28,7 +28,7 @@ import (
 // forwardStore is the subset of store.Store that Forwarder calls.
 // Narrow interface keeps test mocks small.
 type forwardStore interface {
-	InsertForward(ctx context.Context, txHash string, memoID uint64, fromAddress, amount, asset string) (bool, error)
+	InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string) (bool, error)
 	GetIntentByMemoID(ctx context.Context, memoID uint64) (*store.Intent, error)
 	MarkForwardDone(ctx context.Context, txHash, forwardTx string) error
 	CompleteIntent(ctx context.Context, memoID uint64) error
@@ -158,12 +158,16 @@ var backoffs = []time.Duration{
 }
 
 // Forward processes one inbound payment end-to-end. Safe to call in a goroutine.
-func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, fromAddress, amount, asset string) {
+//
+// poolAddress is the pool account the payment arrived at. Every outbound
+// transfer for this deposit — the forward or a recovery sweep — is paid out of
+// that pool, because that is where the money is.
+func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, memoID uint64, fromAddress, amount, asset string) {
 	// Measured from when we first see the deposit rather than from submission,
 	// so the number reflects what the customer waits for.
 	started := time.Now()
 
-	inserted, err := f.store.InsertForward(ctx, txHash, memoID, fromAddress, amount, asset)
+	inserted, err := f.store.InsertForward(ctx, txHash, memoID, poolAddress, fromAddress, amount, asset)
 	if err != nil {
 		slog.Error("forwarder: insert forward", "tx_hash", txHash, "err", err)
 		return
@@ -187,7 +191,7 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 		// rate here means customers are paying and not being paid.
 		metrics.ForwardsTotal.WithLabelValues("unknown_memo").Inc()
 		slog.Warn("forwarder: unknown memo_id, sweeping to recovery", "tx_hash", txHash, "memo_id", memoID)
-		f.sweep(ctx, txHash, amount, asset)
+		f.sweep(ctx, poolAddress, txHash, amount, asset)
 		_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusFailed, "unknown memo_id — swept to recovery")
 		return
 	}
@@ -202,7 +206,7 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 		slog.Warn("forwarder: intent expired, sweeping to recovery",
 			"tx_hash", txHash, "memo_id", memoID,
 			"status", intent.Status, "expires_at", intent.ExpiresAt)
-		f.sweep(ctx, txHash, amount, asset)
+		f.sweep(ctx, poolAddress, txHash, amount, asset)
 		_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusFailed, "intent expired — swept to recovery")
 		return
 	}
@@ -219,6 +223,16 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 			"expected", *intent.ExpectedAmt, "received", amount)
 	}
 
+	// A depositor can pay a different pool than the one their intent named (a
+	// copied address, a stale session). The money is in the pool it was sent
+	// to, so forward from there; the mismatch is only worth flagging for
+	// reconciliation.
+	if intent.PoolAddress != poolAddress {
+		slog.Warn("forwarder: deposit arrived at a different pool than its intent named; forwarding from the receiving pool",
+			"tx_hash", txHash, "memo_id", memoID,
+			"intent_pool", intent.PoolAddress, "receiving_pool", poolAddress)
+	}
+
 	var lastErr error
 	for attempt := range 3 {
 		if attempt > 0 {
@@ -229,7 +243,7 @@ func (f *Forwarder) Forward(ctx context.Context, txHash string, memoID uint64, f
 			}
 		}
 
-		outboundHash, err := f.submit(ctx, intent.CAddress, intent.PoolAddress, amount, asset)
+		outboundHash, err := f.submit(ctx, intent.CAddress, poolAddress, amount, asset)
 		if err == nil {
 			_ = f.store.MarkForwardDone(ctx, txHash, outboundHash)
 			_ = f.store.CompleteIntent(ctx, memoID)
@@ -318,7 +332,15 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 	// the intent was live; only our submission failed. Sweeping it now would punish
 	// the depositor for the relayer's own retry latency.
 
-	outboundHash, err := f.submit(ctx, intent.CAddress, intent.PoolAddress, fwd.Amount, fwd.Asset)
+	// Pay out of the pool that received the deposit. Rows recorded before the
+	// receiving pool was tracked fall back to the intent's pool, which is what
+	// every deposit used when intents were all pinned to one pool.
+	poolAddress := fwd.PoolAddress
+	if poolAddress == "" {
+		poolAddress = intent.PoolAddress
+	}
+
+	outboundHash, err := f.submit(ctx, intent.CAddress, poolAddress, fwd.Amount, fwd.Asset)
 	if err != nil {
 		// Permanent error — do not re-queue, close the forward for good.
 		if isPermanent(err) {
@@ -671,7 +693,11 @@ func classifyResultXDR(resultXDR string) error {
 
 // ── Sweep (classic XLM payment to G-address recovery account) ────────────────
 
-func (f *Forwarder) sweep(ctx context.Context, inboundHash, amount, asset string) {
+// sweep returns an unroutable deposit to the recovery account, paying it out of
+// poolAddress — the pool that actually received it. With intents spread across
+// pools, sweeping from a fixed pool would refund one pool's deposit out of
+// another pool's balance and strand the original funds.
+func (f *Forwarder) sweep(ctx context.Context, poolAddress, inboundHash, amount, asset string) {
 	if f.config.RecoveryAddress == "" {
 		slog.Warn("forwarder: no recovery address configured, funds remain in pool", "tx_hash", inboundHash)
 		return
@@ -682,22 +708,31 @@ func (f *Forwarder) sweep(ctx context.Context, inboundHash, amount, asset string
 			"tx_hash", inboundHash, "asset", asset, "err", err)
 		return
 	}
+	kp, err := f.keypairFor(poolAddress)
+	if err != nil {
+		slog.Error("forwarder: sweep has no key for receiving pool, funds remain in pool",
+			"tx_hash", inboundHash, "pool", poolAddress, "err", err)
+		return
+	}
 
-	// The sweep signs as the same pool account as the forward path, so it has to
-	// draw from the same sequencer. Reading Horizon here instead would hand this
-	// transaction a number the forward path has already spent, and the collision
-	// this sequencer exists to remove would come straight back through the
-	// recovery path.
-	pool := f.config.PoolAccounts[0]
-	seq, err := f.seq().next(pool.Address)
+	// The sweep signs as the same pool account as the forward path, so it draws
+	// from the same sequencer and holds the same send lock. Without the lock it
+	// could take N+1 while a forward holding N is still between draw and send,
+	// reach the network first, be rejected, and resync mid-flight — handing a
+	// number out twice. Horizon's submit waits for ledger inclusion, so the lock
+	// is held until the sweep has landed.
+	unlockSend := f.seq().lockSend(poolAddress)
+	defer unlockSend()
+
+	seq, err := f.seq().next(poolAddress)
 	if err != nil {
 		slog.Error("forwarder: sweep sequence", "err", err)
 		return
 	}
-	sourceAccount := &txnbuild.SimpleAccount{AccountID: pool.Address, Sequence: seq}
+	sourceAccount := &txnbuild.SimpleAccount{AccountID: poolAddress, Sequence: seq}
 	defer func() {
 		if err != nil {
-			f.seq().resync(pool.Address)
+			f.seq().resync(poolAddress)
 		}
 	}()
 
@@ -726,7 +761,7 @@ func (f *Forwarder) sweep(ctx context.Context, inboundHash, amount, asset string
 		return
 	}
 
-	tx, err = tx.Sign(f.config.NetworkPassphrase, pool.Keypair)
+	tx, err = tx.Sign(f.config.NetworkPassphrase, kp)
 	if err != nil {
 		slog.Error("forwarder: sweep sign tx", "err", err)
 		return
@@ -738,7 +773,7 @@ func (f *Forwarder) sweep(ctx context.Context, inboundHash, amount, asset string
 		return
 	}
 
-	slog.Info("forwarder: swept to recovery", "inbound", inboundHash, "sweep_tx", result.Hash)
+	slog.Info("forwarder: swept to recovery", "inbound", inboundHash, "pool", poolAddress, "sweep_tx", result.Hash)
 }
 
 // keypairFor finds the signing keypair for a given pool address.

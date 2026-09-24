@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -65,10 +66,11 @@ type markFailedCall struct{ txHash, status, errMsg string }
 type permanentlyFailCall struct{ txHash, errMsg string }
 
 type mockStore struct {
-	insertErr error
-	insertDup bool // InsertForward reports the row already existed
-	intent    *store.Intent
-	intentErr error
+	insertErr  error
+	insertDup  bool   // InsertForward reports the row already existed
+	insertPool string // pool address InsertForward recorded
+	intent     *store.Intent
+	intentErr  error
 
 	doneCalls           [][2]string
 	completeIntentCalls []uint64
@@ -78,7 +80,8 @@ type mockStore struct {
 	failIntentCalls     []uint64
 }
 
-func (m *mockStore) InsertForward(_ context.Context, _ string, _ uint64, _, _, _ string) (bool, error) {
+func (m *mockStore) InsertForward(_ context.Context, _ string, _ uint64, poolAddress, _, _, _ string) (bool, error) {
+	m.insertPool = poolAddress
 	if m.insertErr != nil {
 		return false, m.insertErr
 	}
@@ -115,13 +118,24 @@ func (m *mockStore) FailIntent(_ context.Context, memoID uint64) error {
 type mockHorizon struct {
 	account    hProtocol.Account
 	accountErr error
+
+	mu        sync.Mutex
+	submitted []*txnbuild.Transaction // sweeps, in submission order
 }
 
 func (m *mockHorizon) AccountDetail(_ horizonclient.AccountRequest) (hProtocol.Account, error) {
 	return m.account, m.accountErr
 }
-func (m *mockHorizon) SubmitTransaction(_ *txnbuild.Transaction) (hProtocol.Transaction, error) {
+func (m *mockHorizon) SubmitTransaction(tx *txnbuild.Transaction) (hProtocol.Transaction, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.submitted = append(m.submitted, tx)
 	return hProtocol.Transaction{}, nil
+}
+func (m *mockHorizon) submittedCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.submitted)
 }
 
 type mockRPC struct {
@@ -131,9 +145,12 @@ type mockRPC struct {
 	sendErr  error
 	pollResp rpcprotocol.GetTransactionResponse
 	pollErr  error
+
+	simulated []string // transaction XDR of each simulation request
 }
 
-func (m *mockRPC) SimulateTransaction(_ context.Context, _ rpcprotocol.SimulateTransactionRequest) (rpcprotocol.SimulateTransactionResponse, error) {
+func (m *mockRPC) SimulateTransaction(_ context.Context, req rpcprotocol.SimulateTransactionRequest) (rpcprotocol.SimulateTransactionResponse, error) {
+	m.simulated = append(m.simulated, req.Transaction)
 	return m.simResp, m.simErr
 }
 func (m *mockRPC) SendTransaction(_ context.Context, _ rpcprotocol.SendTransactionRequest) (rpcprotocol.SendTransactionResponse, error) {
@@ -378,7 +395,7 @@ func TestForward_insertError(t *testing.T) {
 	st := &mockStore{insertErr: errors.New("db down")}
 	f := &Forwarder{store: st, config: testConfig(t), horizon: &mockHorizon{}, rpc: &mockRPC{}}
 
-	f.Forward(context.Background(), "txhash", 1, "GABC", "10.0", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "txhash", 1, "GABC", "10.0", "native")
 
 	// InsertForward failed — nothing else should be called
 	if len(st.markFailedCalls) != 0 || len(st.permFailCalls) != 0 {
@@ -390,7 +407,7 @@ func TestForward_unknownMemoID(t *testing.T) {
 	st := &mockStore{intentErr: errors.New("no rows")}
 	f := &Forwarder{store: st, config: testConfig(t), horizon: &mockHorizon{}, rpc: &mockRPC{}}
 
-	f.Forward(context.Background(), "txhash-unk", 999, "GABC", "5.0", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "txhash-unk", 999, "GABC", "5.0", "native")
 
 	if len(st.markFailedCalls) != 1 {
 		t.Fatalf("want 1 MarkForwardFailed, got %d", len(st.markFailedCalls))
@@ -409,7 +426,7 @@ func TestForward_expiredIntent(t *testing.T) {
 	}}
 	f := &Forwarder{store: st, config: testConfig(t), horizon: &mockHorizon{}, rpc: &mockRPC{}}
 
-	f.Forward(context.Background(), "txhash-exp", 55, "GABC", "5.0", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "txhash-exp", 55, "GABC", "5.0", "native")
 
 	if len(st.markFailedCalls) != 1 {
 		t.Fatalf("want 1 MarkForwardFailed, got %d", len(st.markFailedCalls))
@@ -433,7 +450,7 @@ func TestForward_duplicateTxHash(t *testing.T) {
 		rpc:     successRPC(t, "out-dup"),
 	}
 
-	f.Forward(context.Background(), "in-dup", 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-dup", 1, "GABC", "10.0000000", "native")
 
 	if len(st.doneCalls) != 0 || len(st.completeIntentCalls) != 0 {
 		t.Errorf("duplicate tx_hash was forwarded again: done=%v complete=%v",
@@ -457,7 +474,7 @@ func TestForward_intentPastExpiryButStillPending(t *testing.T) {
 	}}
 	f := &Forwarder{store: st, config: testConfig(t), horizon: &mockHorizon{}, rpc: &mockRPC{}}
 
-	f.Forward(context.Background(), "in-late", 77, "GABC", "5.0", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-late", 77, "GABC", "5.0", "native")
 
 	if len(st.doneCalls) != 0 {
 		t.Errorf("deposit past expires_at was credited: %v", st.doneCalls)
@@ -522,7 +539,7 @@ func TestForward_amountMismatchStillCredits(t *testing.T) {
 		rpc:     successRPC(t, "out-mismatch"),
 	}
 
-	f.Forward(context.Background(), "in-mismatch", 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-mismatch", 1, "GABC", "10.0000000", "native")
 
 	if len(st.doneCalls) != 1 {
 		t.Fatalf("want the deposit credited despite the mismatch, got %d done calls", len(st.doneCalls))
@@ -540,7 +557,7 @@ func TestForward_permanentError(t *testing.T) {
 	rpc := &mockRPC{simResp: rpcprotocol.SimulateTransactionResponse{Error: "contract not deployed"}}
 	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: rpc}
 
-	f.Forward(context.Background(), "in-perm", 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-perm", 1, "GABC", "10.0000000", "native")
 
 	// Permanent error on first attempt → StatusFailed, no pending_retry
 	if len(st.markFailedCalls) != 1 {
@@ -558,7 +575,7 @@ func TestForward_transientAllAttempts(t *testing.T) {
 	hz := &mockHorizon{accountErr: errors.New("horizon timeout")}
 	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: &mockRPC{}}
 
-	f.Forward(context.Background(), "in-trans", 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-trans", 1, "GABC", "10.0000000", "native")
 
 	// All 3 attempts transient → StatusPendingRetry
 	if len(st.markFailedCalls) != 1 {
@@ -576,7 +593,7 @@ func TestForward_success(t *testing.T) {
 	rpc := successRPC(t, "out-hash-xyz")
 	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: rpc}
 
-	f.Forward(context.Background(), "in-hash-abc", 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-hash-abc", 1, "GABC", "10.0000000", "native")
 
 	if len(st.doneCalls) != 1 {
 		t.Fatalf("want 1 MarkForwardDone, got %d", len(st.doneCalls))
@@ -641,7 +658,7 @@ func TestForward_issuedAssetSucceeds(t *testing.T) {
 	rpc := successRPC(t, "out-hash-usdc")
 	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: rpc}
 
-	f.Forward(context.Background(), "in-hash-usdc", 1, "GABC", "25.0000000",
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-hash-usdc", 1, "GABC", "25.0000000",
 		"USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
 
 	if len(st.doneCalls) != 1 {
@@ -662,7 +679,7 @@ func TestForward_unparseableAssetIsPermanent(t *testing.T) {
 	rpc := successRPC(t, "unused")
 	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: rpc}
 
-	f.Forward(context.Background(), "in-hash-bad", 1, "GABC", "1.0000000", "NOTANASSET")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-hash-bad", 1, "GABC", "1.0000000", "NOTANASSET")
 
 	if len(st.doneCalls) != 0 {
 		t.Fatalf("want no MarkForwardDone for an unparseable asset, got %d", len(st.doneCalls))
@@ -732,5 +749,141 @@ func successRPC(t *testing.T, outHash string) *mockRPC {
 				Status: rpcprotocol.TransactionStatusSuccess,
 			},
 		},
+	}
+}
+
+// ── receiving pool: money leaves the pool it arrived at ───────────────────────
+
+// twoPools builds a config with two pool accounts, as round-robin intent
+// assignment produces in production.
+func twoPools(t *testing.T) (*config.Config, *keypair.Full, *keypair.Full) {
+	t.Helper()
+	p1, p2 := newTestKeypair(t), newTestKeypair(t)
+	cfg := testConfigWithKeypair(t, p1)
+	cfg.PoolAccounts = append(cfg.PoolAccounts, config.PoolAccount{Address: p2.Address(), Keypair: p2})
+	return cfg, p1, p2
+}
+
+func txSource(t *testing.T, txB64 string) string {
+	t.Helper()
+	parsed, err := txnbuild.TransactionFromXDR(txB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, _ := parsed.Transaction()
+	return tx.SourceAccount().AccountID
+}
+
+// Before this fix every sweep paid out of PoolAccounts[0]. With intents spread
+// across pools, an unroutable deposit landing in pool 2 was refunded out of
+// pool 1's balance — other customers' in-transit money — while pool 2 kept it.
+func TestSweep_PaysOutOfReceivingPool(t *testing.T) {
+	cases := map[string]*mockStore{
+		"unknown memo":   {intentErr: errors.New("no rows")},
+		"expired intent": {intent: &store.Intent{MemoID: 55, Status: store.IntentExpired, CAddress: testCAddress}},
+	}
+	for name, st := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg, p1, p2 := twoPools(t)
+			if st.intent != nil {
+				st.intent.PoolAddress = p1.Address()
+			}
+			hz := &mockHorizon{account: hProtocol.Account{AccountID: p2.Address(), Sequence: 100}}
+			f := &Forwarder{store: st, config: cfg, horizon: hz, rpc: &mockRPC{}}
+
+			f.Forward(context.Background(), p2.Address(), "in-"+name, 55, "GABC", "5.0000000", "native")
+
+			if st.insertPool != p2.Address() {
+				t.Errorf("forward recorded pool %s, want receiving pool %s", st.insertPool, p2.Address())
+			}
+			if hz.submittedCount() != 1 {
+				t.Fatalf("want 1 sweep, got %d", hz.submittedCount())
+			}
+			sweep := hz.submitted[0]
+			if src := sweep.SourceAccount().AccountID; src != p2.Address() {
+				t.Fatalf("sweep paid out of %s, want receiving pool %s", src, p2.Address())
+			}
+			if sigs := sweep.Signatures(); len(sigs) != 1 || sigs[0].Hint != xdr.SignatureHint(p2.Hint()) {
+				t.Fatal("sweep not signed by the receiving pool's key")
+			}
+		})
+	}
+}
+
+// A depositor who pays a different pool than their intent named still gets
+// credited — out of the pool that actually holds the money.
+func TestForward_WrongPoolForwardsFromReceivingPool(t *testing.T) {
+	cfg, p1, p2 := twoPools(t)
+	st := &mockStore{intent: testIntent(p1.Address())}
+	hz := &mockHorizon{account: hProtocol.Account{AccountID: p2.Address(), Sequence: 100}}
+	rpc := successRPC(t, "out-wrong-pool")
+	f := &Forwarder{store: st, config: cfg, horizon: hz, rpc: rpc}
+
+	f.Forward(context.Background(), p2.Address(), "in-wrong-pool", 1, "GABC", "10.0000000", "native")
+
+	if len(st.doneCalls) != 1 {
+		t.Fatalf("forward not completed: done=%v failed=%v", st.doneCalls, st.markFailedCalls)
+	}
+	if len(rpc.simulated) == 0 || txSource(t, rpc.simulated[0]) != p2.Address() {
+		t.Fatalf("forward built from %v, want receiving pool %s", rpc.simulated, p2.Address())
+	}
+}
+
+func TestRetry_UsesStoredReceivingPool(t *testing.T) {
+	cases := map[string]struct {
+		stored   func(p1, p2 string) string
+		wantPool func(p1, p2 string) string
+	}{
+		"receiving pool recorded": {func(_, p2 string) string { return p2 }, func(_, p2 string) string { return p2 }},
+		"legacy row (no pool)":    {func(_, _ string) string { return "" }, func(p1, _ string) string { return p1 }},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg, p1, p2 := twoPools(t)
+			st := &mockStore{intent: testIntent(p1.Address())}
+			hz := &mockHorizon{account: hProtocol.Account{AccountID: p1.Address(), Sequence: 100}}
+			rpc := successRPC(t, "out-retry")
+			f := &Forwarder{store: st, config: cfg, horizon: hz, rpc: rpc}
+
+			f.Retry(context.Background(), store.Forward{
+				TxHash: "in-retry", MemoID: 1, Amount: "10.0000000", Asset: "native",
+				PoolAddress: tc.stored(p1.Address(), p2.Address()),
+			})
+
+			want := tc.wantPool(p1.Address(), p2.Address())
+			if len(rpc.simulated) == 0 || txSource(t, rpc.simulated[0]) != want {
+				t.Fatalf("retry built from %v, want %s", rpc.simulated, want)
+			}
+		})
+	}
+}
+
+// The sweep draws from the pool's sequencer, so it must also hold the pool's
+// send lock: otherwise it can take N+1 and reach the network while a forward
+// holding N is still between draw and send.
+func TestSweep_WaitsForPoolSendLock(t *testing.T) {
+	cfg, _, p2 := twoPools(t)
+	hz := &mockHorizon{account: hProtocol.Account{AccountID: p2.Address(), Sequence: 100}}
+	f := &Forwarder{store: &mockStore{}, config: cfg, horizon: hz, rpc: &mockRPC{}}
+
+	unlock := f.seq().lockSend(p2.Address()) // a forward mid-send on this pool
+	done := make(chan struct{})
+	go func() {
+		f.sweep(context.Background(), p2.Address(), "in-locked", "1.0000000", "native")
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	if hz.submittedCount() != 0 {
+		t.Fatal("sweep submitted while another send held the pool's lock")
+	}
+	unlock()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sweep did not proceed after the lock was released")
+	}
+	if hz.submittedCount() != 1 {
+		t.Fatalf("want 1 sweep after unlock, got %d", hz.submittedCount())
 	}
 }
