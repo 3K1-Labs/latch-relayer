@@ -122,7 +122,7 @@ Add `Store.Ping(ctx)` that calls `s.pool.Ping(ctx)`. OZ returns `Healthy` (200),
 
 ### [P1] No Prometheus /metrics endpoint
 
-**Status: partly resolved.** `GET /metrics` (bearer-authenticated) now exposes HTTP request count/latency by route, load-shed rejections, and Go/process metrics (`internal/metrics`). The forward-specific metrics below are still to do.
+**Status: resolved.** `GET /metrics` (bearer-authenticated) exposes HTTP request count/latency by route, load-shed rejections and Go/process metrics (#46), plus the deposit metrics from #34: `relayer_forwards_total{outcome}`, `relayer_pool_contention_total`, `relayer_pending_retry_depth` and `relayer_deposit_to_credit_seconds`. Dashboards and alerts (below) remain.
 
 **What we have:** Structured logging via `slog`. No counters, histograms, or gauges. No way to answer: "how many forwards processed per hour?", "what's the P95 forward duration?", "how many are sitting in pending_retry right now?"
 
