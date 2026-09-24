@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"time"
@@ -48,6 +49,16 @@ type Config struct {
 	// latch-api is the only intended caller — this is service-to-service, not a
 	// user credential.
 	APIKey string
+
+	// Capacity limits
+	DBMaxConns       int32
+	DBMinConns       int32
+	MaxInflight      int     // concurrent requests before new ones get 503
+	RateLimitRPS     float64 // per-caller sustained requests/second
+	RateLimitBurst   int
+	RPCTimeout       time.Duration
+	ShutdownDrain    time.Duration // how long in-flight work gets to finish on SIGTERM
+	MetricsNamespace string
 }
 
 // Load reads environment variables (and an optional .env file), validates all
@@ -62,7 +73,6 @@ func Load() (*Config, error) {
 		RecoveryAddress: os.Getenv("RECOVERY_ADDRESS"),
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		Port:            getEnv("PORT", "4000"),
-		RetryInterval:   time.Duration(getEnvInt("RETRY_INTERVAL_SEC", 10)) * time.Second,
 		APIKey:          os.Getenv("RELAYER_API_KEY"),
 	}
 
@@ -86,6 +96,36 @@ func Load() (*Config, error) {
 	if len(cfg.APIKey) < 32 {
 		return nil, errors.New("RELAYER_API_KEY is required and must be at least 32 characters")
 	}
+
+	var err error
+	if cfg.DBMaxConns, err = envInt32("DB_MAX_CONNS", 20); err != nil {
+		return nil, err
+	}
+	if cfg.DBMinConns, err = envInt32("DB_MIN_CONNS", 2); err != nil {
+		return nil, err
+	}
+	if cfg.DBMinConns > cfg.DBMaxConns {
+		return nil, errors.New("DB_MIN_CONNS must not exceed DB_MAX_CONNS")
+	}
+	if cfg.MaxInflight, err = envInt("MAX_INFLIGHT_REQUESTS", 500); err != nil {
+		return nil, err
+	}
+	if cfg.RateLimitRPS, err = envFloat("RATE_LIMIT_RPS", 100); err != nil {
+		return nil, err
+	}
+	if cfg.RateLimitBurst, err = envInt("RATE_LIMIT_BURST", 300); err != nil {
+		return nil, err
+	}
+	if cfg.RPCTimeout, err = envMillis("RPC_TIMEOUT_MS", 15_000); err != nil {
+		return nil, err
+	}
+	if cfg.ShutdownDrain, err = envSeconds("SHUTDOWN_DRAIN_SECONDS", 30); err != nil {
+		return nil, err
+	}
+	if cfg.RetryInterval, err = envSeconds("RETRY_INTERVAL_SEC", 10); err != nil {
+		return nil, err
+	}
+	cfg.MetricsNamespace = "latch_relayer"
 
 	// Load pool accounts — indexed as POOL_ADDRESS_1 / POOL_PRIVATE_KEY_1, etc.
 	// Stops at the first missing pair.
@@ -119,23 +159,55 @@ func Load() (*Config, error) {
 }
 
 // getEnv returns the env var value or a fallback default.
-// getEnvInt parses an integer env var, falling back on unset or malformed
-// input rather than failing startup over a tuning value.
-func getEnvInt(key string, fallback int) int {
-	raw := os.Getenv(key)
-	if raw == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		return fallback
-	}
-	return n
-}
-
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return fallback
+}
+
+// envInt parses a positive integer env var, returning fallback when unset.
+func envInt(key string, fallback int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer, got %q", key, v)
+	}
+	return n, nil
+}
+
+func envInt32(key string, fallback int32) (int32, error) {
+	n, err := envInt(key, int(fallback))
+	if err != nil {
+		return 0, err
+	}
+	if n > math.MaxInt32 {
+		return 0, fmt.Errorf("%s is too large", key)
+	}
+	return int32(n), nil
+}
+
+func envFloat(key string, fallback float64) (float64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 {
+		return 0, fmt.Errorf("%s must be a positive number, got %q", key, v)
+	}
+	return f, nil
+}
+
+func envMillis(key string, fallback int) (time.Duration, error) {
+	n, err := envInt(key, fallback)
+	return time.Duration(n) * time.Millisecond, err
+}
+
+func envSeconds(key string, fallback int) (time.Duration, error) {
+	n, err := envInt(key, fallback)
+	return time.Duration(n) * time.Second, err
 }

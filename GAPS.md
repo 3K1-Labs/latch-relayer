@@ -122,6 +122,8 @@ Add `Store.Ping(ctx)` that calls `s.pool.Ping(ctx)`. OZ returns `Healthy` (200),
 
 ### [P1] No Prometheus /metrics endpoint
 
+**Status: resolved.** `GET /metrics` (bearer-authenticated) exposes HTTP request count/latency by route, load-shed rejections and Go/process metrics (#46), plus the deposit metrics from #34: `relayer_forwards_total{outcome}`, `relayer_pool_contention_total`, `relayer_pending_retry_depth` and `relayer_deposit_to_credit_seconds`. Dashboards and alerts (below) remain.
+
 **What we have:** Structured logging via `slog`. No counters, histograms, or gauges. No way to answer: "how many forwards processed per hour?", "what's the P95 forward duration?", "how many are sitting in pending_retry right now?"
 
 **What we need:** GitHub Issue #3 has the full implementation spec. Summary:
@@ -149,6 +151,8 @@ Add `Store.Ping(ctx)` that calls `s.pool.Ping(ctx)`. OZ returns `Healthy` (200),
 
 ### [P1] No request ID / correlation ID
 
+**Status: resolved** for HTTP requests (`internal/httpx/requestid.go`: honours a well-formed caller `X-Request-ID`, else generates one; echoed back and logged per request). Deposit forwards start from the SSE stream, not a request, so they have no request ID to carry.
+
 **What we have:** Requests are logged with their path and status, but there is no correlation ID linking an incoming HTTP request to the downstream `slog` output from `forwarder.Forward()`.
 
 **What we need:** Middleware that generates a UUID per request, injects it into the context, logs it at request start, and returns it as `X-Request-ID` in the response header. Pass the context through to `Forward()` calls so all logs for one request share the same ID.
@@ -156,6 +160,8 @@ Add `Store.Ping(ctx)` that calls `s.pool.Ping(ctx)`. OZ returns `Healthy` (200),
 ---
 
 ### [P2] No HTTP concurrency limit
+
+**Status: resolved** (`internal/httpx/limit.go`). `MAX_INFLIGHT_REQUESTS` caps concurrent requests with **503** + `Retry-After` (server-side overload, not the caller's fault), and a per-caller token bucket (`RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`) returns **429**. `/health` and `/metrics` are exempt.
 
 **What we have:** `http.ServeMux` with no bound on concurrent handlers. `CreateIntent` hits the DB — a burst of requests can exhaust the connection pool.
 
@@ -209,6 +215,8 @@ Neither client has a connect or request timeout. `AccountDetail()` inside `submi
 
 **File:** [internal/service/watcher/watcher.go:116](internal/service/watcher/watcher.go#L116)
 
+**Status: resolved** (#34). Each watcher runs 32 forward workers over a 256-deep queue that back-pressures the stream. Workers run on the lifecycle tracker, so on shutdown they finish queued payments (whose cursors are already saved) within `SHUTDOWN_DRAIN_SECONDS`.
+
 **What we have:** Every inbound payment spawns `go w.forwarder.Forward(ctx, ...)`. Under a burst of deposits (or after a reconnect that replays events), an unbounded number of goroutines run simultaneously, each submitting a Soroban transaction to Stellar RPC. Soroban transactions from the same source account need ordered sequence numbers — concurrent submissions will cause `bad_seq` errors.
 
 **What we need:** A buffered channel (semaphore) that caps the number of concurrent `Forward()` calls. Size: 1 for now (sequence numbers must be serial) or N with per-account sequence locking. OZ uses `DEFAULT_CONCURRENCY = 100` for their multi-account setup but serialises per-account.
@@ -227,6 +235,8 @@ go func() {
 ### [P1] No graceful shutdown for in-flight forward goroutines
 
 **File:** [cmd/serve/main.go:102](cmd/serve/main.go#L102)
+
+**Status: resolved** (`internal/lifecycle/tracker.go`). Forwards run on a tracked context that the shutdown signal does not cancel; on SIGTERM the relayer refuses new requests, stops intake, and gives in-flight work `SHUTDOWN_DRAIN_SECONDS` before cancelling it.
 
 **What we have:** On SIGTERM, `cancel()` is called, which signals all goroutines via context. But goroutines dispatched by the watcher are untracked — there is no `sync.WaitGroup`. The process exits while forwards may be mid-flight (between `InsertForward` and `MarkForwardDone`). The forward will be in `pending` status (covered by the crash recovery gap above), but ideally we drain cleanly.
 
@@ -249,6 +259,8 @@ go func() {
 ### [P2] DB connection pool uses all defaults
 
 **File:** [internal/db/db.go](internal/db/db.go)
+
+**Status: resolved.** `DB_MAX_CONNS` (default 20) / `DB_MIN_CONNS` (default 2), plus connection lifetime, idle time and health-check period.
 
 **What we have:** `pgxpool.New(ctx, databaseURL)` — all pool parameters come from defaults (max 4 connections, or `PGPOOL_MAX_CONNS` env var). Under load, 4 connections can be a bottleneck. Under idle, stale connections accumulate.
 

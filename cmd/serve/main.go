@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -16,6 +19,9 @@ import (
 	"github.com/latch/relayer/internal/config"
 	"github.com/latch/relayer/internal/db"
 	"github.com/latch/relayer/internal/handler"
+	"github.com/latch/relayer/internal/httpx"
+	"github.com/latch/relayer/internal/lifecycle"
+	"github.com/latch/relayer/internal/metrics"
 	"github.com/latch/relayer/internal/service/forwarder"
 	"github.com/latch/relayer/internal/service/retry"
 	"github.com/latch/relayer/internal/service/watcher"
@@ -34,21 +40,27 @@ func main() {
 		"pools", len(cfg.PoolAccounts),
 		"horizon", cfg.HorizonURL,
 		"port", cfg.Port,
+		"db_max_conns", cfg.DBMaxConns,
+		"max_inflight", cfg.MaxInflight,
 	)
 
-	// ── 2. Root context — cancelled on shutdown to stop all goroutines ────────
+	// ── 2. Contexts ───────────────────────────────────────────────────────────
+	// ctx stops intake (SSE streams, retry ticks) on the shutdown signal.
+	// Work already started — a forward mid-submission — runs on `work` instead
+	// and gets until the drain deadline to finish.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	work := lifecycle.NewTracker()
 
 	// ── 3. Database ───────────────────────────────────────────────────────────
-	pool, err := db.Connect(ctx, cfg.DatabaseURL)
+	pool, err := db.Connect(ctx, cfg.DatabaseURL, db.PoolOptions{MaxConns: cfg.DBMaxConns, MinConns: cfg.DBMinConns})
 	if err != nil {
 		slog.Error("database: connect", "err", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
 
-	if err := migrations.Run(ctx, pool); err != nil {
+	if err := migrations.Run(ctx, pool, migrations.Deposit); err != nil {
 		slog.Error("database: migrations", "err", err)
 		os.Exit(1)
 	}
@@ -57,26 +69,34 @@ func main() {
 	// ── 4. Core services ──────────────────────────────────────────────────────
 	st := store.New(pool)
 
-	// Shared HTTP client with explicit timeouts for all outbound Stellar calls.
-	// OZ constants: connect 2s, request 10s, keep-alive 30s.
+	// Shared transport for all outbound Stellar calls.
+	// OZ constants: connect 2s, keep-alive 30s. The stdlib default keeps only 2
+	// idle connections per host, so under concurrent load every extra call to
+	// RPC/Horizon would open a fresh TCP+TLS connection.
 	stellarTransport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   2 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        256,
+		MaxIdleConnsPerHost: 64,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 5 * time.Second,
 	}
-	stellarHTTP := &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: stellarTransport,
-	}
+	horizonHTTP := &http.Client{Timeout: 10 * time.Second, Transport: stellarTransport}
+	// RPC gets its own timeout: simulating a Soroban call that runs a smart
+	// account's __check_auth can legitimately take longer than a Horizon read.
+	rpcHTTP := &http.Client{Timeout: cfg.RPCTimeout, Transport: stellarTransport}
 
-	hz := &horizonclient.Client{HorizonURL: cfg.HorizonURL, HTTP: stellarHTTP}
-	rpc := rpcclient.NewClient(cfg.RPCURL, stellarHTTP)
+	hz := &horizonclient.Client{HorizonURL: cfg.HorizonURL, HTTP: horizonHTTP}
+	rpc := rpcclient.NewClient(cfg.RPCURL, rpcHTTP)
 	defer rpc.Close()
 	fwd := forwarder.New(st, cfg, hz, rpc)
 
 	// Horizon's SSE stream is long-lived and idles between payments, so it can't
-	// share stellarHTTP's 10s Timeout — that applies to the whole request,
+	// share horizonHTTP's 10s Timeout — that applies to the whole request,
 	// including reading the streaming body, and would abort a healthy stream
 	// after 10s of inactivity. Reuse the transport (dial/keep-alive settings)
 	// but rely on ctx cancellation, not a fixed deadline, to bound the stream.
@@ -86,24 +106,41 @@ func main() {
 	}
 
 	// ── 5. Background workers ─────────────────────────────────────────────────
-	// Retry worker polls every 30s for pending_retry forwards.
-	go retry.NewWorker(st, fwd, cfg.RetryInterval).Run(ctx)
+	var workers sync.WaitGroup
+
+	// Retry worker polls every RETRY_INTERVAL_SEC (default 10s) for pending_retry forwards.
+	workers.Go(func() { retry.NewWorker(st, fwd, cfg.RetryInterval).Run(ctx) })
 
 	// One SSE watcher goroutine per pool address.
 	for _, pa := range cfg.PoolAccounts {
-		go watcher.New(pa, st, fwd, hzStream).Run(ctx)
+		workers.Go(func() { watcher.New(pa, st, fwd, hzStream, work).Run(ctx) })
 	}
 
 	// ── 6. HTTP server ────────────────────────────────────────────────────────
+	m := metrics.New(cfg.MetricsNamespace)
+	m.RegisterDeposit()
+	draining := &httpx.Draining{}
+	limiter := httpx.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+
 	mux := http.NewServeMux()
 	h := handler.New(st, cfg)
 	h.RegisterRoutes(mux)
+	mux.Handle("GET /metrics", m.Handler())
+
+	// Outermost first. Auth wraps the whole mux rather than individual routes,
+	// so a route added later is authenticated by default. Rate limiting sits
+	// after auth so only a valid caller ever gets a bucket. Metrics must reach
+	// the mux without a request copy in between to see the route pattern.
+	var root http.Handler = mux
+	root = limiter.Middleware(callerKey, m.Rejected)(root)
+	root = h.RequireAPIKey(root)
+	root = httpx.LimitInflight(cfg.MaxInflight, draining, m.Rejected)(root)
+	root = m.Middleware(root)
+	root = httpx.WithRequestID(root)
 
 	srv := &http.Server{
-		Addr: ":" + cfg.Port,
-		// Auth wraps the whole mux rather than individual routes, so a route added
-		// later is authenticated by default instead of by remembering to opt in.
-		Handler:      h.RequireAPIKey(mux),
+		Addr:         ":" + cfg.Port,
+		Handler:      root,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -127,14 +164,41 @@ func main() {
 	case <-ctx.Done():
 	}
 
-	cancel() // propagate cancellation to watchers and retry worker
+	// Drain: refuse new requests, stop intake, then give in-flight HTTP
+	// requests and forwards until the deadline to finish. Anything cut off is
+	// picked up again by the retry worker after restart.
+	deadline := time.Now().Add(cfg.ShutdownDrain)
+	draining.Set()
+	cancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shutdownCtx, shutdownCancel := context.WithDeadline(context.Background(), deadline)
 	defer shutdownCancel()
-
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("http server shutdown", "err", err)
 	}
 
+	if !work.Drain(time.Until(deadline)) {
+		slog.Warn("shutdown: drain deadline passed, cancelled remaining in-flight work")
+	}
+
+	// Watchers and the retry ticker hold no in-flight work (forwards run on
+	// `work`), but Horizon's SSE client can take a minute to notice a cancelled
+	// context, so don't let it hold the process past the deadline.
+	stopped := make(chan struct{})
+	go func() { workers.Wait(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(time.Until(deadline)):
+		slog.Warn("shutdown: background workers still stopping at deadline; exiting anyway")
+	}
+
 	slog.Info("shutdown complete")
+}
+
+// callerKey identifies the caller for rate limiting. Runs after auth, so the
+// bearer token is always a valid key here; hashing keeps the secret itself out
+// of the limiter's map.
+func callerKey(r *http.Request) string {
+	sum := sha256.Sum256([]byte(r.Header.Get("Authorization")))
+	return hex.EncodeToString(sum[:8])
 }
