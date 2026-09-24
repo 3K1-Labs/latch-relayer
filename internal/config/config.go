@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/stellar/go-stellar-sdk/keypair"
@@ -35,6 +37,13 @@ type Config struct {
 	// HTTP server
 	Port string
 
+	// RetryInterval is how often the background worker sweeps forwards that are
+	// waiting for another attempt. It bounds how long a deposit that lost the
+	// race for its pool account's ledger slot waits before trying again, so the
+	// old 30s default meant a straggler could sit half a minute waiting for a
+	// slot that was already free.
+	RetryInterval time.Duration
+
 	// Shared secret every caller but /health must present as a bearer token.
 	// latch-api is the only intended caller — this is service-to-service, not a
 	// user credential.
@@ -53,6 +62,7 @@ func Load() (*Config, error) {
 		RecoveryAddress: os.Getenv("RECOVERY_ADDRESS"),
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		Port:            getEnv("PORT", "4000"),
+		RetryInterval:   time.Duration(getEnvInt("RETRY_INTERVAL_SEC", 10)) * time.Second,
 		APIKey:          os.Getenv("RELAYER_API_KEY"),
 	}
 
@@ -109,6 +119,20 @@ func Load() (*Config, error) {
 }
 
 // getEnv returns the env var value or a fallback default.
+// getEnvInt parses an integer env var, falling back on unset or malformed
+// input rather than failing startup over a tuning value.
+func getEnvInt(key string, fallback int) int {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

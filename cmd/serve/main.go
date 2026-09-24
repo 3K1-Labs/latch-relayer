@@ -87,7 +87,7 @@ func main() {
 
 	// ── 5. Background workers ─────────────────────────────────────────────────
 	// Retry worker polls every 30s for pending_retry forwards.
-	go retry.NewWorker(st, fwd, 30*time.Second).Run(ctx)
+	go retry.NewWorker(st, fwd, cfg.RetryInterval).Run(ctx)
 
 	// One SSE watcher goroutine per pool address.
 	for _, pa := range cfg.PoolAccounts {

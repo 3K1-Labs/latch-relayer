@@ -8,6 +8,8 @@
 # Go build output — prevent accidentally committing compiled binaries
 /latch-relayer
 /sweep_test
+/onramp_load
+/batch_probe
 /e2e_test
 
 # Test coverage output
