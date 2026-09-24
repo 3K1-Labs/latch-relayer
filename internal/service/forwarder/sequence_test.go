@@ -6,7 +6,6 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	hProtocol "github.com/stellar/go-stellar-sdk/protocols/horizon"
-	"github.com/stellar/go-stellar-sdk/txnbuild"
 )
 
 // countingHorizon reports a fixed account and counts how often it was asked.
@@ -23,10 +22,6 @@ func (c *countingHorizon) AccountDetail(_ horizonclient.AccountRequest) (hProtoc
 	defer c.mu.Unlock()
 	c.calls++
 	return hProtocol.Account{AccountID: "GPOOL", Sequence: c.seq}, nil
-}
-
-func (c *countingHorizon) SubmitTransaction(_ *txnbuild.Transaction) (hProtocol.Transaction, error) {
-	return hProtocol.Transaction{}, nil
 }
 
 // The regression this package exists to prevent: concurrent forwards on one

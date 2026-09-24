@@ -142,7 +142,14 @@ Verified: Horizon renders a text memo as the raw UTF-8 string in `memo` (the bas
 - `id`/`text` memo whose value is not a `uint64` → sweep to recovery (`ErrInvalidMemoID`)
 - Unknown `memo_id` (not in intents table) → sweep to recovery
 - Expired intent → sweep to recovery
-- All cases logged in `forwards` table with status `failed`
+- A failed intent lookup (database error) is **not** treated as an unknown memo; the forward is retried instead of swept.
+
+How a sweep is recorded (#32):
+- The decision is persisted first (`forwards.sweep = true`), so a retry after a crash finishes the sweep instead of deciding again.
+- The recovery payment goes through the same pipeline as a forward: the pool's sequencer and send lock, recorded before sending, sent via Stellar RPC and resolved by hash. Its memo is the inbound transaction hash (`MEMO_HASH`), so the recovery account can be reconciled against deposits.
+- Status becomes `swept`, with `forward_tx` set to the sweep's hash, **only once the payment has landed**.
+- For issued assets, the recovery account's trustline is checked first. Without an authorized trustline nothing is sent (so no fee is burned); the sweep waits in `pending_retry` and goes through on the first tick after the trustline is added.
+- Transient failures retry through the retry worker. Permanent ones fail with `not swept, funds remain in pool: …`, never with a message claiming the funds were swept.
 
 ### Architecture Split
 - **Relayer** owns the deposit hot path: Horizon SSE → memo parse → intent lookup → forward

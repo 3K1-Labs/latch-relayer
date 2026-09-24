@@ -96,3 +96,43 @@ func pendingForward(t *testing.T, s *Store, txHash string) Forward {
 	t.Fatalf("%s not in pending retries", txHash)
 	return Forward{}
 }
+
+// A sweep's decision survives a restart, and its outcome is only 'swept' once
+// recorded as landed (#32). Also proves migration 003 replaced the status
+// check: the insert of 'swept' would be rejected by the original constraint.
+func TestSweepRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	if _, err := s.InsertForward(ctx, "in-3", 9, "GPOOL", "GFROM", "5.0000000", "native"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkSweep(ctx, "in-3", "unknown memo_id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordSubmission(ctx, "in-3", "sweep-3", time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RequeueForContention(ctx, "in-3", "not swept yet"); err != nil {
+		t.Fatal(err)
+	}
+	got := pendingForward(t, s, "in-3")
+	if !got.Sweep || got.SubmittedTx == nil || *got.SubmittedTx != "sweep-3" {
+		t.Fatalf("sweep=%v submitted=%v, want the decision and the in-flight sweep", got.Sweep, got.SubmittedTx)
+	}
+
+	if err := s.MarkSwept(ctx, "in-3", "sweep-3"); err != nil {
+		t.Fatal(err)
+	}
+	fwds, err := s.GetForwardByMemoID(ctx, 9)
+	if err != nil || len(fwds) != 1 {
+		t.Fatalf("forwards = %v, err = %v", fwds, err)
+	}
+	f := fwds[0]
+	if f.Status != StatusSwept || f.ForwardTx == nil || *f.ForwardTx != "sweep-3" {
+		t.Fatalf("status=%s forward_tx=%v", f.Status, f.ForwardTx)
+	}
+	if f.SubmittedTx != nil {
+		t.Fatalf("swept forward still has an in-flight transfer")
+	}
+}

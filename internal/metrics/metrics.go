@@ -121,7 +121,7 @@ var (
 	ForwardsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "relayer_forwards_total",
-			Help: "Forward attempts by outcome (done, unknown_memo, expired, permanent_failure).",
+			Help: "Forward attempts by outcome (done, unknown_memo, expired, permanent_failure, swept, sweep_failed).",
 		},
 		[]string{"outcome"},
 	)

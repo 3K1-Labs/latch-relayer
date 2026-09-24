@@ -4,11 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/keypair"
 	"github.com/stellar/go-stellar-sdk/network"
@@ -81,6 +80,9 @@ type mockStore struct {
 	recordCalls         []recordCall
 	clearCalls          []string
 	recordErr           error
+	sweepCalls          [][2]string // {txHash, reason}
+	sweptCalls          [][2]string // {txHash, sweepTx}
+	sweepErr            error
 }
 
 type recordCall struct {
@@ -122,6 +124,17 @@ func (m *mockStore) FailIntent(_ context.Context, memoID uint64) error {
 	m.failIntentCalls = append(m.failIntentCalls, memoID)
 	return nil
 }
+func (m *mockStore) MarkSweep(_ context.Context, txHash, reason string) error {
+	if m.sweepErr != nil {
+		return m.sweepErr
+	}
+	m.sweepCalls = append(m.sweepCalls, [2]string{txHash, reason})
+	return nil
+}
+func (m *mockStore) MarkSwept(_ context.Context, txHash, sweepTx string) error {
+	m.sweptCalls = append(m.sweptCalls, [2]string{txHash, sweepTx})
+	return nil
+}
 func (m *mockStore) RecordSubmission(_ context.Context, txHash, submittedTx string, until time.Time) error {
 	if m.recordErr != nil {
 		return m.recordErr
@@ -137,24 +150,14 @@ func (m *mockStore) ClearSubmission(_ context.Context, txHash string) error {
 type mockHorizon struct {
 	account    hProtocol.Account
 	accountErr error
-
-	mu        sync.Mutex
-	submitted []*txnbuild.Transaction // sweeps, in submission order
+	accounts   map[string]hProtocol.Account // per-address overrides of account
 }
 
-func (m *mockHorizon) AccountDetail(_ horizonclient.AccountRequest) (hProtocol.Account, error) {
+func (m *mockHorizon) AccountDetail(req horizonclient.AccountRequest) (hProtocol.Account, error) {
+	if a, ok := m.accounts[req.AccountID]; ok {
+		return a, nil
+	}
 	return m.account, m.accountErr
-}
-func (m *mockHorizon) SubmitTransaction(tx *txnbuild.Transaction) (hProtocol.Transaction, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.submitted = append(m.submitted, tx)
-	return hProtocol.Transaction{}, nil
-}
-func (m *mockHorizon) submittedCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.submitted)
 }
 
 type mockRPC struct {
@@ -169,6 +172,7 @@ type mockRPC struct {
 
 	simulated []string // transaction XDR of each simulation request
 	sent      int      // SendTransaction calls
+	sentXDR   []string // transaction XDR of each send
 	looked    []string // hashes passed to GetTransaction
 }
 
@@ -176,8 +180,9 @@ func (m *mockRPC) SimulateTransaction(_ context.Context, req rpcprotocol.Simulat
 	m.simulated = append(m.simulated, req.Transaction)
 	return m.simResp, m.simErr
 }
-func (m *mockRPC) SendTransaction(_ context.Context, _ rpcprotocol.SendTransactionRequest) (rpcprotocol.SendTransactionResponse, error) {
+func (m *mockRPC) SendTransaction(_ context.Context, req rpcprotocol.SendTransactionRequest) (rpcprotocol.SendTransactionResponse, error) {
 	m.sent++
+	m.sentXDR = append(m.sentXDR, req.Transaction)
 	return m.sendResp, m.sendErr
 }
 func (m *mockRPC) GetTransaction(_ context.Context, req rpcprotocol.GetTransactionRequest) (rpcprotocol.GetTransactionResponse, error) {
@@ -339,7 +344,7 @@ func TestRetry_ceiling(t *testing.T) {
 }
 
 func TestRetry_intentNotFound(t *testing.T) {
-	st := &mockStore{intentErr: errors.New("no rows")}
+	st := &mockStore{intentErr: pgx.ErrNoRows}
 	f := &Forwarder{store: st, config: testConfig(t), horizon: &mockHorizon{}, rpc: &mockRPC{}}
 
 	f.Retry(context.Background(), store.Forward{TxHash: "txhash2", MemoID: 99, Retries: 0})
@@ -432,36 +437,33 @@ func TestForward_insertError(t *testing.T) {
 }
 
 func TestForward_unknownMemoID(t *testing.T) {
-	st := &mockStore{intentErr: errors.New("no rows")}
-	f := &Forwarder{store: st, config: testConfig(t), horizon: &mockHorizon{}, rpc: &mockRPC{}}
+	f, st := forwarderWith(t, successRPC(t, "sweep-hash"))
+	st.intent, st.intentErr = nil, pgx.ErrNoRows
 
 	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "txhash-unk", 999, "GABC", "5.0", "native")
 
-	if len(st.markFailedCalls) != 1 {
-		t.Fatalf("want 1 MarkForwardFailed, got %d", len(st.markFailedCalls))
+	if len(st.sweepCalls) != 1 || st.sweepCalls[0] != [2]string{"txhash-unk", "unknown memo_id"} {
+		t.Fatalf("sweep decision = %v", st.sweepCalls)
 	}
-	c := st.markFailedCalls[0]
-	if c.txHash != "txhash-unk" || c.status != store.StatusFailed {
-		t.Errorf("unexpected MarkForwardFailed call: %+v", c)
+	if len(st.sweptCalls) != 1 || st.sweptCalls[0] != [2]string{"txhash-unk", "sweep-hash"} {
+		t.Fatalf("swept = %v, want the landed sweep recorded", st.sweptCalls)
+	}
+	if len(st.markFailedCalls) != 0 || len(st.doneCalls) != 0 {
+		t.Errorf("markFailed=%v done=%v", st.markFailedCalls, st.doneCalls)
 	}
 }
 
 func TestForward_expiredIntent(t *testing.T) {
-	st := &mockStore{intent: &store.Intent{
-		MemoID:   55,
-		Status:   store.IntentExpired,
-		CAddress: testCAddress,
-	}}
-	f := &Forwarder{store: st, config: testConfig(t), horizon: &mockHorizon{}, rpc: &mockRPC{}}
+	f, st := forwarderWith(t, successRPC(t, "sweep-hash"))
+	st.intent = &store.Intent{MemoID: 55, Status: store.IntentExpired, CAddress: testCAddress}
 
 	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "txhash-exp", 55, "GABC", "5.0", "native")
 
-	if len(st.markFailedCalls) != 1 {
-		t.Fatalf("want 1 MarkForwardFailed, got %d", len(st.markFailedCalls))
+	if len(st.sweepCalls) != 1 || st.sweepCalls[0][1] != "intent expired" {
+		t.Fatalf("sweep decision = %v, want intent expired", st.sweepCalls)
 	}
-	c := st.markFailedCalls[0]
-	if c.status != store.StatusFailed {
-		t.Errorf("want StatusFailed, got %q", c.status)
+	if len(st.sweptCalls) != 1 || len(st.doneCalls) != 0 {
+		t.Fatalf("swept=%v done=%v", st.sweptCalls, st.doneCalls)
 	}
 }
 
@@ -507,17 +509,10 @@ func TestForward_intentPastExpiryButStillPending(t *testing.T) {
 	if len(st.doneCalls) != 0 {
 		t.Errorf("deposit past expires_at was credited: %v", st.doneCalls)
 	}
-	if len(st.markFailedCalls) != 1 {
-		t.Fatalf("want 1 MarkForwardFailed, got %d", len(st.markFailedCalls))
-	}
-	c := st.markFailedCalls[0]
-	if c.status != store.StatusFailed {
-		t.Errorf("status = %q, want StatusFailed", c.status)
-	}
-	// Assert the reason, not just the status: falling through to submit() also
-	// fails this forward, so a status-only check passes even without the guard.
-	if !strings.Contains(c.errMsg, "intent expired") {
-		t.Errorf("errMsg = %q, want the expiry sweep reason", c.errMsg)
+	// Assert the reason, not just an outcome: falling through to submit() also
+	// fails this forward, so an outcome-only check passes even without the guard.
+	if len(st.sweepCalls) != 1 || st.sweepCalls[0][1] != "intent expired" {
+		t.Errorf("sweep decision = %v, want the expiry sweep reason", st.sweepCalls)
 	}
 }
 
@@ -794,12 +789,20 @@ func twoPools(t *testing.T) (*config.Config, *keypair.Full, *keypair.Full) {
 
 func txSource(t *testing.T, txB64 string) string {
 	t.Helper()
+	return parseTx(t, txB64).SourceAccount().AccountID
+}
+
+func parseTx(t *testing.T, txB64 string) *txnbuild.Transaction {
+	t.Helper()
 	parsed, err := txnbuild.TransactionFromXDR(txB64)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx, _ := parsed.Transaction()
-	return tx.SourceAccount().AccountID
+	tx, ok := parsed.Transaction()
+	if !ok {
+		t.Fatal("not a simple transaction")
+	}
+	return tx
 }
 
 // Before this fix every sweep paid out of PoolAccounts[0]. With intents spread
@@ -807,7 +810,7 @@ func txSource(t *testing.T, txB64 string) string {
 // pool 1's balance — other customers' in-transit money — while pool 2 kept it.
 func TestSweep_PaysOutOfReceivingPool(t *testing.T) {
 	cases := map[string]*mockStore{
-		"unknown memo":   {intentErr: errors.New("no rows")},
+		"unknown memo":   {intentErr: pgx.ErrNoRows},
 		"expired intent": {intent: &store.Intent{MemoID: 55, Status: store.IntentExpired, CAddress: testCAddress}},
 	}
 	for name, st := range cases {
@@ -817,17 +820,18 @@ func TestSweep_PaysOutOfReceivingPool(t *testing.T) {
 				st.intent.PoolAddress = p1.Address()
 			}
 			hz := &mockHorizon{account: hProtocol.Account{AccountID: p2.Address(), Sequence: 100}}
-			f := &Forwarder{store: st, config: cfg, horizon: hz, rpc: &mockRPC{}}
+			rpc := successRPC(t, "sweep-hash")
+			f := &Forwarder{store: st, config: cfg, horizon: hz, rpc: rpc}
 
 			f.Forward(context.Background(), p2.Address(), "in-"+name, 55, "GABC", "5.0000000", "native")
 
 			if st.insertPool != p2.Address() {
 				t.Errorf("forward recorded pool %s, want receiving pool %s", st.insertPool, p2.Address())
 			}
-			if hz.submittedCount() != 1 {
-				t.Fatalf("want 1 sweep, got %d", hz.submittedCount())
+			if len(rpc.sentXDR) != 1 {
+				t.Fatalf("want 1 sweep, got %d", len(rpc.sentXDR))
 			}
-			sweep := hz.submitted[0]
+			sweep := parseTx(t, rpc.sentXDR[0])
 			if src := sweep.SourceAccount().AccountID; src != p2.Address() {
 				t.Fatalf("sweep paid out of %s, want receiving pool %s", src, p2.Address())
 			}
@@ -892,18 +896,21 @@ func TestRetry_UsesStoredReceivingPool(t *testing.T) {
 func TestSweep_WaitsForPoolSendLock(t *testing.T) {
 	cfg, _, p2 := twoPools(t)
 	hz := &mockHorizon{account: hProtocol.Account{AccountID: p2.Address(), Sequence: 100}}
-	f := &Forwarder{store: &mockStore{}, config: cfg, horizon: hz, rpc: &mockRPC{}}
+	rpc := successRPC(t, "sweep-hash")
+	f := &Forwarder{store: &mockStore{}, config: cfg, horizon: hz, rpc: rpc}
 
 	unlock := f.seq().lockSend(p2.Address()) // a forward mid-send on this pool
 	done := make(chan struct{})
 	go func() {
-		f.sweep(context.Background(), p2.Address(), "in-locked", "1.0000000", "native")
+		_, _ = f.sweep(context.Background(), "in-locked", p2.Address(), "1.0000000", "native")
 		close(done)
 	}()
 
 	time.Sleep(100 * time.Millisecond)
-	if hz.submittedCount() != 0 {
+	select {
+	case <-done:
 		t.Fatal("sweep submitted while another send held the pool's lock")
+	default:
 	}
 	unlock()
 	select {
@@ -911,7 +918,7 @@ func TestSweep_WaitsForPoolSendLock(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("sweep did not proceed after the lock was released")
 	}
-	if hz.submittedCount() != 1 {
-		t.Fatalf("want 1 sweep after unlock, got %d", hz.submittedCount())
+	if rpc.sent != 1 {
+		t.Fatalf("want 1 sweep after unlock, got %d", rpc.sent)
 	}
 }

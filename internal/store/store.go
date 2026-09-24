@@ -17,6 +17,9 @@ const (
 	StatusDone         = "done"
 	StatusFailed       = "failed"
 	StatusPendingRetry = "pending_retry"
+	// StatusSwept: the deposit could not be credited and its recovery payment
+	// landed; forward_tx holds that payment's hash.
+	StatusSwept = "swept"
 )
 
 // Status values for the intents table.
@@ -65,6 +68,9 @@ type Forward struct {
 	// land. Both are nil when no transfer is in flight.
 	SubmittedTx    *string
 	SubmittedUntil *time.Time
+	// Sweep is set once the deposit is to be returned to the recovery account
+	// instead of credited, so a retry sweeps it rather than deciding again.
+	Sweep bool
 }
 
 // Store wraps a pgxpool and exposes all database operations the relayer needs.
@@ -242,6 +248,35 @@ func (s *Store) MarkForwardDone(ctx context.Context, txHash, forwardTx string) e
 	return nil
 }
 
+// MarkSweep records that this deposit is to be returned to the recovery
+// account rather than credited, and why. Written before the sweep is attempted,
+// so a retry after a crash sweeps it instead of deciding again.
+func (s *Store) MarkSweep(ctx context.Context, txHash, reason string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE forwards SET sweep = TRUE, error = $1, updated_at = NOW()
+		WHERE tx_hash = $2
+	`, reason, txHash)
+	if err != nil {
+		return fmt.Errorf("mark sweep: %w", err)
+	}
+	return nil
+}
+
+// MarkSwept records a recovery payment that landed. Only called once the
+// network confirms it: a sweep that failed must never read as swept.
+func (s *Store) MarkSwept(ctx context.Context, txHash, sweepTx string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE forwards
+		SET status = $1, forward_tx = $2, error = 'swept to recovery',
+		    submitted_tx = NULL, submitted_until = NULL, updated_at = NOW()
+		WHERE tx_hash = $3
+	`, StatusSwept, sweepTx, txHash)
+	if err != nil {
+		return fmt.Errorf("mark swept: %w", err)
+	}
+	return nil
+}
+
 // RecordSubmission notes the outbound transaction about to be sent for a
 // forward, and the time after which it can no longer land. It must be written
 // before the transaction is sent: from then on the transfer may be in flight,
@@ -325,7 +360,7 @@ func (s *Store) GetForwardByMemoID(ctx context.Context, memoID uint64) ([]Forwar
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, tx_hash, memo_id, from_address, amount, asset,
 		       forward_tx, status, retries, error, created_at, updated_at,
-		       COALESCE(pool_address, ''), submitted_tx, submitted_until
+		       COALESCE(pool_address, ''), submitted_tx, submitted_until, sweep
 		FROM forwards WHERE memo_id = $1
 		ORDER BY created_at DESC
 	`, int64(memoID))
@@ -345,7 +380,7 @@ func (s *Store) GetPendingRetries(ctx context.Context) ([]Forward, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, tx_hash, memo_id, from_address, amount, asset,
 		       forward_tx, status, retries, error, created_at, updated_at,
-		       COALESCE(pool_address, ''), submitted_tx, submitted_until
+		       COALESCE(pool_address, ''), submitted_tx, submitted_until, sweep
 		FROM forwards
 		WHERE status = 'pending_retry'
 		   OR (status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes')
@@ -407,7 +442,7 @@ func scanForwards(rows pgx.Rows) ([]Forward, error) {
 			&f.ID, &f.TxHash, &rawID, &f.FromAddress, &f.Amount, &f.Asset,
 			&f.ForwardTx, &f.Status, &f.Retries, &f.Error,
 			&f.CreatedAt, &f.UpdatedAt, &f.PoolAddress,
-			&f.SubmittedTx, &f.SubmittedUntil,
+			&f.SubmittedTx, &f.SubmittedUntil, &f.Sweep,
 		); err != nil {
 			return nil, fmt.Errorf("scan forward: %w", err)
 		}
