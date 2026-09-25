@@ -387,3 +387,92 @@ func TestForward_ExpiryJudgedByLandingTime(t *testing.T) {
 		})
 	}
 }
+
+// ── Review of #54 ─────────────────────────────────────────────────────────────
+
+// A send that errored may still have reached the network, so its sequence
+// number may be spent. Re-reading Horizon then would hand the same number to
+// the next payment.
+func TestTransfer_UnconfirmedSendDoesNotResyncSequence(t *testing.T) {
+	rpc := successRPC(t, "out")
+	rpc.sendErr = errors.New("connection reset")
+	f, _ := forwarderWith(t, rpc)
+	pool := f.config.PoolAccounts[0].Address
+
+	f.Forward(context.Background(), pool, "in-a", 1, "GABC", "1.0000000", "native", time.Now())
+	rpc.sendErr = nil
+	f.Forward(context.Background(), pool, "in-b", 1, "GABC", "1.0000000", "native", time.Now())
+
+	if len(rpc.sentXDR) != 2 {
+		t.Fatalf("sent %d transactions, want 2", len(rpc.sentXDR))
+	}
+	first, second := parseTx(t, rpc.sentXDR[0]).SequenceNumber(), parseTx(t, rpc.sentXDR[1]).SequenceNumber()
+	if second != first+1 {
+		t.Fatalf("second payment reused sequence %d after an unconfirmed send (first %d)", second, first)
+	}
+}
+
+// If the first attempt died before its sweep decision was saved, the retry
+// must still return a deposit that landed after its intent expired.
+func TestRetry_RechecksExpiryByLandingTime(t *testing.T) {
+	expires := time.Now().Add(-time.Hour)
+	late, early := expires.Add(time.Minute), expires.Add(-time.Minute)
+	cases := []struct {
+		name     string
+		landedAt *time.Time
+		credited bool
+	}{
+		{"landed after expiry", &late, false},
+		{"landed in time, retried after expiry", &early, true},
+		{"legacy row without landing time", nil, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f, st := forwarderWith(t, successRPC(t, "out"))
+			st.intent.ExpiresAt, st.intent.Status = expires, store.IntentExpired
+
+			f.Retry(context.Background(), store.Forward{
+				TxHash: "in-retry", MemoID: 1, Amount: "1.0000000", Asset: "native",
+				PoolAddress: f.config.PoolAccounts[0].Address, LandedAt: c.landedAt,
+			})
+
+			if credited := len(st.doneCalls) == 1; credited != c.credited {
+				t.Fatalf("credited = %v, want %v (sweep=%v)", credited, c.credited, st.sweepCalls)
+			}
+			if !c.credited && (len(st.sweepCalls) != 1 || st.sweepCalls[0][1] != "intent expired") {
+				t.Fatalf("sweep = %v, want the expiry sweep", st.sweepCalls)
+			}
+		})
+	}
+}
+
+// Failing to load the recovery account is a Horizon blip, not the sweep
+// failing: it must not use up the retry budget.
+func TestSweep_TrustlineLookupFailureIsNotCharged(t *testing.T) {
+	rpc := successRPC(t, "sweep-hash")
+	f, st, hz := sweepForwarder(t, rpc)
+	pool := f.config.PoolAccounts[0].Address
+	hz.accounts = map[string]hProtocol.Account{pool: {AccountID: pool, Sequence: 100}}
+	hz.accountErr = errors.New("horizon: 503")
+
+	f.Retry(context.Background(), sweepRow(f, usdc))
+
+	if rpc.sent != 0 || len(st.markFailedCalls) != 0 || len(st.permFailCalls) != 0 {
+		t.Fatalf("sent=%d markFailed=%v permFail=%v, want an uncharged wait",
+			rpc.sent, st.markFailedCalls, st.permFailCalls)
+	}
+	if len(st.requeueCalls) != 1 {
+		t.Fatalf("requeue = %v", st.requeueCalls)
+	}
+}
+
+func TestForward_RecordsLandingTime(t *testing.T) {
+	f, st := forwarderWith(t, successRPC(t, "out"))
+	landed := time.Now().Add(-time.Minute).Truncate(time.Second)
+
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-landed", 1, "GABC", "1.0000000", "native", landed)
+
+	if !st.insertLanded.Equal(landed) {
+		t.Fatalf("recorded landing time %s, want %s", st.insertLanded, landed)
+	}
+}

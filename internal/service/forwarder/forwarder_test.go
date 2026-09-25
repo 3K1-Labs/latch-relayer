@@ -65,11 +65,12 @@ type markFailedCall struct{ txHash, status, errMsg string }
 type permanentlyFailCall struct{ txHash, errMsg string }
 
 type mockStore struct {
-	insertErr  error
-	insertDup  bool   // InsertForward reports the row already existed
-	insertPool string // pool address InsertForward recorded
-	intent     *store.Intent
-	intentErr  error
+	insertErr    error
+	insertDup    bool   // InsertForward reports the row already existed
+	insertPool   string // pool address InsertForward recorded
+	insertLanded time.Time
+	intent       *store.Intent
+	intentErr    error
 
 	doneCalls           [][2]string
 	completeIntentCalls []uint64
@@ -90,7 +91,8 @@ type recordCall struct {
 	until               time.Time
 }
 
-func (m *mockStore) InsertForward(_ context.Context, _ string, _ uint64, poolAddress, _, _, _ string) (bool, error) {
+func (m *mockStore) InsertForward(_ context.Context, _ string, _ uint64, poolAddress, _, _, _ string, landedAt time.Time) (bool, error) {
+	m.insertLanded = landedAt
 	m.insertPool = poolAddress
 	if m.insertErr != nil {
 		return false, m.insertErr

@@ -30,7 +30,7 @@ import (
 // forwardStore is the subset of store.Store that Forwarder calls.
 // Narrow interface keeps test mocks small.
 type forwardStore interface {
-	InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string) (bool, error)
+	InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string, landedAt time.Time) (bool, error)
 	GetIntentByMemoID(ctx context.Context, memoID uint64) (*store.Intent, error)
 	MarkForwardDone(ctx context.Context, txHash, forwardTx string) error
 	CompleteIntent(ctx context.Context, memoID uint64) error
@@ -202,7 +202,12 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 	// so the number reflects what the customer waits for.
 	started := time.Now()
 
-	inserted, err := f.store.InsertForward(ctx, txHash, memoID, poolAddress, fromAddress, amount, asset)
+	landed := landedAt
+	if landed.IsZero() {
+		landed = started
+	}
+
+	inserted, err := f.store.InsertForward(ctx, txHash, memoID, poolAddress, fromAddress, amount, asset, landed)
 	if err != nil {
 		slog.Error("forwarder: insert forward", "tx_hash", txHash, "err", err)
 		return
@@ -250,10 +255,6 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 	// after a restart, or a backlog of forwards on a busy pool. For the same
 	// reason the intent's status is not consulted: the retry worker flips it
 	// to 'expired' by wall clock, which says nothing about this deposit.
-	landed := landedAt
-	if landed.IsZero() {
-		landed = time.Now()
-	}
 	if landed.After(intent.ExpiresAt) {
 		metrics.ForwardsTotal.WithLabelValues("expired").Inc()
 		slog.Warn("forwarder: intent expired, sweeping to recovery",
@@ -425,6 +426,17 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 	if err != nil {
 		_ = f.store.MarkForwardFailed(ctx, fwd.TxHash, store.StatusPendingRetry, fmt.Sprintf("look up intent: %v", err))
 		slog.Error("forwarder: retry — intent lookup failed", "tx_hash", fwd.TxHash, "err", err)
+		return
+	}
+
+	// Same expiry rule as Forward, by landing time. A deposit whose first
+	// attempt died before its sweep decision was saved (a crash, or the write
+	// itself failing) must still be returned, not credited. One that landed in
+	// time is still forwarded however long our retries took. Rows recorded
+	// before landing times were kept have none and are forwarded as before.
+	if fwd.LandedAt != nil && fwd.LandedAt.After(intent.ExpiresAt) && fwd.PoolAddress != "" {
+		metrics.ForwardsTotal.WithLabelValues("expired").Inc()
+		f.startSweep(ctx, fwd.TxHash, fwd.PoolAddress, fwd.Amount, fwd.Asset, "intent expired")
 		return
 	}
 
@@ -668,7 +680,10 @@ func (f *Forwarder) transfer(
 		// accepted the transaction is a confirmation problem: the sequence is
 		// spent, and re-reading Horizon while the transaction is still settling
 		// would report the older value and hand the number out a second time.
-		if err != nil && !sendDone {
+		// An unconfirmed send is the same case: the request may have reached
+		// the network, so the number may be spent. If it was not, the next
+		// transaction on the pool is rejected with txBadSeq, which resyncs then.
+		if err != nil && !sendDone && !isUnconfirmed(err) {
 			f.seq().resync(poolAddress)
 		}
 	}()
@@ -986,6 +1001,12 @@ func classifyResultXDR(resultXDR string) error {
 // it through.
 var errAwaitingTrustline = errors.New("no authorized trustline for the asset")
 
+// errTrustlineUnknown means the account could not be loaded to check its
+// trustline — a Horizon or network failure, not a problem with the sweep.
+// Like a missing trustline it waits uncharged, so a blip cannot use up the
+// retry budget and leave the deposit marked not swept.
+var errTrustlineUnknown = errors.New("could not load account to check its trustline")
+
 // startSweep returns a deposit that cannot be credited to the recovery account.
 // The decision is persisted before anything is sent, so a retry after a crash
 // finishes the sweep instead of deciding again.
@@ -1009,7 +1030,7 @@ func (f *Forwarder) sweepDeposit(ctx context.Context, txHash, poolAddress, amoun
 		metrics.ForwardsTotal.WithLabelValues("swept").Inc()
 		slog.Info("forwarder: swept to recovery", "inbound", txHash, "pool", poolAddress, "sweep_tx", hash)
 
-	case errors.Is(err, errAwaitingTrustline), isUnconfirmed(err), isContention(err):
+	case errors.Is(err, errAwaitingTrustline), errors.Is(err, errTrustlineUnknown), isUnconfirmed(err), isContention(err):
 		// Waiting on configuration, on confirmation or for the pool's slot —
 		// none of which is this sweep failing, so none is charged.
 		_ = f.store.RequeueForContention(ctx, txHash, "not swept yet: "+err.Error())
@@ -1099,7 +1120,7 @@ func (f *Forwarder) sweep(ctx context.Context, inboundHash, poolAddress, amount,
 func (f *Forwarder) checkTrustline(account string, asset txnbuild.Asset) error {
 	acct, err := f.horizon.AccountDetail(horizonclient.AccountRequest{AccountID: account})
 	if err != nil {
-		return transient(fmt.Errorf("load account %s: %w", account, err))
+		return fmt.Errorf("%w %s: %v", errTrustlineUnknown, account, err)
 	}
 	for _, b := range acct.Balances {
 		if b.Code == asset.GetCode() && b.Issuer == asset.GetIssuer() {

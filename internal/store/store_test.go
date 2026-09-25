@@ -24,7 +24,7 @@ func TestSubmissionRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 
-	if _, err := s.InsertForward(ctx, "in-1", 7, "GPOOL", "GFROM", "10.0000000", "native"); err != nil {
+	if _, err := s.InsertForward(ctx, "in-1", 7, "GPOOL", "GFROM", "10.0000000", "native", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	until := time.Now().Add(2 * time.Minute).Truncate(time.Second)
@@ -59,7 +59,7 @@ func TestMarkForwardDoneClearsSubmission(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 
-	if _, err := s.InsertForward(ctx, "in-2", 8, "GPOOL", "GFROM", "1.0000000", "native"); err != nil {
+	if _, err := s.InsertForward(ctx, "in-2", 8, "GPOOL", "GFROM", "1.0000000", "native", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RecordSubmission(ctx, "in-2", "out-2", time.Now().Add(time.Minute)); err != nil {
@@ -104,7 +104,7 @@ func TestSweepRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 
-	if _, err := s.InsertForward(ctx, "in-3", 9, "GPOOL", "GFROM", "5.0000000", "native"); err != nil {
+	if _, err := s.InsertForward(ctx, "in-3", 9, "GPOOL", "GFROM", "5.0000000", "native", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.MarkSweep(ctx, "in-3", "unknown memo_id"); err != nil {
@@ -159,5 +159,36 @@ func TestCompleteIntentAfterWallClockExpiry(t *testing.T) {
 	}
 	if got.Status != IntentCompleted {
 		t.Fatalf("status = %s, want completed", got.Status)
+	}
+}
+
+// The reason a deposit was swept survives the retries in between, which
+// overwrite `error`, and ends up on the final record.
+func TestMarkSweptKeepsReason(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	landed := time.Now().Add(-time.Minute).Truncate(time.Second)
+
+	if _, err := s.InsertForward(ctx, "in-4", 10, "GPOOL", "GFROM", "1.0000000", "native", landed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkSweep(ctx, "in-4", "intent expired"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RequeueForContention(ctx, "in-4", "not swept yet: horizon 503"); err != nil {
+		t.Fatal(err)
+	}
+	if got := pendingForward(t, s, "in-4"); got.LandedAt == nil || !got.LandedAt.Equal(landed) {
+		t.Fatalf("landed_at = %v, want %v", got.LandedAt, landed)
+	}
+	if err := s.MarkSwept(ctx, "in-4", "sweep-4"); err != nil {
+		t.Fatal(err)
+	}
+	fwds, err := s.GetForwardByMemoID(ctx, 10)
+	if err != nil || len(fwds) != 1 {
+		t.Fatalf("forwards = %v, err = %v", fwds, err)
+	}
+	if e := fwds[0].Error; e == nil || *e != "swept to recovery: intent expired" {
+		t.Fatalf("error = %v, want the sweep reason kept", e)
 	}
 }
