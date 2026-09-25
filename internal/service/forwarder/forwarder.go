@@ -3,6 +3,7 @@ package forwarder
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	sdkamount "github.com/stellar/go-stellar-sdk/amount"
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
@@ -28,7 +30,7 @@ import (
 // forwardStore is the subset of store.Store that Forwarder calls.
 // Narrow interface keeps test mocks small.
 type forwardStore interface {
-	InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string) (bool, error)
+	InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string, landedAt time.Time) (bool, error)
 	GetIntentByMemoID(ctx context.Context, memoID uint64) (*store.Intent, error)
 	MarkForwardDone(ctx context.Context, txHash, forwardTx string) error
 	CompleteIntent(ctx context.Context, memoID uint64) error
@@ -36,12 +38,15 @@ type forwardStore interface {
 	RequeueForContention(ctx context.Context, txHash, errMsg string) error
 	PermanentlyFail(ctx context.Context, txHash, errMsg string) error
 	FailIntent(ctx context.Context, memoID uint64) error
+	MarkSweep(ctx context.Context, txHash, reason string) error
+	MarkSwept(ctx context.Context, txHash, sweepTx string) error
+	RecordSubmission(ctx context.Context, txHash, submittedTx string, until time.Time) error
+	ClearSubmission(ctx context.Context, txHash string) error
 }
 
 // horizonClient is the subset of horizonclient.Client used by Forwarder.
 type horizonClient interface {
 	AccountDetail(request horizonclient.AccountRequest) (hProtocol.Account, error)
-	SubmitTransaction(transaction *txnbuild.Transaction) (hProtocol.Transaction, error)
 }
 
 // rpcClient is the subset of rpcclient.Client used by Forwarder.
@@ -49,6 +54,7 @@ type rpcClient interface {
 	SimulateTransaction(ctx context.Context, request rpcprotocol.SimulateTransactionRequest) (rpcprotocol.SimulateTransactionResponse, error)
 	SendTransaction(ctx context.Context, request rpcprotocol.SendTransactionRequest) (rpcprotocol.SendTransactionResponse, error)
 	PollTransaction(ctx context.Context, txHash string) (rpcprotocol.GetTransactionResponse, error)
+	GetTransaction(ctx context.Context, request rpcprotocol.GetTransactionRequest) (rpcprotocol.GetTransactionResponse, error)
 }
 
 const (
@@ -70,8 +76,21 @@ const (
 	ledgerTime = 5 * time.Second
 
 	// pollTimeout is the max time we wait for a PENDING transaction to reach a
-	// terminal state on-chain before declaring a transient failure.
+	// terminal state on-chain before handing it to the retry worker to resolve.
 	pollTimeout = 60 * time.Second
+
+	// txValidity is how long an outbound forward stays valid (its time bounds).
+	// It is also how long a forward whose outcome is unknown must wait before it
+	// may be built again: until then the first transaction can still land, and a
+	// second one would pay the C-address twice. Long enough to cover simulation,
+	// the TRY_AGAIN_LATER loop and the poll; short enough that an unresolved
+	// forward is retried within a few minutes.
+	txValidity = 2 * time.Minute
+
+	// landingGrace is added to a transaction's max time before treating "not
+	// found" as "never landed", to absorb clock skew against ledger close times
+	// and RPC ingestion lag.
+	landingGrace = 30 * time.Second
 )
 
 // Forwarder builds, signs, and submits the outbound payment for each inbound deposit.
@@ -110,9 +129,10 @@ func (f *Forwarder) seq() *sequencer {
 // Transient errors are safe to retry (network timeout, sequence race, fee congestion,
 // RPC overload). On transient failure the forward goes to pending_retry.
 type submitError struct {
-	permanent  bool
-	contention bool
-	err        error
+	permanent   bool
+	contention  bool
+	unconfirmed bool
+	err         error
 }
 
 func (e *submitError) Error() string { return e.err.Error() }
@@ -130,6 +150,18 @@ func transient(err error) error { return &submitError{permanent: false, err: err
 // forwards that are holding real customer funds — the more load, the more
 // likely, which is exactly backwards.
 func contention(err error) error { return &submitError{contention: true, err: err} }
+
+// unconfirmed marks a failure after which the transaction may still land: the
+// send call errored, or it was accepted and never seen to settle. Retrying such a
+// forward means resolving the recorded transaction, never building a new one —
+// the first can be included until its time bounds pass, so a second transfer
+// would pay the C-address twice for one deposit.
+func unconfirmed(err error) error { return &submitError{unconfirmed: true, err: err} }
+
+func isUnconfirmed(err error) bool {
+	var se *submitError
+	return errors.As(err, &se) && se.unconfirmed
+}
 
 func isContention(err error) bool {
 	var se *submitError
@@ -162,12 +194,20 @@ var backoffs = []time.Duration{
 // poolAddress is the pool account the payment arrived at. Every outbound
 // transfer for this deposit — the forward or a recovery sweep — is paid out of
 // that pool, because that is where the money is.
-func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, memoID uint64, fromAddress, amount, asset string) {
+//
+// landedAt is when the payment closed on-chain; it decides whether the intent
+// was still open. Zero means unknown, and the current time is used instead.
+func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, memoID uint64, fromAddress, amount, asset string, landedAt time.Time) {
 	// Measured from when we first see the deposit rather than from submission,
 	// so the number reflects what the customer waits for.
 	started := time.Now()
 
-	inserted, err := f.store.InsertForward(ctx, txHash, memoID, poolAddress, fromAddress, amount, asset)
+	landed := landedAt
+	if landed.IsZero() {
+		landed = started
+	}
+
+	inserted, err := f.store.InsertForward(ctx, txHash, memoID, poolAddress, fromAddress, amount, asset, landed)
 	if err != nil {
 		slog.Error("forwarder: insert forward", "tx_hash", txHash, "err", err)
 		return
@@ -184,30 +224,43 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 		return
 	}
 
+	if !f.accepts(asset) {
+		metrics.ForwardsTotal.WithLabelValues("unsupported_asset").Inc()
+		slog.Warn("forwarder: asset not accepted, sweeping to recovery", "tx_hash", txHash, "asset", asset)
+		f.startSweep(ctx, txHash, poolAddress, amount, asset, "unsupported asset "+asset)
+		return
+	}
+
 	intent, err := f.store.GetIntentByMemoID(ctx, memoID)
-	if err != nil {
+	if errors.Is(err, pgx.ErrNoRows) {
 		// The alertable outcome: a deposit carrying a reference this relayer never
 		// issued. It is swept to recovery rather than credited, so any sustained
 		// rate here means customers are paying and not being paid.
 		metrics.ForwardsTotal.WithLabelValues("unknown_memo").Inc()
 		slog.Warn("forwarder: unknown memo_id, sweeping to recovery", "tx_hash", txHash, "memo_id", memoID)
-		f.sweep(ctx, poolAddress, txHash, amount, asset)
-		_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusFailed, "unknown memo_id — swept to recovery")
+		f.startSweep(ctx, txHash, poolAddress, amount, asset, "unknown memo_id")
+		return
+	}
+	if err != nil {
+		// A failed lookup says nothing about the memo. Sweeping on it would send a
+		// valid deposit to recovery; leave it for the retry worker instead.
+		_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusPendingRetry, fmt.Sprintf("look up intent: %v", err))
+		slog.Error("forwarder: intent lookup failed, queued for retry", "tx_hash", txHash, "err", err)
 		return
 	}
 
-	// Two ways to be past the window: the retry worker already flipped the status,
-	// or the TTL elapsed since its last tick. Testing the status alone makes
-	// crediting depend on when that worker last ran, so a deposit landing in the gap
-	// is forwarded against an intent the client already shows as dead — the mobile
-	// app's isDepositIntentExpired keys off expires_at directly.
-	if intent.Status == store.IntentExpired || time.Now().After(intent.ExpiresAt) {
+	// Expiry is judged by when the deposit landed on-chain, not when the
+	// relayer got to it. A payment made inside the window must be credited
+	// even if it is processed after the window closes — the stream replaying
+	// after a restart, or a backlog of forwards on a busy pool. For the same
+	// reason the intent's status is not consulted: the retry worker flips it
+	// to 'expired' by wall clock, which says nothing about this deposit.
+	if landed.After(intent.ExpiresAt) {
 		metrics.ForwardsTotal.WithLabelValues("expired").Inc()
 		slog.Warn("forwarder: intent expired, sweeping to recovery",
 			"tx_hash", txHash, "memo_id", memoID,
-			"status", intent.Status, "expires_at", intent.ExpiresAt)
-		f.sweep(ctx, poolAddress, txHash, amount, asset)
-		_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusFailed, "intent expired — swept to recovery")
+			"landed_at", landed, "expires_at", intent.ExpiresAt)
+		f.startSweep(ctx, txHash, poolAddress, amount, asset, "intent expired")
 		return
 	}
 
@@ -243,7 +296,7 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 			}
 		}
 
-		outboundHash, err := f.submit(ctx, intent.CAddress, poolAddress, amount, asset)
+		outboundHash, err := f.submit(ctx, txHash, intent.CAddress, poolAddress, amount, asset)
 		if err == nil {
 			_ = f.store.MarkForwardDone(ctx, txHash, outboundHash)
 			_ = f.store.CompleteIntent(ctx, memoID)
@@ -252,6 +305,16 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 			slog.Info("forwarder: forwarded",
 				"inbound", txHash, "outbound", outboundHash,
 				"memo_id", memoID, "amount", amount)
+			return
+		}
+
+		// The transfer may be in flight, so another attempt here could pay twice.
+		// Hand it to the retry worker, which resolves the recorded transaction
+		// before it will build a new one. Not charged: nothing has failed yet.
+		if isUnconfirmed(err) {
+			_ = f.store.RequeueForContention(ctx, txHash, err.Error())
+			slog.Warn("forwarder: outcome unknown, left for the retry worker to resolve",
+				"tx_hash", txHash, "err", err)
 			return
 		}
 
@@ -311,20 +374,69 @@ func mismatchesExpected(expected, received string) bool {
 
 // Retry is called by the background retry worker for pending_retry forwards.
 func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
+	// A transfer already put on the network is resolved before anything else —
+	// ahead of the ceiling too, since one that landed must be recorded as done,
+	// not failed.
+	if fwd.SubmittedTx != nil {
+		if settled := f.resolveSubmitted(ctx, fwd); settled {
+			return
+		}
+	}
+
 	// enforce retry ceiling — a forward that has already failed maxRetries
 	// times will never succeed and must be permanently closed.
 	if fwd.Retries >= maxRetries {
-		_ = f.store.PermanentlyFail(ctx, fwd.TxHash, fmt.Sprintf("exceeded max retries (%d)", maxRetries))
-		_ = f.store.FailIntent(ctx, fwd.MemoID)
+		if fwd.Sweep {
+			_ = f.store.PermanentlyFail(ctx, fwd.TxHash,
+				fmt.Sprintf("not swept after %d retries, funds remain in pool", maxRetries))
+		} else {
+			_ = f.store.PermanentlyFail(ctx, fwd.TxHash, fmt.Sprintf("exceeded max retries (%d)", maxRetries))
+			_ = f.store.FailIntent(ctx, fwd.MemoID)
+		}
 		slog.Error("forwarder: retry ceiling reached, permanently failing",
-			"tx_hash", fwd.TxHash, "retries", fwd.Retries)
+			"tx_hash", fwd.TxHash, "retries", fwd.Retries, "sweep", fwd.Sweep)
+		return
+	}
+
+	if fwd.Sweep {
+		if fwd.PoolAddress == "" {
+			_ = f.store.PermanentlyFail(ctx, fwd.TxHash, "not swept: receiving pool unknown, funds remain in pool")
+			return
+		}
+		f.sweepDeposit(ctx, fwd.TxHash, fwd.PoolAddress, fwd.Amount, fwd.Asset)
+		return
+	}
+
+	if !f.accepts(fwd.Asset) && fwd.PoolAddress != "" {
+		f.startSweep(ctx, fwd.TxHash, fwd.PoolAddress, fwd.Amount, fwd.Asset, "unsupported asset "+fwd.Asset)
 		return
 	}
 
 	intent, err := f.store.GetIntentByMemoID(ctx, fwd.MemoID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Only reachable for a row whose first attempt died before deciding. The
+		// deposit carries a memo this relayer never issued: return it.
+		if fwd.PoolAddress == "" {
+			_ = f.store.PermanentlyFail(ctx, fwd.TxHash, "intent not found and receiving pool unknown")
+			return
+		}
+		f.startSweep(ctx, fwd.TxHash, fwd.PoolAddress, fwd.Amount, fwd.Asset, "unknown memo_id")
+		return
+	}
 	if err != nil {
-		_ = f.store.PermanentlyFail(ctx, fwd.TxHash, "intent not found")
-		slog.Error("forwarder: retry — intent not found", "tx_hash", fwd.TxHash)
+		_ = f.store.MarkForwardFailed(ctx, fwd.TxHash, store.StatusPendingRetry, fmt.Sprintf("look up intent: %v", err))
+		slog.Error("forwarder: retry — intent lookup failed", "tx_hash", fwd.TxHash, "err", err)
+		return
+	}
+
+	// Same expiry rule as Forward, by landing time. A deposit whose first
+	// attempt died before its sweep decision was saved (a crash, or the write
+	// itself failing) must still be returned, not credited. One that landed in
+	// time is still forwarded however long our retries took. Rows recorded
+	// before landing times were kept have none and are forwarded as before.
+	if fwd.LandedAt != nil && fwd.LandedAt.After(intent.ExpiresAt) && fwd.PoolAddress != "" {
+		metrics.ForwardsTotal.WithLabelValues("expired").Inc()
+		f.startSweep(ctx, fwd.TxHash, fwd.PoolAddress, fwd.Amount, fwd.Asset, "intent expired")
 		return
 	}
 
@@ -340,8 +452,15 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 		poolAddress = intent.PoolAddress
 	}
 
-	outboundHash, err := f.submit(ctx, intent.CAddress, poolAddress, fwd.Amount, fwd.Asset)
+	outboundHash, err := f.submit(ctx, fwd.TxHash, intent.CAddress, poolAddress, fwd.Amount, fwd.Asset)
 	if err != nil {
+		// May be in flight — the next tick resolves it. Not charged.
+		if isUnconfirmed(err) {
+			_ = f.store.RequeueForContention(ctx, fwd.TxHash, err.Error())
+			slog.Warn("forwarder: retry outcome unknown, will resolve next tick",
+				"tx_hash", fwd.TxHash, "err", err)
+			return
+		}
 		// Permanent error — do not re-queue, close the forward for good.
 		if isPermanent(err) {
 			_ = f.store.PermanentlyFail(ctx, fwd.TxHash, err.Error())
@@ -367,11 +486,115 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 		return
 	}
 
+	f.completeRetried(ctx, fwd, outboundHash)
+	slog.Info("forwarder: retry succeeded", "inbound", fwd.TxHash, "outbound", outboundHash)
+}
+
+func (f *Forwarder) completeRetried(ctx context.Context, fwd store.Forward, outboundHash string) {
 	_ = f.store.MarkForwardDone(ctx, fwd.TxHash, outboundHash)
 	_ = f.store.CompleteIntent(ctx, fwd.MemoID)
 	metrics.ForwardsTotal.WithLabelValues("done").Inc()
 	metrics.DepositToCreditSeconds.Observe(time.Since(fwd.CreatedAt).Seconds())
-	slog.Info("forwarder: retry succeeded", "inbound", fwd.TxHash, "outbound", outboundHash)
+}
+
+// resolveSubmitted settles a forward whose earlier transfer was put on the
+// network with its outcome unknown. It reports true when the forward is settled
+// or must keep waiting, and false only when that transfer is known never to have
+// moved funds — the one case in which building a new transfer is safe.
+func (f *Forwarder) resolveSubmitted(ctx context.Context, fwd store.Forward) bool {
+	hash := *fwd.SubmittedTx
+	resp, err := f.rpc.GetTransaction(ctx, rpcprotocol.GetTransactionRequest{Hash: hash})
+	if err != nil {
+		_ = f.store.RequeueForContention(ctx, fwd.TxHash, fmt.Sprintf("resolve %s: %v", hash, err))
+		slog.Warn("forwarder: cannot resolve in-flight transfer yet",
+			"tx_hash", fwd.TxHash, "submitted_tx", hash, "err", err)
+		return true
+	}
+
+	switch resp.Status {
+	case rpcprotocol.TransactionStatusSuccess:
+		if fwd.Sweep {
+			_ = f.store.MarkSwept(ctx, fwd.TxHash, hash)
+			metrics.ForwardsTotal.WithLabelValues("swept").Inc()
+		} else {
+			f.completeRetried(ctx, fwd, hash)
+		}
+		slog.Info("forwarder: in-flight transfer had landed",
+			"inbound", fwd.TxHash, "outbound", hash, "sweep", fwd.Sweep)
+		return true
+
+	case rpcprotocol.TransactionStatusFailed:
+		// Included but failed: the transfer did not happen. A permanent cause
+		// would fail again, so close it; otherwise it is safe to build anew.
+		cause := classifyResultXDR(resp.ResultXDR)
+		if isPermanent(cause) {
+			if fwd.Sweep {
+				_ = f.store.PermanentlyFail(ctx, fwd.TxHash, "not swept, funds remain in pool: "+cause.Error())
+			} else {
+				_ = f.store.PermanentlyFail(ctx, fwd.TxHash, cause.Error())
+				_ = f.store.FailIntent(ctx, fwd.MemoID)
+			}
+			slog.Error("forwarder: in-flight transfer failed on-chain, permanent",
+				"tx_hash", fwd.TxHash, "submitted_tx", hash, "err", cause)
+			return true
+		}
+		return !f.forgetSubmission(ctx, fwd.TxHash)
+
+	default: // NOT_FOUND
+		// Not seen yet. It can still land until its max time has passed, so wait
+		// that out rather than risk a second transfer.
+		until := fwd.UpdatedAt.Add(txValidity)
+		if fwd.SubmittedUntil != nil {
+			until = *fwd.SubmittedUntil
+		}
+		if !pastMaxTime(resp, until) {
+			_ = f.store.RequeueForContention(ctx, fwd.TxHash,
+				fmt.Sprintf("awaiting %s (valid until %s)", hash, until.UTC().Format(time.RFC3339)))
+			return true
+		}
+
+		// "Not found" only proves it never landed if RPC still holds every ledger
+		// it could have landed in. After an outage longer than RPC's retention a
+		// transfer that did land also reads as not found, and rebuilding would pay
+		// twice. Close it for a human to reconcile instead; the intent is left as
+		// is, since the deposit may well have been credited.
+		sent := until.Add(-txValidity)
+		if resp.OldestLedgerCloseTime != 0 && time.Unix(resp.OldestLedgerCloseTime, 0).After(sent) {
+			_ = f.store.PermanentlyFail(ctx, fwd.TxHash, fmt.Sprintf(
+				"outcome of %s unknown: older than RPC history — reconcile on-chain before re-forwarding", hash))
+			slog.Error("forwarder: in-flight transfer outside RPC history, needs manual reconciliation",
+				"tx_hash", fwd.TxHash, "submitted_tx", hash, "sent", sent,
+				"rpc_oldest", time.Unix(resp.OldestLedgerCloseTime, 0))
+			return true
+		}
+
+		slog.Warn("forwarder: in-flight transfer expired without landing, rebuilding",
+			"tx_hash", fwd.TxHash, "submitted_tx", hash)
+		return !f.forgetSubmission(ctx, fwd.TxHash)
+	}
+}
+
+// pastMaxTime reports whether a transaction valid until `until` can no longer be
+// included. The network's own clock decides that — no ledger closing after the
+// max time can include it — so it uses the latest ledger RPC has ingested,
+// which also absorbs RPC ingestion lag. Only when RPC does not report one does
+// it fall back to the local clock plus landingGrace.
+func pastMaxTime(resp rpcprotocol.GetTransactionResponse, until time.Time) bool {
+	if resp.LatestLedgerCloseTime != 0 {
+		return time.Unix(resp.LatestLedgerCloseTime, 0).After(until)
+	}
+	return time.Now().After(until.Add(landingGrace))
+}
+
+// forgetSubmission clears a forward's in-flight transaction once it is known
+// never to transfer funds. It reports whether that succeeded; if not, the hash
+// stays recorded and the next resolution simply finds it expired again.
+func (f *Forwarder) forgetSubmission(ctx context.Context, txHash string) bool {
+	if err := f.store.ClearSubmission(ctx, txHash); err != nil {
+		slog.Error("forwarder: clear submission", "tx_hash", txHash, "err", err)
+		return false
+	}
+	return true
 }
 
 // ── Submit pipeline ───────────────────────────────────────────────────────────
@@ -397,7 +620,33 @@ func parseAsset(asset string) (txnbuild.Asset, error) {
 	return txnbuild.CreditAsset{Code: code, Issuer: issuer}, nil
 }
 
-func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, asset string) (hash string, err error) {
+// submit pays amount of asset from poolAddress to the C-address cAddress via
+// the asset's SAC transfer. inboundHash identifies the forward row the transfer
+// is recorded against before it is sent; see RecordSubmission.
+func (f *Forwarder) submit(ctx context.Context, inboundHash, cAddress, poolAddress, amount, asset string) (string, error) {
+	return f.transfer(ctx, inboundHash, poolAddress, func(src *txnbuild.SimpleAccount, validUntil time.Time) (prepared, error) {
+		return f.prepareContractPayment(ctx, src, cAddress, amount, asset, validUntil)
+	})
+}
+
+// prepared is a built, unsigned transaction and how to price it for a given
+// inclusion fee.
+type prepared struct {
+	env    xdr.TransactionEnvelope
+	setFee func(env *xdr.TransactionEnvelope, inclusionFee uint32)
+}
+
+// transfer runs one outbound payment out of poolAddress end to end: draw the
+// pool's next sequence number, build the transaction with prepare, then sign,
+// record, send and confirm it, bumping the fee on tx_insufficient_fee. Forwards
+// and recovery sweeps share it, so both get the same guarantee: the transaction
+// is recorded against inboundHash before it is sent, and an unknown outcome is
+// returned as unconfirmed rather than retried.
+func (f *Forwarder) transfer(
+	ctx context.Context,
+	inboundHash, poolAddress string,
+	prepare func(src *txnbuild.SimpleAccount, validUntil time.Time) (prepared, error),
+) (hash string, err error) {
 	kp, err := f.keypairFor(poolAddress)
 	if err != nil {
 		return "", permanent(err)
@@ -431,88 +680,40 @@ func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, a
 		// accepted the transaction is a confirmation problem: the sequence is
 		// spent, and re-reading Horizon while the transaction is still settling
 		// would report the older value and hand the number out a second time.
-		if err != nil && !sendDone {
+		// An unconfirmed send is the same case: the request may have reached
+		// the network, so the number may be spent. If it was not, the next
+		// transaction on the pool is rejected with txBadSeq, which resyncs then.
+		if err != nil && !sendDone && !isUnconfirmed(err) {
 			f.seq().resync(poolAddress)
 		}
 	}()
 
-	parsedAsset, err := parseAsset(asset)
-	if err != nil {
-		return "", permanent(err)
-	}
+	// Whole seconds, so the recorded deadline is exactly the max time on-chain.
+	validUntil := time.Now().Add(txValidity).Truncate(time.Second)
 
-	// Classic Payment only accepts G-addresses. C-addresses (Soroban contracts)
-	// must be paid via the asset's SAC transfer function instead.
-	op, err := txnbuild.NewPaymentToContract(txnbuild.PaymentToContractParams{
-		NetworkPassphrase: f.config.NetworkPassphrase,
-		Destination:       cAddress,
-		Amount:            amount,
-		Asset:             parsedAsset,
-		SourceAccount:     poolAddress,
-	})
+	p, err := prepare(sourceAccount, validUntil)
 	if err != nil {
-		return "", permanent(fmt.Errorf("build payment-to-contract: %w", err))
-	}
-
-	// Build with placeholder fee for simulation — Stellar RPC ignores the fee value
-	// during simulation and returns the true minimum resource fee in the response.
-	tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
-		SourceAccount: sourceAccount,
-		// The sequencer already returned the exact number this transaction must
-		// carry, so txnbuild must not advance it again.
-		IncrementSequenceNum: false,
-		Operations:           []txnbuild.Operation{&op},
-		BaseFee:              txnbuild.MinBaseFee,
-		Preconditions: txnbuild.Preconditions{
-			TimeBounds: txnbuild.NewTimeout(300),
-		},
-	})
-	if err != nil {
-		return "", permanent(fmt.Errorf("build tx for simulation: %w", err))
-	}
-
-	// ── Simulate via Stellar RPC ──────────────────────────────────────────────
-	// Soroban transactions are rejected if the footprint or resource fee doesn't
-	// match the network's actual usage. Simulation gives us the ground truth once.
-	env := tx.ToXDR()
-	envBytes, err := env.MarshalBinary()
-	if err != nil {
-		return "", permanent(fmt.Errorf("marshal tx for simulation: %w", err))
-	}
-
-	simResp, err := f.rpc.SimulateTransaction(ctx, rpcprotocol.SimulateTransactionRequest{
-		Transaction: base64.StdEncoding.EncodeToString(envBytes),
-	})
-	if err != nil {
-		return "", transient(fmt.Errorf("simulate tx: %w", err))
-	}
-	if simResp.Error != "" {
-		// Simulation errors are permanent — the same transaction will always fail
-		// simulation (e.g., contract not found, invalid arguments).
-		return "", permanent(fmt.Errorf("simulate tx: %s", simResp.Error))
-	}
-
-	simDataBytes, err := base64.StdEncoding.DecodeString(simResp.TransactionDataXDR)
-	if err != nil {
-		return "", permanent(fmt.Errorf("decode simulation data: %w", err))
-	}
-	var sorobanData xdr.SorobanTransactionData
-	if err := xdr.SafeUnmarshal(simDataBytes, &sorobanData); err != nil {
-		return "", permanent(fmt.Errorf("unmarshal soroban data: %w", err))
+		return "", err
 	}
 
 	// ── Submit with fee-bump retry ────────────────────────────────────────────
-	// The simulation footprint is reused across fee attempts — only the inclusion
-	// fee portion changes. detect tx_insufficient_fee and double the fee.
+	// Only the inclusion fee changes between attempts (a Soroban transaction
+	// keeps its simulated footprint). Detect tx_insufficient_fee and double it.
 	inclusionFee := uint32(txnbuild.MinBaseFee)
 	for feeAttempt := range maxFeeRetries + 1 {
-		hash, err = f.signAndSend(ctx, kp, env, sorobanData, simResp.MinResourceFee, inclusionFee)
+		p.setFee(&p.env, inclusionFee)
+		hash, err = f.signAndSend(ctx, inboundHash, kp, p.env, validUntil)
 		if err == nil {
 			// Accepted by the network, so this sequence number is spent and the
 			// next forward may proceed. Confirmation is polled without the lock.
 			unlockSend()
 			sendDone = true
-			return f.pollResult(ctx, hash)
+			hash, err = f.pollResult(ctx, hash)
+			if err != nil && !isUnconfirmed(err) {
+				// Settled as failed: this transaction moved nothing.
+				f.forgetSubmission(ctx, inboundHash)
+			}
+			return hash, err
 		}
 
 		var fe *feeError
@@ -534,26 +735,109 @@ func (f *Forwarder) submit(ctx context.Context, cAddress, poolAddress, amount, a
 	return "", transient(fmt.Errorf("insufficient fee after %d retries", maxFeeRetries))
 }
 
-// signAndSend applies simulation results to the envelope, re-signs it, submits via
-// Stellar RPC, and polls for the terminal state.
+// prepareContractPayment builds the SAC transfer to a C-address and simulates
+// it for its footprint and resource fee.
+func (f *Forwarder) prepareContractPayment(
+	ctx context.Context,
+	src *txnbuild.SimpleAccount,
+	cAddress, amount, asset string,
+	validUntil time.Time,
+) (prepared, error) {
+	parsedAsset, err := parseAsset(asset)
+	if err != nil {
+		return prepared{}, permanent(err)
+	}
+
+	// Classic Payment only accepts G-addresses. C-addresses (Soroban contracts)
+	// must be paid via the asset's SAC transfer function instead.
+	op, err := txnbuild.NewPaymentToContract(txnbuild.PaymentToContractParams{
+		NetworkPassphrase: f.config.NetworkPassphrase,
+		Destination:       cAddress,
+		Amount:            amount,
+		Asset:             parsedAsset,
+		SourceAccount:     src.AccountID,
+	})
+	if err != nil {
+		return prepared{}, permanent(fmt.Errorf("build payment-to-contract: %w", err))
+	}
+
+	// Build with placeholder fee for simulation — Stellar RPC ignores the fee value
+	// during simulation and returns the true minimum resource fee in the response.
+	tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
+		SourceAccount: src,
+		// The sequencer already returned the exact number this transaction must
+		// carry, so txnbuild must not advance it again.
+		IncrementSequenceNum: false,
+		Operations:           []txnbuild.Operation{&op},
+		BaseFee:              txnbuild.MinBaseFee,
+		Preconditions: txnbuild.Preconditions{
+			TimeBounds: txnbuild.NewTimebounds(0, validUntil.Unix()),
+		},
+	})
+	if err != nil {
+		return prepared{}, permanent(fmt.Errorf("build tx for simulation: %w", err))
+	}
+
+	// ── Simulate via Stellar RPC ──────────────────────────────────────────────
+	// Soroban transactions are rejected if the footprint or resource fee doesn't
+	// match the network's actual usage. Simulation gives us the ground truth once.
+	env := tx.ToXDR()
+	envBytes, err := env.MarshalBinary()
+	if err != nil {
+		return prepared{}, permanent(fmt.Errorf("marshal tx for simulation: %w", err))
+	}
+
+	simResp, err := f.rpc.SimulateTransaction(ctx, rpcprotocol.SimulateTransactionRequest{
+		Transaction: base64.StdEncoding.EncodeToString(envBytes),
+	})
+	if err != nil {
+		return prepared{}, transient(fmt.Errorf("simulate tx: %w", err))
+	}
+	if simResp.Error != "" {
+		// Simulation errors are permanent — the same transaction will always fail
+		// simulation (e.g., contract not found, invalid arguments).
+		return prepared{}, permanent(fmt.Errorf("simulate tx: %s", simResp.Error))
+	}
+
+	simDataBytes, err := base64.StdEncoding.DecodeString(simResp.TransactionDataXDR)
+	if err != nil {
+		return prepared{}, permanent(fmt.Errorf("decode simulation data: %w", err))
+	}
+	var sorobanData xdr.SorobanTransactionData
+	if err := xdr.SafeUnmarshal(simDataBytes, &sorobanData); err != nil {
+		return prepared{}, permanent(fmt.Errorf("unmarshal soroban data: %w", err))
+	}
+
+	return prepared{
+		env: env,
+		// Apply the simulation footprint and total fee.
+		// total = inclusion (per-op base fee) + resource (from simulation) + buffer.
+		setFee: func(env *xdr.TransactionEnvelope, inclusionFee uint32) {
+			env.V1.Tx.Ext = xdr.TransactionExt{V: 1, SorobanData: &sorobanData}
+			env.V1.Tx.Fee = xdr.Uint32(inclusionFee + uint32(simResp.MinResourceFee) + 10_000)
+		},
+	}, nil
+}
+
+// signAndSend signs a fully priced envelope and submits it via Stellar RPC.
 //
 // submits via rpc.SendTransaction (not horizon.SubmitTransaction) so we receive
 // Stellar-native status codes including TRY_AGAIN_LATER and ERROR result codes.
 //
 // retries on TRY_AGAIN_LATER up to maxTryAgain times with a one-ledger sleep.
+//
+// The signed transaction's hash is recorded against the forward before the first
+// send, so a crash or a lost response after this point is resolved by looking
+// that hash up rather than by paying again. Every return that means "never
+// queued" clears it again; every return that means "may be queued" is
+// unconfirmed and leaves it in place.
 func (f *Forwarder) signAndSend(
 	ctx context.Context,
+	inboundHash string,
 	kp *keypair.Full,
 	env xdr.TransactionEnvelope,
-	sorobanData xdr.SorobanTransactionData,
-	minResourceFee int64,
-	inclusionFee uint32,
+	validUntil time.Time,
 ) (string, error) {
-	// Apply the simulation footprint and total fee.
-	// total = inclusion (per-op base fee) + resource (from simulation) + buffer.
-	env.V1.Tx.Ext = xdr.TransactionExt{V: 1, SorobanData: &sorobanData}
-	env.V1.Tx.Fee = xdr.Uint32(inclusionFee + uint32(minResourceFee) + 10_000)
-
 	// Marshal, re-parse, and sign so the signature covers the updated fee and footprint.
 	updatedBytes, err := env.MarshalBinary()
 	if err != nil {
@@ -579,6 +863,16 @@ func (f *Forwarder) signAndSend(
 	}
 	signedB64 := base64.StdEncoding.EncodeToString(signedBytes)
 
+	txHash, err := tx.HashHex(f.config.NetworkPassphrase)
+	if err != nil {
+		return "", permanent(fmt.Errorf("hash tx: %w", err))
+	}
+	if err := f.store.RecordSubmission(ctx, inboundHash, txHash, validUntil); err != nil {
+		// Nothing sent: without the record, a lost response could not be told
+		// apart from a transfer that never happened.
+		return "", transient(err)
+	}
+
 	// TRY_AGAIN_LATER retry loop — Stellar Core's mempool can be temporarily full.
 	// The correct response is to wait one ledger cycle (~5s) and resubmit the same
 	// signed envelope. We do not count these as failures.
@@ -586,6 +880,8 @@ func (f *Forwarder) signAndSend(
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
+				// An earlier attempt got TRY_AGAIN_LATER, so nothing is queued.
+				f.forgetSubmission(ctx, inboundHash)
 				return "", transient(ctx.Err())
 			case <-time.After(ledgerTime):
 			}
@@ -595,7 +891,8 @@ func (f *Forwarder) signAndSend(
 			Transaction: signedB64,
 		})
 		if err != nil {
-			return "", transient(fmt.Errorf("send transaction: %w", err))
+			// The request may have reached the network before the error.
+			return "", unconfirmed(fmt.Errorf("send transaction %s: %w", txHash, err))
 		}
 
 		switch resp.Status {
@@ -614,12 +911,16 @@ func (f *Forwarder) signAndSend(
 				"attempt", attempt+1, "max", maxTryAgain)
 			continue
 		case "ERROR":
+			// Rejected before entering the queue: it can never land.
+			f.forgetSubmission(ctx, inboundHash)
 			return "", classifyResultXDR(resp.ErrorResultXDR)
 		default:
-			return "", transient(fmt.Errorf("unknown send status: %s", resp.Status))
+			return "", unconfirmed(fmt.Errorf("unknown send status %s for %s", resp.Status, txHash))
 		}
 	}
 
+	// TRY_AGAIN_LATER means not queued, every time.
+	f.forgetSubmission(ctx, inboundHash)
 	return "", transient(fmt.Errorf("TRY_AGAIN_LATER after %d retries", maxTryAgain))
 }
 
@@ -631,7 +932,8 @@ func (f *Forwarder) pollResult(ctx context.Context, hash string) (string, error)
 
 	result, err := f.rpc.PollTransaction(pollCtx, hash)
 	if err != nil {
-		return "", transient(fmt.Errorf("poll transaction %s: %w", hash, err))
+		// Accepted but not seen to settle; it may still land.
+		return "", unconfirmed(fmt.Errorf("poll transaction %s: %w", hash, err))
 	}
 
 	switch result.Status {
@@ -641,7 +943,7 @@ func (f *Forwarder) pollResult(ctx context.Context, hash string) (string, error)
 		// Classify the on-chain failure to decide whether retry makes sense.
 		return "", classifyResultXDR(result.ResultXDR)
 	default:
-		return "", transient(fmt.Errorf("unexpected poll status %s for %s", result.Status, hash))
+		return "", unconfirmed(fmt.Errorf("unexpected poll status %s for %s", result.Status, hash))
 	}
 }
 
@@ -691,89 +993,187 @@ func classifyResultXDR(resultXDR string) error {
 	}
 }
 
-// ── Sweep (classic XLM payment to G-address recovery account) ────────────────
+// ── Sweep (classic payment to the G-address recovery account) ──────────────────
 
-// sweep returns an unroutable deposit to the recovery account, paying it out of
-// poolAddress — the pool that actually received it. With intents spread across
-// pools, sweeping from a fixed pool would refund one pool's deposit out of
-// another pool's balance and strand the original funds.
-func (f *Forwarder) sweep(ctx context.Context, poolAddress, inboundHash, amount, asset string) {
-	if f.config.RecoveryAddress == "" {
-		slog.Warn("forwarder: no recovery address configured, funds remain in pool", "tx_hash", inboundHash)
+// errAwaitingTrustline means the recovery account cannot yet receive the swept
+// asset. Nothing is sent — a payment would only fail on-chain and burn its fee —
+// and the sweep is retried each tick, so adding the trustline is enough to let
+// it through.
+var errAwaitingTrustline = errors.New("no authorized trustline for the asset")
+
+// errTrustlineUnknown means the account could not be loaded to check its
+// trustline — a Horizon or network failure, not a problem with the sweep.
+// Like a missing trustline it waits uncharged, so a blip cannot use up the
+// retry budget and leave the deposit marked not swept.
+var errTrustlineUnknown = errors.New("could not load account to check its trustline")
+
+// startSweep returns a deposit that cannot be credited to the recovery account.
+// The decision is persisted before anything is sent, so a retry after a crash
+// finishes the sweep instead of deciding again.
+func (f *Forwarder) startSweep(ctx context.Context, txHash, poolAddress, amount, asset, reason string) {
+	if err := f.store.MarkSweep(ctx, txHash, reason); err != nil {
+		_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusPendingRetry, err.Error())
+		slog.Error("forwarder: cannot record sweep decision, queued for retry", "tx_hash", txHash, "err", err)
 		return
+	}
+	f.sweepDeposit(ctx, txHash, poolAddress, amount, asset)
+}
+
+// sweepDeposit attempts the recovery payment once and records the outcome only
+// as far as it is known: swept once the payment has landed, and otherwise left
+// queued or failed with the funds still in the pool — never claimed as swept.
+func (f *Forwarder) sweepDeposit(ctx context.Context, txHash, poolAddress, amount, asset string) {
+	hash, err := f.sweep(ctx, txHash, poolAddress, amount, asset)
+	switch {
+	case err == nil:
+		_ = f.store.MarkSwept(ctx, txHash, hash)
+		metrics.ForwardsTotal.WithLabelValues("swept").Inc()
+		slog.Info("forwarder: swept to recovery", "inbound", txHash, "pool", poolAddress, "sweep_tx", hash)
+
+	case errors.Is(err, errAwaitingTrustline), errors.Is(err, errTrustlineUnknown), isUnconfirmed(err), isContention(err):
+		// Waiting on configuration, on confirmation or for the pool's slot —
+		// none of which is this sweep failing, so none is charged.
+		_ = f.store.RequeueForContention(ctx, txHash, "not swept yet: "+err.Error())
+		slog.Warn("forwarder: sweep deferred", "tx_hash", txHash, "err", err)
+
+	case isPermanent(err):
+		_ = f.store.PermanentlyFail(ctx, txHash, "not swept, funds remain in pool: "+err.Error())
+		metrics.ForwardsTotal.WithLabelValues("sweep_failed").Inc()
+		slog.Error("forwarder: sweep failed permanently, funds remain in pool",
+			"tx_hash", txHash, "pool", poolAddress, "err", err)
+
+	default:
+		_ = f.store.MarkForwardFailed(ctx, txHash, store.StatusPendingRetry, "not swept yet: "+err.Error())
+		slog.Warn("forwarder: sweep failed, queued for retry", "tx_hash", txHash, "err", err)
+	}
+}
+
+// sweep pays an unroutable deposit to the recovery account out of poolAddress —
+// the pool that actually received it. With intents spread across pools,
+// sweeping from a fixed pool would refund one pool's deposit out of another
+// pool's balance and strand the original funds.
+//
+// It goes through the same transfer pipeline as a forward (same sequencer and
+// send lock, recorded before it is sent), so a lost response or a crash is
+// resolved by looking the payment up rather than paying the recovery account
+// twice.
+func (f *Forwarder) sweep(ctx context.Context, inboundHash, poolAddress, amount, asset string) (string, error) {
+	if f.config.RecoveryAddress == "" {
+		return "", permanent(errors.New("RECOVERY_ADDRESS is not configured"))
 	}
 	parsedAsset, err := parseAsset(asset)
 	if err != nil {
-		slog.Error("forwarder: sweep cannot parse asset, funds remain in pool",
-			"tx_hash", inboundHash, "asset", asset, "err", err)
-		return
+		return "", permanent(err)
 	}
-	kp, err := f.keypairFor(poolAddress)
-	if err != nil {
-		slog.Error("forwarder: sweep has no key for receiving pool, funds remain in pool",
-			"tx_hash", inboundHash, "pool", poolAddress, "err", err)
-		return
-	}
-
-	// The sweep signs as the same pool account as the forward path, so it draws
-	// from the same sequencer and holds the same send lock. Without the lock it
-	// could take N+1 while a forward holding N is still between draw and send,
-	// reach the network first, be rejected, and resync mid-flight — handing a
-	// number out twice. Horizon's submit waits for ledger inclusion, so the lock
-	// is held until the sweep has landed.
-	unlockSend := f.seq().lockSend(poolAddress)
-	defer unlockSend()
-
-	seq, err := f.seq().next(poolAddress)
-	if err != nil {
-		slog.Error("forwarder: sweep sequence", "err", err)
-		return
-	}
-	sourceAccount := &txnbuild.SimpleAccount{AccountID: poolAddress, Sequence: seq}
-	defer func() {
-		if err != nil {
-			f.seq().resync(poolAddress)
+	if !parsedAsset.IsNative() {
+		if err := f.checkTrustline(f.config.RecoveryAddress, parsedAsset); err != nil {
+			return "", err
 		}
-	}()
+	}
 
-	tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
-		SourceAccount:        sourceAccount,
-		IncrementSequenceNum: false,
-		Operations: []txnbuild.Operation{
-			&txnbuild.Payment{
-				Destination: f.config.RecoveryAddress,
-				Amount:      amount,
-				// Sweeping an issued asset needs the recovery account to hold a
-				// trustline for it; without one Horizon rejects the payment and
-				// the balance stays in the pool. Keep the recovery account's
-				// trustlines in step with the assets the pool accepts.
-				Asset: parsedAsset,
+	// Tie the recovery payment to the deposit it returns, on-chain: whoever
+	// reconciles the recovery account can find the original payment by hash.
+	// The deposit key is the transaction hash, suffixed with the operation's
+	// position when the transaction paid the pool more than once.
+	var memo txnbuild.Memo
+	var h txnbuild.MemoHash
+	if txHash, _, _ := strings.Cut(inboundHash, ":"); len(txHash) == 2*len(h) {
+		if _, err := hex.Decode(h[:], []byte(txHash)); err == nil {
+			memo = h
+		}
+	}
+
+	return f.transfer(ctx, inboundHash, poolAddress, func(src *txnbuild.SimpleAccount, validUntil time.Time) (prepared, error) {
+		tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
+			SourceAccount:        src,
+			IncrementSequenceNum: false,
+			Operations: []txnbuild.Operation{
+				&txnbuild.Payment{
+					Destination: f.config.RecoveryAddress,
+					Amount:      amount,
+					Asset:       parsedAsset,
+				},
 			},
-		},
-		Memo:    txnbuild.MemoText("unknown-memo"),
-		BaseFee: txnbuild.MinBaseFee,
-		Preconditions: txnbuild.Preconditions{
-			TimeBounds: txnbuild.NewTimeout(300),
-		},
+			Memo:    memo,
+			BaseFee: txnbuild.MinBaseFee,
+			Preconditions: txnbuild.Preconditions{
+				TimeBounds: txnbuild.NewTimebounds(0, validUntil.Unix()),
+			},
+		})
+		if err != nil {
+			return prepared{}, permanent(fmt.Errorf("build sweep tx: %w", err))
+		}
+		return prepared{
+			env: tx.ToXDR(),
+			// One classic operation: the fee is the inclusion fee.
+			setFee: func(env *xdr.TransactionEnvelope, inclusionFee uint32) {
+				env.V1.Tx.Fee = xdr.Uint32(inclusionFee)
+			},
+		}, nil
 	})
-	if err != nil {
-		slog.Error("forwarder: sweep build tx", "err", err)
-		return
-	}
+}
 
-	tx, err = tx.Sign(f.config.NetworkPassphrase, kp)
+// checkTrustline confirms account can receive an issued asset. For a sweep it
+// runs before any payment is sent: without an authorized trustline the payment
+// is included and fails (op_no_trust / op_not_authorized), which costs a fee
+// and proves nothing, so the sweep waits for the trustline instead.
+func (f *Forwarder) checkTrustline(account string, asset txnbuild.Asset) error {
+	acct, err := f.horizon.AccountDetail(horizonclient.AccountRequest{AccountID: account})
 	if err != nil {
-		slog.Error("forwarder: sweep sign tx", "err", err)
-		return
+		return fmt.Errorf("%w %s: %v", errTrustlineUnknown, account, err)
 	}
-
-	result, err := f.horizon.SubmitTransaction(tx)
-	if err != nil {
-		slog.Error("forwarder: sweep submit", "tx_hash", inboundHash, "err", err)
-		return
+	for _, b := range acct.Balances {
+		if b.Code == asset.GetCode() && b.Issuer == asset.GetIssuer() {
+			if b.IsAuthorized != nil && !*b.IsAuthorized {
+				break
+			}
+			return nil
+		}
 	}
+	return fmt.Errorf("%w (%s:%s)", errAwaitingTrustline, asset.GetCode(), asset.GetIssuer())
+}
 
-	slog.Info("forwarder: swept to recovery", "inbound", inboundHash, "pool", poolAddress, "sweep_tx", result.Hash)
+// accepts reports whether deposits may be credited in asset. An empty
+// allowlist accepts everything; config.Load always sets one.
+func (f *Forwarder) accepts(asset string) bool {
+	if len(f.config.AcceptedAssets) == 0 {
+		return true
+	}
+	for _, a := range f.config.AcceptedAssets {
+		if a == asset {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckTrustlines reports, at startup, any pool or recovery account that lacks
+// an authorized trustline for an accepted issued asset. A pool without one
+// cannot receive that asset at all; a recovery account without one leaves such
+// deposits waiting in pending_retry whenever they need sweeping. It returns the
+// problems found rather than failing: on testnet a reset account is expected,
+// and refusing to start would stop every other deposit too.
+func (f *Forwarder) CheckTrustlines() []string {
+	accounts := []string{f.config.RecoveryAddress}
+	for _, p := range f.config.PoolAccounts {
+		accounts = append(accounts, p.Address)
+	}
+	var problems []string
+	for _, a := range f.config.AcceptedAssets {
+		asset, err := parseAsset(a)
+		if err != nil || asset.IsNative() {
+			continue
+		}
+		for _, acct := range accounts {
+			if acct == "" {
+				continue
+			}
+			if err := f.checkTrustline(acct, asset); err != nil {
+				problems = append(problems, fmt.Sprintf("%s: %v", acct, err))
+			}
+		}
+	}
+	return problems
 }
 
 // keypairFor finds the signing keypair for a given pool address.

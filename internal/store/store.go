@@ -17,6 +17,9 @@ const (
 	StatusDone         = "done"
 	StatusFailed       = "failed"
 	StatusPendingRetry = "pending_retry"
+	// StatusSwept: the deposit could not be credited and its recovery payment
+	// landed; forward_tx holds that payment's hash.
+	StatusSwept = "swept"
 )
 
 // Status values for the intents table.
@@ -60,6 +63,17 @@ type Forward struct {
 	// PoolAddress is the pool account that received the inbound payment; "" for
 	// rows recorded before it was tracked.
 	PoolAddress string
+	// SubmittedTx is the outbound transaction put on the network but not yet
+	// seen to settle, and SubmittedUntil the time after which it can no longer
+	// land. Both are nil when no transfer is in flight.
+	SubmittedTx    *string
+	SubmittedUntil *time.Time
+	// Sweep is set once the deposit is to be returned to the recovery account
+	// instead of credited, so a retry sweeps it rather than deciding again.
+	Sweep bool
+	// LandedAt is when the inbound payment closed on-chain; nil on rows
+	// recorded before it was tracked.
+	LandedAt *time.Time
 }
 
 // Store wraps a pgxpool and exposes all database operations the relayer needs.
@@ -166,11 +180,13 @@ func (s *Store) SetIntentExternalID(ctx context.Context, memoID uint64, external
 	return ErrExternalIDConflict
 }
 
-// CompleteIntent marks a pending intent as completed (deposit forwarded successfully).
+// CompleteIntent marks an intent completed once its deposit is forwarded. An
+// intent already flipped to 'expired' by the retry worker's wall clock is
+// completed too: its deposit landed inside the window and was credited.
 func (s *Store) CompleteIntent(ctx context.Context, memoID uint64) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE intents SET status = $1, updated_at = NOW()
-		WHERE memo_id = $2 AND status = 'pending'
+		WHERE memo_id = $2 AND status IN ('pending', 'expired')
 	`, IntentCompleted, int64(memoID))
 	if err != nil {
 		return fmt.Errorf("complete intent: %w", err)
@@ -211,12 +227,15 @@ func (s *Store) ExpireStaleIntents(ctx context.Context) (int64, error) {
 // for txHash. Callers must stop on false: ON CONFLICT DO NOTHING makes the
 // insert idempotent, but it does not make the outbound transfer idempotent, and
 // the same deposit reaching submit() twice pays the C-address twice.
-func (s *Store) InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string) (bool, error) {
+//
+// landedAt is when the payment closed on-chain; a retry re-checks the intent's
+// expiry against it.
+func (s *Store) InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string, landedAt time.Time) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO forwards (tx_hash, memo_id, pool_address, from_address, amount, asset)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO forwards (tx_hash, memo_id, pool_address, from_address, amount, asset, landed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (tx_hash) DO NOTHING
-	`, txHash, int64(memoID), poolAddress, fromAddress, amount, asset)
+	`, txHash, int64(memoID), poolAddress, fromAddress, amount, asset, landedAt)
 	if err != nil {
 		return false, fmt.Errorf("insert forward: %w", err)
 	}
@@ -227,11 +246,76 @@ func (s *Store) InsertForward(ctx context.Context, txHash string, memoID uint64,
 func (s *Store) MarkForwardDone(ctx context.Context, txHash, forwardTx string) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE forwards
-		SET status = $1, forward_tx = $2, updated_at = NOW()
+		SET status = $1, forward_tx = $2,
+		    submitted_tx = NULL, submitted_until = NULL, updated_at = NOW()
 		WHERE tx_hash = $3
 	`, StatusDone, forwardTx, txHash)
 	if err != nil {
 		return fmt.Errorf("mark forward done: %w", err)
+	}
+	return nil
+}
+
+// MarkSweep records that this deposit is to be returned to the recovery
+// account rather than credited, and why. Written before the sweep is attempted,
+// so a retry after a crash sweeps it instead of deciding again.
+func (s *Store) MarkSweep(ctx context.Context, txHash, reason string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE forwards SET sweep = TRUE, sweep_reason = $1, error = $1, updated_at = NOW()
+		WHERE tx_hash = $2
+	`, reason, txHash)
+	if err != nil {
+		return fmt.Errorf("mark sweep: %w", err)
+	}
+	return nil
+}
+
+// MarkSwept records a recovery payment that landed. Only called once the
+// network confirms it: a sweep that failed must never read as swept. The
+// error column keeps why it was swept, from sweep_reason, which retries do
+// not overwrite.
+func (s *Store) MarkSwept(ctx context.Context, txHash, sweepTx string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE forwards
+		SET status = $1, forward_tx = $2,
+		    error = 'swept to recovery: ' || COALESCE(sweep_reason, 'reason not recorded'),
+		    submitted_tx = NULL, submitted_until = NULL, updated_at = NOW()
+		WHERE tx_hash = $3
+	`, StatusSwept, sweepTx, txHash)
+	if err != nil {
+		return fmt.Errorf("mark swept: %w", err)
+	}
+	return nil
+}
+
+// RecordSubmission notes the outbound transaction about to be sent for a
+// forward, and the time after which it can no longer land. It must be written
+// before the transaction is sent: from then on the transfer may be in flight,
+// and anything that retries this forward has to resolve this hash rather than
+// build a second transfer.
+func (s *Store) RecordSubmission(ctx context.Context, txHash, submittedTx string, until time.Time) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE forwards
+		SET submitted_tx = $1, submitted_until = $2, updated_at = NOW()
+		WHERE tx_hash = $3
+	`, submittedTx, until, txHash)
+	if err != nil {
+		return fmt.Errorf("record submission: %w", err)
+	}
+	return nil
+}
+
+// ClearSubmission forgets a forward's in-flight transaction once it is known it
+// will never transfer anything — rejected before entering the queue, failed
+// on-chain, or expired without landing — so the forward may be built again.
+func (s *Store) ClearSubmission(ctx context.Context, txHash string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE forwards
+		SET submitted_tx = NULL, submitted_until = NULL, updated_at = NOW()
+		WHERE tx_hash = $1
+	`, txHash)
+	if err != nil {
+		return fmt.Errorf("clear submission: %w", err)
 	}
 	return nil
 }
@@ -287,7 +371,7 @@ func (s *Store) GetForwardByMemoID(ctx context.Context, memoID uint64) ([]Forwar
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, tx_hash, memo_id, from_address, amount, asset,
 		       forward_tx, status, retries, error, created_at, updated_at,
-		       COALESCE(pool_address, '')
+		       COALESCE(pool_address, ''), submitted_tx, submitted_until, sweep, landed_at
 		FROM forwards WHERE memo_id = $1
 		ORDER BY created_at DESC
 	`, int64(memoID))
@@ -307,7 +391,7 @@ func (s *Store) GetPendingRetries(ctx context.Context) ([]Forward, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, tx_hash, memo_id, from_address, amount, asset,
 		       forward_tx, status, retries, error, created_at, updated_at,
-		       COALESCE(pool_address, '')
+		       COALESCE(pool_address, ''), submitted_tx, submitted_until, sweep, landed_at
 		FROM forwards
 		WHERE status = 'pending_retry'
 		   OR (status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes')
@@ -369,6 +453,7 @@ func scanForwards(rows pgx.Rows) ([]Forward, error) {
 			&f.ID, &f.TxHash, &rawID, &f.FromAddress, &f.Amount, &f.Asset,
 			&f.ForwardTx, &f.Status, &f.Retries, &f.Error,
 			&f.CreatedAt, &f.UpdatedAt, &f.PoolAddress,
+			&f.SubmittedTx, &f.SubmittedUntil, &f.Sweep, &f.LandedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan forward: %w", err)
 		}

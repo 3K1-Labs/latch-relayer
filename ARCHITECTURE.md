@@ -26,6 +26,13 @@ pending → completed   (deposit arrived and was forwarded successfully)
 ```
 Intents expire via `ExpireStaleIntents`, called by the retry worker on every tick (every 30s).
 
+Whether a deposit is in time is judged by **when it landed on-chain**, not when the relayer processes it, and not by the intent's status:
+- A payment made inside the window is credited even if it is processed late, for example when the stream replays after a restart or a pool is backlogged.
+- In that case an intent already flipped to `expired` becomes `completed`.
+- A payment that lands after `expires_at` is swept to recovery.
+
+**TTL: 1 hour by default, on purpose for launch.** Callers set `expires_in` (seconds) per flow. One hour may be too short for exchange withdrawals, which can be held for review for hours, and for some on-ramps. Revisit the default once real settlement times per integrated provider are known. A longer TTL is safe because memo_ids are random and unguessable.
+
 ### Database Model
 Three tables:
 
@@ -85,7 +92,7 @@ Implementation: `txnbuild.NewPaymentToContract` builds an `InvokeHostFunction` o
 1. Build tx with placeholder fee
 2. `SimulateTransaction` via Stellar RPC → get real footprint + `MinResourceFee`
 3. Apply simulation result to XDR (`SorobanData` ext + updated fee)
-4. Re-parse, sign, submit via Horizon
+4. Re-parse, sign, record the hash on the forward row, submit via Stellar RPC `sendTransaction`, then poll `getTransaction` (see Idempotency)
 
 **Soroban transactions do not support memos** — the outbound forwarding tx carries no memo. Traceability is via the `forwards` table (`tx_hash` → `forward_tx`).
 
@@ -100,10 +107,19 @@ Not needed. The relay controls the pooled G-address and is both the signer and f
 - wallet-backend is NOT used for the deposit hot path
 
 ### Multiple Pooled Addresses
-Config supports `POOL_ADDRESS_N` / `POOL_PRIVATE_KEY_N` for N pool accounts. One watcher goroutine per pool. Currently intent creation always picks `PoolAccounts[0]` — round-robin or least-loaded assignment is a future improvement.
+Config supports `POOL_ADDRESS_N` / `POOL_PRIVATE_KEY_N` for N pool accounts. One watcher goroutine per pool. Intent creation round-robins across the pools (`internal/handler/handler.go`). Each pool account still lands at most one transaction per ledger (Stellar Core holds one pending transaction per source account), so scaling throughput with channel accounts rather than more pool keys is tracked in #48.
 
 ### Idempotency
 Incoming deposit `tx_hash` is unique on Stellar. `INSERT ... ON CONFLICT (tx_hash) DO NOTHING` ensures replaying the same SSE event is safe.
+
+The outbound transfer is guarded separately. The signed transaction's hash and max time are written to `forwards.submitted_tx` and `submitted_until` **before** it is sent.
+
+After that point, an unknown outcome is never retried by building a new transfer. That covers a send error, a poll timeout and a crash. The retry worker looks the recorded hash up first:
+- `SUCCESS` marks the forward done.
+- `FAILED` closes the forward if the cause is permanent, otherwise rebuilds it.
+- `NOT_FOUND` waits until RPC has ingested a ledger past the max time, then rebuilds. If RPC's history no longer covers the submission, the forward is failed for manual reconciliation instead.
+
+Forwards are valid for 2 minutes, so an unresolved one is settled within a few minutes. See #50.
 
 ### Retry Strategy
 ```
@@ -119,6 +135,19 @@ SSE stream → dispatch goroutine (non-blocking)
             failure: mark forward failed + intent failed
 ```
 
+### Accepted Assets
+XLM and Circle's USDC only, by default for the configured network (`ACCEPTED_ASSETS` overrides). A deposit in any other asset is swept to recovery with reason `unsupported asset …`. The pools and the recovery account need an authorized trustline for each accepted issued asset. The relayer logs any that are missing at startup.
+
+### What Counts as a Deposit
+- `payment`, `path_payment_strict_receive` and `path_payment_strict_send` into a pool. For path payments the credited amount and asset are the destination side: what the pool actually received.
+- Anything else that credits a pool (an `account_merge` into it, or a Soroban transfer to it) cannot be attributed. It is logged as an error and counted in `relayer_unhandled_credits_total{kind}`, never skipped silently.
+- Deposits are keyed by transaction hash. A transaction with several operations keys each payment `hash:position`, so a batched transaction paying the pool more than once credits every payment.
+
+### Routing Tag: Muxed Address or Memo
+A payment to a muxed address `M…(pool, id)` is routed by its muxed id, which is the protocol-native form of "address + memo". Intents are still issued as pool G-address + memo, because many exchanges reject M-addresses.
+- If both a muxed id and a numeric memo are present and they disagree, the deposit is swept rather than guessed.
+- A non-numeric memo alongside a muxed id (an exchange's own reference) is ignored.
+
 ### Accepted Memo Types
 `memo.ParseID` accepts **both `MEMO_ID` and `MEMO_TEXT`**, provided the value parses as a `uint64`.
 
@@ -133,7 +162,14 @@ Verified: Horizon renders a text memo as the raw UTF-8 string in `memo` (the bas
 - `id`/`text` memo whose value is not a `uint64` → sweep to recovery (`ErrInvalidMemoID`)
 - Unknown `memo_id` (not in intents table) → sweep to recovery
 - Expired intent → sweep to recovery
-- All cases logged in `forwards` table with status `failed`
+- A failed intent lookup (database error) is **not** treated as an unknown memo; the forward is retried instead of swept.
+
+How a sweep is recorded (#32):
+- The decision is persisted first (`forwards.sweep = true`), so a retry after a crash finishes the sweep instead of deciding again.
+- The recovery payment goes through the same pipeline as a forward: the pool's sequencer and send lock, recorded before sending, sent via Stellar RPC and resolved by hash. Its memo is the inbound transaction hash (`MEMO_HASH`), so the recovery account can be reconciled against deposits.
+- Status becomes `swept`, with `forward_tx` set to the sweep's hash, **only once the payment has landed**.
+- For issued assets, the recovery account's trustline is checked first. Without an authorized trustline nothing is sent (so no fee is burned); the sweep waits in `pending_retry` and goes through on the first tick after the trustline is added.
+- Transient failures retry through the retry worker. Permanent ones fail with `not swept, funds remain in pool: …`, never with a message claiming the funds were swept.
 
 ### Architecture Split
 - **Relayer** owns the deposit hot path: Horizon SSE → memo parse → intent lookup → forward

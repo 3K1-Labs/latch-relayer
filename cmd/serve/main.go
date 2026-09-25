@@ -39,6 +39,7 @@ func main() {
 		"port", cfg.Port,
 		"db_max_conns", cfg.DBMaxConns,
 		"max_inflight", cfg.MaxInflight,
+		"accepted_assets", cfg.AcceptedAssets,
 	)
 
 	// ── 2. Contexts ───────────────────────────────────────────────────────────
@@ -77,6 +78,9 @@ func main() {
 	rpc := rpcclient.NewClient(cfg.RPCURL, rpcHTTP)
 	defer rpc.Close()
 	fwd := forwarder.New(st, cfg, hz, rpc)
+	for _, p := range fwd.CheckTrustlines() {
+		slog.Error("trustline missing for an accepted asset", "detail", p)
+	}
 
 	// Horizon's SSE stream is long-lived and idles between payments, so it can't
 	// share horizonHTTP's 10s Timeout — that applies to the whole request,

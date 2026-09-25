@@ -1,0 +1,21 @@
+[submodule "reference/near-intents"]
+	path = reference/near-intents
+	url = https://github.com/near/intents.git
+[submodule "reference/near-intents-sdk"]
+	path = reference/near-intents-sdk
+	url = https://github.com/defuse-protocol/sdk-monorepo.git
+[submodule "reference/near-one-click-sdk-go"]
+	path = reference/near-one-click-sdk-go
+	url = https://github.com/defuse-protocol/one-click-sdk-go.git
+[submodule "reference/near-intents-amm-solver"]
+	path = reference/near-intents-amm-solver
+	url = https://github.com/defuse-protocol/near-intents-amm-solver.git
+[submodule "reference/near-intents-examples"]
+	path = reference/near-intents-examples
+	url = https://github.com/near-examples/near-intents-examples.git
+[submodule "reference/hot-omni-sdk"]
+	path = reference/hot-omni-sdk
+	url = https://github.com/hot-dao/omni-sdk.git
+[submodule "reference/openzeppelin-relayer"]
+	path = reference/openzeppelin-relayer
+	url = https://github.com/OpenZeppelin/openzeppelin-relayer.git

@@ -4,10 +4,19 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/stellar/go-stellar-sdk/keypair"
+	"github.com/stellar/go-stellar-sdk/network"
+	"github.com/stellar/go-stellar-sdk/strkey"
+)
+
+// Circle's USDC issuers. Accepted by default on the matching network.
+const (
+	USDCIssuerMainnet = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+	USDCIssuerTestnet = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
 )
 
 // PoolAccount holds a single pooled G-address and its loaded signing keypair.
@@ -27,6 +36,12 @@ type Config struct {
 	// Pool accounts — one SSE watcher goroutine per account
 	PoolAccounts    []PoolAccount
 	RecoveryAddress string
+
+	// AcceptedAssets are the assets deposits may be credited in, as the
+	// watcher writes them: "native" or "CODE:ISSUER". A deposit in anything
+	// else is swept to recovery instead of forwarded. Defaults to XLM and
+	// Circle's USDC for the configured network (ACCEPTED_ASSETS overrides).
+	AcceptedAssets []string
 
 	// RetryInterval is how often the background worker sweeps forwards that are
 	// waiting for another attempt. It bounds how long a deposit that lost the
@@ -56,6 +71,9 @@ func Load() (*Config, error) {
 		return nil, errors.New("RECOVERY_ADDRESS is required")
 	}
 	if cfg.RetryInterval, err = envSeconds("RETRY_INTERVAL_SEC", 10); err != nil {
+		return nil, err
+	}
+	if cfg.AcceptedAssets, err = acceptedAssets(os.Getenv("ACCEPTED_ASSETS"), cfg.NetworkPassphrase); err != nil {
 		return nil, err
 	}
 
@@ -88,4 +106,31 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// acceptedAssets parses ACCEPTED_ASSETS, a comma-separated list of "native" and
+// "CODE:ISSUER" entries. Empty means XLM plus Circle's USDC on the configured
+// network.
+func acceptedAssets(raw, passphrase string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		issuer := USDCIssuerTestnet
+		if passphrase == network.PublicNetworkPassphrase {
+			issuer = USDCIssuerMainnet
+		}
+		return []string{"native", "USDC:" + issuer}, nil
+	}
+	var out []string
+	for _, a := range strings.Split(raw, ",") {
+		a = strings.TrimSpace(a)
+		if a == "native" {
+			out = append(out, a)
+			continue
+		}
+		code, issuer, ok := strings.Cut(a, ":")
+		if !ok || code == "" || len(code) > 12 || !strkey.IsValidEd25519PublicKey(issuer) {
+			return nil, fmt.Errorf("ACCEPTED_ASSETS: %q is not \"native\" or CODE:ISSUER", a)
+		}
+		out = append(out, a)
+	}
+	return out, nil
 }
