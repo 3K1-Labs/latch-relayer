@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,10 +37,28 @@ var (
 type Pool struct {
 	db       *pgxpool.Pool
 	instance string
+	table    string
 }
 
+// DefaultTable is the gasless service's channel table.
+const DefaultTable = "channel_accounts"
+
 func NewPool(db *pgxpool.Pool, instance string) *Pool {
-	return &Pool{db: db, instance: instance}
+	return NewPoolForTable(db, instance, DefaultTable)
+}
+
+// NewPoolForTable leases channels from table, which must have the
+// channel_accounts schema. The deposit bridge keeps its own channels in their
+// own table (deposit_channel_accounts), derived from a separate seed, so the
+// two services never lease each other's accounts even on a shared database.
+func NewPoolForTable(db *pgxpool.Pool, instance, table string) *Pool {
+	return &Pool{db: db, instance: instance, table: table}
+}
+
+// q points a query written against channel_accounts at this pool's table.
+// table is set by code, never from input.
+func (p *Pool) q(sql string) string {
+	return strings.ReplaceAll(sql, DefaultTable, p.table)
 }
 
 // Lease is exclusive use of one channel until Release or expiry.
@@ -61,7 +80,7 @@ type Lease struct {
 func (p *Pool) Sync(ctx context.Context, chans []keys.Channel) error {
 	return pgx.BeginFunc(ctx, p.db, func(tx pgx.Tx) error {
 		for _, ch := range chans {
-			if _, err := tx.Exec(ctx, `
+			if _, err := tx.Exec(ctx, p.q(`
 				INSERT INTO channel_accounts (hd_index, address) VALUES ($1, $2)
 				ON CONFLICT (hd_index) DO UPDATE SET
 					address         = EXCLUDED.address,
@@ -74,14 +93,14 @@ func (p *Pool) Sync(ctx context.Context, chans []keys.Channel) error {
 					                       THEN NULL ELSE channel_accounts.seq END,
 					needs_resync    = channel_accounts.needs_resync
 					                  OR channel_accounts.address <> EXCLUDED.address,
-					updated_at      = NOW()`,
+					updated_at      = NOW()`),
 				ch.Index, ch.Address()); err != nil {
 				return fmt.Errorf("sync channel %d: %w", ch.Index, err)
 			}
 		}
-		if _, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, p.q(`
 			UPDATE channel_accounts SET status = 'retired', updated_at = NOW()
-			WHERE hd_index >= $1 AND status <> 'retired'`, len(chans)); err != nil {
+			WHERE hd_index >= $1 AND status <> 'retired'`), len(chans)); err != nil {
 			return fmt.Errorf("retire channels: %w", err)
 		}
 		return nil
@@ -98,7 +117,7 @@ func (p *Pool) Acquire(ctx context.Context, ttl time.Duration) (*Lease, error) {
 	}
 	l := &Lease{Token: token}
 	var seq *int64
-	err = p.db.QueryRow(ctx, `
+	err = p.db.QueryRow(ctx, p.q(`
 		WITH pick AS (
 			SELECT id, lease_expires_at AS prev_expiry
 			FROM channel_accounts
@@ -117,7 +136,7 @@ func (p *Pool) Acquire(ctx context.Context, ttl time.Duration) (*Lease, error) {
 			updated_at       = NOW()
 		FROM pick
 		WHERE c.id = pick.id
-		RETURNING c.id, c.hd_index, c.address, c.seq, c.needs_resync`,
+		RETURNING c.id, c.hd_index, c.address, c.seq, c.needs_resync`),
 		token, p.instance, ttl.Seconds(),
 	).Scan(&l.ChannelID, &l.Index, &l.Address, &seq, &l.NeedsResync)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -156,11 +175,11 @@ func (p *Pool) AcquireWait(ctx context.Context, ttl, wait time.Duration) (*Lease
 // sequence number the finished transaction consumed; resync forces the next
 // holder to reload it from the network (outcome unknown, or tx never landed).
 func (p *Pool) Release(ctx context.Context, l *Lease, seq *int64, resync bool) error {
-	tag, err := p.db.Exec(ctx, `
+	tag, err := p.db.Exec(ctx, p.q(`
 		UPDATE channel_accounts SET
 			lease_token = NULL, leased_by = NULL, lease_expires_at = NULL,
 			seq = COALESCE($3, seq), needs_resync = $4, updated_at = NOW()
-		WHERE id = $1 AND lease_token = $2`,
+		WHERE id = $1 AND lease_token = $2`),
 		l.ChannelID, l.Token, seq, resync)
 	if err != nil {
 		return fmt.Errorf("release channel %d: %w", l.Index, err)
@@ -175,7 +194,7 @@ func (p *Pool) Release(ctx context.Context, l *Lease, seq *int64, resync bool) e
 // disabled with reason when missing on-chain (balance < 0) or under min,
 // re-activated once healthy. Retired channels are left alone.
 func (p *Pool) RecordBalance(ctx context.Context, index int, balanceStroops, minStroops int64) error {
-	_, err := p.db.Exec(ctx, `
+	_, err := p.db.Exec(ctx, p.q(`
 		UPDATE channel_accounts SET
 			balance_stroops    = CASE WHEN $2 < 0 THEN NULL ELSE $2 END,
 			balance_checked_at = NOW(),
@@ -189,7 +208,7 @@ func (p *Pool) RecordBalance(ctx context.Context, index int, balanceStroops, min
 				WHEN $2 < $3 THEN 'balance below CHANNEL_MIN_XLM'
 				ELSE NULL END,
 			updated_at = NOW()
-		WHERE hd_index = $1`, index, balanceStroops, minStroops)
+		WHERE hd_index = $1`), index, balanceStroops, minStroops)
 	if err != nil {
 		return fmt.Errorf("record channel %d balance: %w", index, err)
 	}
@@ -206,13 +225,13 @@ type Stats struct {
 
 func (p *Pool) Stats(ctx context.Context) (Stats, error) {
 	var s Stats
-	err := p.db.QueryRow(ctx, `
+	err := p.db.QueryRow(ctx, p.q(`
 		SELECT
 			count(*) FILTER (WHERE status = 'active'),
 			count(*) FILTER (WHERE status = 'active' AND lease_token IS NOT NULL AND lease_expires_at >= NOW()),
 			count(*) FILTER (WHERE status = 'disabled'),
 			count(*) FILTER (WHERE status = 'retired')
-		FROM channel_accounts`).Scan(&s.Active, &s.Leased, &s.Disabled, &s.Retired)
+		FROM channel_accounts`)).Scan(&s.Active, &s.Leased, &s.Disabled, &s.Retired)
 	if err != nil {
 		return s, fmt.Errorf("channel stats: %w", err)
 	}

@@ -1,13 +1,18 @@
-// Command channels creates (or retires) the gasless service's channel
-// accounts on-chain. Channels are derived from CHANNEL_SEED, so this only
-// needs the funder key and the seed; it's safe to re-run — existing channels
-// are skipped — which is also how you recover after a testnet reset.
+// Command channels creates (or retires) channel accounts on-chain. Channels
+// are derived from a seed, so this only needs a funding key and the seed; it's
+// safe to re-run — existing channels are skipped — which is also how you
+// recover after a testnet reset.
 //
 //	go run ./scripts/channels -n 10                 # ensure channels 0..9 exist
 //	go run ./scripts/channels -n 10 -merge-to 25    # also merge channels 10..24 back into the funder
+//	go run ./scripts/channels -deposit              # the deposit bridge's channels (make deposit-channels)
 //
-// Reads gasless.env (or the environment): NETWORK, RPC_URL, FUNDER_ADDRESS,
-// FUNDER_PRIVATE_KEY, CHANNEL_SEED, CHANNEL_COUNT.
+// By default it serves the gasless service and reads gasless.env (or the
+// environment): NETWORK, RPC_URL, FUNDER_ADDRESS, FUNDER_PRIVATE_KEY,
+// CHANNEL_SEED, CHANNEL_COUNT. With -deposit it reads .env instead and uses
+// DEPOSIT_CHANNEL_SEED and DEPOSIT_CHANNEL_COUNT, funded by pool 1
+// (POOL_ADDRESS_1 / POOL_PRIVATE_KEY_1). Deposit channels only need their
+// base reserve: the pool pays every fee by fee-bump.
 package main
 
 import (
@@ -42,9 +47,21 @@ const (
 )
 
 func main() {
-	godotenv.Load(config.GaslessEnvFile)
+	deposit := flag.Bool("deposit", false, "manage the deposit bridge's channels (.env, DEPOSIT_CHANNEL_*, funded by pool 1)")
+	for _, a := range os.Args[1:] {
+		if a == "-deposit" || a == "--deposit" || a == "-deposit=true" || a == "--deposit=true" {
+			*deposit = true
+		}
+	}
+	envFile, seedVar, countVar := config.GaslessEnvFile, "CHANNEL_SEED", "CHANNEL_COUNT"
+	funderKeyVar, funderAddrVar := "FUNDER_PRIVATE_KEY", "FUNDER_ADDRESS"
+	if *deposit {
+		envFile, seedVar, countVar = ".env", "DEPOSIT_CHANNEL_SEED", "DEPOSIT_CHANNEL_COUNT"
+		funderKeyVar, funderAddrVar = "POOL_PRIVATE_KEY_1", "POOL_ADDRESS_1"
+	}
+	godotenv.Load(envFile)
 
-	n := flag.Int("n", envInt("CHANNEL_COUNT"), "number of channels that should exist (indexes 0..n-1)")
+	n := flag.Int("n", envInt(countVar), "number of channels that should exist (indexes 0..n-1)")
 	startXLM := flag.String("start-xlm", "1.5", "starting balance for each new channel (base reserve is 1 XLM)")
 	mergeTo := flag.Int("merge-to", 0, "also merge channels n..merge-to-1 back into the funder")
 	dryRun := flag.Bool("dry-run", false, "show what would change without submitting")
@@ -61,10 +78,10 @@ func main() {
 	if rpcURL == "" {
 		rpcURL = "https://soroban-testnet.stellar.org"
 	}
-	funder := mustKeypair("FUNDER")
-	seed, err := hex.DecodeString(os.Getenv("CHANNEL_SEED"))
+	funder := mustKeypair(funderKeyVar, funderAddrVar)
+	seed, err := hex.DecodeString(os.Getenv(seedVar))
 	if err != nil || len(seed) < keys.MinSeedBytes {
-		log.Fatal("CHANNEL_SEED must be hex, at least 16 bytes")
+		log.Fatalf("%s must be hex, at least 16 bytes", seedVar)
 	}
 	if _, err := amount.ParseInt64(*startXLM); err != nil {
 		log.Fatalf("-start-xlm: %v", err)
@@ -181,13 +198,13 @@ func submit(ctx context.Context, rpc *rpcclient.Client, passphrase string, funde
 	return nil
 }
 
-func mustKeypair(prefix string) *keypair.Full {
-	kp, err := keypair.ParseFull(os.Getenv(prefix + "_PRIVATE_KEY"))
+func mustKeypair(keyVar, addrVar string) *keypair.Full {
+	kp, err := keypair.ParseFull(os.Getenv(keyVar))
 	if err != nil {
-		log.Fatalf("%s_PRIVATE_KEY: %v", prefix, err)
+		log.Fatalf("%s: %v", keyVar, err)
 	}
-	if addr := os.Getenv(prefix + "_ADDRESS"); addr != "" && addr != kp.Address() {
-		log.Fatal(errors.New(prefix + "_ADDRESS does not match " + prefix + "_PRIVATE_KEY"))
+	if addr := os.Getenv(addrVar); addr != "" && addr != kp.Address() {
+		log.Fatal(errors.New(addrVar + " does not match " + keyVar))
 	}
 	return kp
 }

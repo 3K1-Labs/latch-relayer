@@ -10,11 +10,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+	sdkamount "github.com/stellar/go-stellar-sdk/amount"
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 
 	"github.com/latch/relayer/internal/config"
 	"github.com/latch/relayer/internal/db"
+	"github.com/latch/relayer/internal/gasless/channels"
 	"github.com/latch/relayer/internal/handler"
 	"github.com/latch/relayer/internal/httpx"
 	"github.com/latch/relayer/internal/lifecycle"
@@ -39,6 +42,7 @@ func main() {
 		"port", cfg.Port,
 		"db_max_conns", cfg.DBMaxConns,
 		"max_inflight", cfg.MaxInflight,
+		"deposit_channels", len(cfg.Channels),
 		"accepted_assets", cfg.AcceptedAssets,
 	)
 
@@ -80,6 +84,9 @@ func main() {
 	fwd := forwarder.New(st, cfg, hz, rpc)
 	for _, p := range fwd.CheckTrustlines() {
 		slog.Error("trustline missing for an accepted asset", "detail", p)
+	}
+	if len(cfg.Channels) > 0 {
+		enableChannels(ctx, pool, cfg, hz, fwd)
 	}
 
 	// Horizon's SSE stream is long-lived and idles between payments, so it can't
@@ -180,4 +187,51 @@ func main() {
 	}
 
 	slog.Info("shutdown complete")
+}
+
+// enableChannels puts the deposit channel accounts (#48) in rotation and hands
+// them to the forwarder. A channel missing on-chain is taken out of rotation
+// (create it with `make deposit-channels`); if none exists the relayer keeps
+// the pool as transaction source rather than stalling every transfer.
+func enableChannels(ctx context.Context, db *pgxpool.Pool, cfg *config.Config, hz *horizonclient.Client, fwd *forwarder.Forwarder) {
+	chanPool := channels.NewPoolForTable(db, cfg.InstanceID, "deposit_channel_accounts")
+	if err := chanPool.Sync(ctx, cfg.Channels); err != nil {
+		slog.Error("deposit channels: sync, keeping the pool as transaction source", "err", err)
+		return
+	}
+	live := 0
+	for _, ch := range cfg.Channels {
+		balance := int64(-1) // missing on-chain: out of rotation
+		acct, err := hz.AccountDetail(horizonclient.AccountRequest{AccountID: ch.Address()})
+		switch {
+		case err == nil:
+			if native, err := acct.GetNativeBalance(); err == nil {
+				if b, err := sdkamount.ParseInt64(native); err == nil {
+					balance = b
+				}
+			}
+		case horizonclient.IsNotFoundError(err):
+			slog.Error("deposit channel not on-chain, out of rotation", "index", ch.Index, "address", ch.Address(), "err", err)
+		default:
+			// Horizon unreachable or erroring says nothing about the channel:
+			// leave its status as it was rather than take it out of rotation
+			// over a network blip.
+			slog.Warn("deposit channel: could not check on-chain, status unchanged", "index", ch.Index, "address", ch.Address(), "err", err)
+			live++
+			continue
+		}
+		if err := chanPool.RecordBalance(ctx, ch.Index, balance, 0); err != nil {
+			slog.Error("deposit channels: record balance", "index", ch.Index, "err", err)
+			continue
+		}
+		if balance >= 0 {
+			live++
+		}
+	}
+	if live == 0 {
+		slog.Error("deposit channels: none exist on-chain, keeping the pool as transaction source (run make deposit-channels)")
+		return
+	}
+	fwd.UseChannels(chanPool, cfg.Channels)
+	slog.Info("deposit channels enabled", "configured", len(cfg.Channels), "live", live)
 }

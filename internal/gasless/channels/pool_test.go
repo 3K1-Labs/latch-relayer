@@ -189,3 +189,51 @@ func TestAcquireWaitGetsChannelFreedMidWait(t *testing.T) {
 		t.Fatalf("AcquireWait on a busy pool: %v, want ErrPoolCapacity", err)
 	}
 }
+
+// The deposit bridge keeps its channels in its own table, from the deposit
+// migrations alone: nothing may touch the gasless service's channel_accounts.
+func TestPoolForTableUsesOnlyThatTable(t *testing.T) {
+	ctx := context.Background()
+	db := testdb.New(t)
+	if err := migrations.Run(ctx, db, migrations.Deposit); err != nil {
+		t.Fatal(err)
+	}
+	seed, _ := hex.DecodeString("0f0e0d0c0b0a09080706050403020100")
+	chans, err := keys.DeriveChannels(seed, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewPoolForTable(db, "deposit", "deposit_channel_accounts")
+	if err := p.Sync(ctx, chans); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RecordBalance(ctx, 1, -1, 0); err != nil { // channel 1 not on-chain
+		t.Fatal(err)
+	}
+	l, err := p.Acquire(ctx, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Address != chans[0].Address() {
+		t.Fatalf("leased %s, want the only live channel %s", l.Address, chans[0].Address())
+	}
+	if _, err := p.Acquire(ctx, time.Minute); !errors.Is(err, ErrPoolCapacity) {
+		t.Fatalf("second acquire: %v, want ErrPoolCapacity", err)
+	}
+	seq := int64(99)
+	if err := p.Release(ctx, l, &seq, false); err != nil {
+		t.Fatal(err)
+	}
+	if l, err = p.Acquire(ctx, time.Minute); err != nil || l.Seq != 99 || l.NeedsResync {
+		t.Fatalf("after release: %+v, %v", l, err)
+	}
+
+	var exists bool
+	if err := db.QueryRow(ctx, `SELECT to_regclass('channel_accounts') IS NOT NULL`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("deposit migrations created the gasless channel_accounts table")
+	}
+}
