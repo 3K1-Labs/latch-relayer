@@ -128,6 +128,19 @@ SSE stream → dispatch goroutine (non-blocking)
             failure: mark forward failed + intent failed
 ```
 
+### Accepted Assets
+XLM and Circle's USDC only, by default for the configured network (`ACCEPTED_ASSETS` overrides). A deposit in any other asset is swept to recovery with reason `unsupported asset …`. The pools and the recovery account need an authorized trustline for each accepted issued asset. The relayer logs any that are missing at startup.
+
+### What Counts as a Deposit
+- `payment`, `path_payment_strict_receive` and `path_payment_strict_send` into a pool. For path payments the credited amount and asset are the destination side: what the pool actually received.
+- Anything else that credits a pool (an `account_merge` into it, or a Soroban transfer to it) cannot be attributed. It is logged as an error and counted in `relayer_unhandled_credits_total{kind}`, never skipped silently.
+- Deposits are keyed by transaction hash. A transaction with several operations keys each payment `hash:position`, so a batched transaction paying the pool more than once credits every payment.
+
+### Routing Tag: Muxed Address or Memo
+A payment to a muxed address `M…(pool, id)` is routed by its muxed id, which is the protocol-native form of "address + memo". Intents are still issued as pool G-address + memo, because many exchanges reject M-addresses.
+- If both a muxed id and a numeric memo are present and they disagree, the deposit is swept rather than guessed.
+- A non-numeric memo alongside a muxed id (an exchange's own reference) is ignored.
+
 ### Accepted Memo Types
 `memo.ParseID` accepts **both `MEMO_ID` and `MEMO_TEXT`**, provided the value parses as a `uint64`.
 

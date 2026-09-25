@@ -2,7 +2,10 @@ package watcher
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
@@ -11,6 +14,7 @@ import (
 	"github.com/latch/relayer/internal/config"
 	"github.com/latch/relayer/internal/lifecycle"
 	"github.com/latch/relayer/internal/memo"
+	"github.com/latch/relayer/internal/metrics"
 	"github.com/latch/relayer/internal/service/forwarder"
 	"github.com/latch/relayer/internal/store"
 )
@@ -162,15 +166,16 @@ func (w *Watcher) stream(ctx context.Context) error {
 
 // handle processes one payment event from the SSE stream.
 func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
-	payment, ok := op.(operations.Payment)
+	payment, ok := paymentTo(op, w.pool.Address)
 	if !ok {
-		// Not a simple payment (could be path payment, etc.) — save cursor and skip.
-		w.saveCursor(ctx, op.PagingToken())
-		return
-	}
-
-	// Only process payments arriving at our pool address.
-	if payment.To != w.pool.Address {
+		// Not a payment into this pool: our own forwards and sweeps, or an
+		// operation that moved nothing here. Anything that did credit the pool
+		// without being a payment is flagged rather than skipped silently.
+		if kind := unhandledCredit(op, w.pool.Address); kind != "" {
+			metrics.UnhandledCreditsTotal.WithLabelValues(kind).Inc()
+			slog.Error("watcher: pool credited by an operation that cannot be attributed to a deposit; funds need manual handling",
+				"pool", w.pool.Address, "kind", kind, "op_id", op.GetBase().ID, "tx_hash", op.GetBase().TransactionHash)
+		}
 		w.saveCursor(ctx, op.PagingToken())
 		return
 	}
@@ -181,27 +186,26 @@ func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
 		w.saveCursor(ctx, op.PagingToken())
 		return
 	}
-	tx := payment.Transaction
 
 	job := forwardJob{
-		txHash: payment.TransactionHash,
+		txHash: depositKey(payment.TransactionHash, payment.ID, payment.Transaction.OperationCount),
 		from:   payment.From,
 		amount: payment.Amount,
 		asset:  assetID(payment),
 	}
 
-	// Parse the memo — MEMO_ID or a numeric MEMO_TEXT.
-	memoID, err := memo.ParseID(tx.MemoType, tx.Memo)
+	memoID, err := routingID(payment)
 	if err != nil {
-		// No memo or wrong type — memo 0 matches no intent, so the forwarder
-		// sweeps it to recovery.
-		slog.Warn("watcher: invalid memo, dispatching to forwarder for sweep",
-			"tx_hash", payment.TransactionHash, "memo_type", tx.MemoType, "memo", tx.Memo)
+		// No usable tag — memo 0 matches no intent, so the forwarder sweeps it
+		// to recovery.
+		slog.Warn("watcher: no routing tag, dispatching to forwarder for sweep",
+			"deposit", job.txHash, "memo_type", payment.Transaction.MemoType,
+			"memo", payment.Transaction.Memo, "to_muxed_id", payment.ToMuxedID, "err", err)
 	} else {
 		job.memoID = memoID
 		slog.Info("watcher: dispatching forward",
-			"tx_hash", payment.TransactionHash, "memo_id", memoID,
-			"from", payment.From, "amount", payment.Amount)
+			"deposit", job.txHash, "memo_id", memoID,
+			"from", payment.From, "amount", payment.Amount, "asset", job.asset)
 	}
 
 	// Hand off to a worker so the stream is not blocked by submission latency.
@@ -210,6 +214,78 @@ func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
 		return
 	}
 	w.saveCursor(ctx, op.PagingToken())
+}
+
+// paymentTo returns op as a payment into pool. Path payments count: the
+// embedded Payment carries the destination side — the asset and amount the pool
+// actually received — so they are credited exactly like a plain payment.
+func paymentTo(op operations.Operation, pool string) (operations.Payment, bool) {
+	var p operations.Payment
+	switch o := op.(type) {
+	case operations.Payment:
+		p = o
+	case operations.PathPayment:
+		p = o.Payment
+	case operations.PathPaymentStrictSend:
+		p = o.Payment
+	default:
+		return p, false
+	}
+	return p, p.To == pool
+}
+
+// unhandledCredit names an operation that moved value into pool without being
+// a payment the relayer can attribute, or returns "" if op credited nothing.
+func unhandledCredit(op operations.Operation, pool string) string {
+	switch o := op.(type) {
+	case operations.AccountMerge:
+		if o.Into == pool {
+			return "account_merge"
+		}
+	case operations.InvokeHostFunction:
+		for _, c := range o.AssetBalanceChanges {
+			if c.To == pool && (c.Type == "transfer" || c.Type == "mint") {
+				return "contract_transfer"
+			}
+		}
+	}
+	return ""
+}
+
+var errTagConflict = errors.New("memo and muxed id name different intents")
+
+// routingID finds the memo_id a payment is tagged with. A muxed destination
+// (M-address) carries it in the address itself, which is the protocol's own
+// version of "address + memo", so it wins over a memo that is not a number —
+// an exchange may add its own text reference. A numeric memo that names a
+// different id is a contradiction; the payment is swept rather than guessed.
+func routingID(p operations.Payment) (uint64, error) {
+	tx := p.Transaction
+	fromMemo, memoErr := memo.ParseID(tx.MemoType, tx.Memo)
+	if p.ToMuxed == "" {
+		return fromMemo, memoErr
+	}
+	if memoErr == nil && fromMemo != p.ToMuxedID {
+		return 0, fmt.Errorf("%w: memo %d, muxed id %d", errTagConflict, fromMemo, p.ToMuxedID)
+	}
+	return p.ToMuxedID, nil
+}
+
+// depositKey identifies one inbound payment. For a single-operation
+// transaction — every deposit recorded so far — it is the transaction hash.
+// A transaction can pay the pool more than once, though (an exchange batching
+// withdrawals to several M-addresses), and keying on the hash alone dropped
+// every payment after the first as a replay; those keys are suffixed with the
+// operation's position, taken from the low 12 bits of Horizon's operation ID.
+func depositKey(txHash, opID string, opCount int32) string {
+	if opCount == 1 {
+		return txHash
+	}
+	id, err := strconv.ParseInt(opID, 10, 64)
+	if err != nil {
+		return txHash + ":" + opID
+	}
+	return txHash + ":" + strconv.FormatInt(id&0xFFF, 10)
 }
 
 // saveCursor persists the SSE paging token after each handled event.

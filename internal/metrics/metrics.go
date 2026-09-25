@@ -121,7 +121,7 @@ var (
 	ForwardsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "relayer_forwards_total",
-			Help: "Forward attempts by outcome (done, unknown_memo, expired, permanent_failure, swept, sweep_failed).",
+			Help: "Forward attempts by outcome (done, unknown_memo, expired, unsupported_asset, permanent_failure, swept, sweep_failed).",
 		},
 		[]string{"outcome"},
 	)
@@ -147,6 +147,18 @@ var (
 		},
 	)
 
+	// UnhandledCreditsTotal counts value that reached a pool through an
+	// operation the watcher cannot attribute to a deposit — an account merged
+	// into the pool, or a Soroban transfer to it. Any increase is money sitting
+	// in a pool with no forward and no sweep, and needs a human.
+	UnhandledCreditsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "relayer_unhandled_credits_total",
+			Help: "Credits to a pool the watcher cannot attribute to a deposit, by operation kind.",
+		},
+		[]string{"kind"},
+	)
+
 	// DepositToCreditSeconds measures the span a customer actually feels: the
 	// deposit landing in the pool through to the forward confirming on-chain.
 	// Buckets stretch to twenty minutes because the tail is the interesting part.
@@ -161,5 +173,5 @@ var (
 
 // RegisterDeposit adds the deposit metrics to the service's registry. Call once.
 func (m *Metrics) RegisterDeposit() {
-	m.Registry.MustRegister(ForwardsTotal, ContentionTotal, PendingRetryDepth, DepositToCreditSeconds)
+	m.Registry.MustRegister(ForwardsTotal, ContentionTotal, PendingRetryDepth, DepositToCreditSeconds, UnhandledCreditsTotal)
 }

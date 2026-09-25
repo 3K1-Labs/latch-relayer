@@ -201,3 +201,43 @@ func TestLoad_RetryInterval(t *testing.T) {
 		t.Fatal("expected error for a non-numeric RETRY_INTERVAL_SEC")
 	}
 }
+
+func TestLoad_AcceptedAssetsDefaultPerNetwork(t *testing.T) {
+	validEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"native", "USDC:" + USDCIssuerTestnet}
+	if len(cfg.AcceptedAssets) != 2 || cfg.AcceptedAssets[0] != want[0] || cfg.AcceptedAssets[1] != want[1] {
+		t.Fatalf("testnet default = %v, want %v", cfg.AcceptedAssets, want)
+	}
+
+	t.Setenv("NETWORK", "mainnet")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.AcceptedAssets) != 2 || cfg.AcceptedAssets[1] != "USDC:"+USDCIssuerMainnet {
+		t.Fatalf("mainnet default = %v", cfg.AcceptedAssets)
+	}
+}
+
+func TestLoad_AcceptedAssetsOverride(t *testing.T) {
+	validEnv(t)
+	t.Setenv("ACCEPTED_ASSETS", " native ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.AcceptedAssets) != 1 || cfg.AcceptedAssets[0] != "native" {
+		t.Fatalf("override = %v, want [native]", cfg.AcceptedAssets)
+	}
+
+	for _, bad := range []string{"USDC", "USDC:not-a-key", ":" + USDCIssuerMainnet} {
+		t.Setenv("ACCEPTED_ASSETS", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("ACCEPTED_ASSETS=%q accepted", bad)
+		}
+	}
+}

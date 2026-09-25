@@ -290,3 +290,66 @@ func TestSweep_MemoIsInboundHash(t *testing.T) {
 		t.Fatalf("operation = %#v, want a payment to the recovery account", tx.Operations()[0])
 	}
 }
+
+// Only accepted assets are credited; anything else goes back to recovery.
+func TestForward_UnsupportedAssetIsSwept(t *testing.T) {
+	rpc := successRPC(t, "sweep-hash")
+	f, st := forwarderWith(t, rpc)
+	f.config.AcceptedAssets = []string{"native"}
+	withTrustline(f.horizon.(*mockHorizon), f.config.RecoveryAddress, true)
+
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-usdc", 1, "GABC", "5.0000000", usdc)
+
+	if len(st.doneCalls) != 0 {
+		t.Fatalf("credited an asset that is not accepted: %v", st.doneCalls)
+	}
+	if len(st.sweepCalls) != 1 || st.sweepCalls[0][1] != "unsupported asset "+usdc {
+		t.Fatalf("sweep decision = %v", st.sweepCalls)
+	}
+	if len(st.sweptCalls) != 1 {
+		t.Fatalf("swept = %v", st.sweptCalls)
+	}
+}
+
+func TestForward_AcceptedAssetIsCredited(t *testing.T) {
+	rpc := successRPC(t, "out")
+	f, st := forwarderWith(t, rpc)
+	f.config.AcceptedAssets = []string{"native", usdc}
+
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-usdc", 1, "GABC", "5.0000000", usdc)
+
+	if len(st.doneCalls) != 1 || len(st.sweepCalls) != 0 {
+		t.Fatalf("done=%v sweep=%v, want an accepted asset credited", st.doneCalls, st.sweepCalls)
+	}
+}
+
+func TestCheckTrustlines(t *testing.T) {
+	f, _ := forwarderWith(t, successRPC(t, "x"))
+	f.config.AcceptedAssets = []string{"native", usdc}
+	hz := f.horizon.(*mockHorizon)
+	withTrustline(hz, f.config.RecoveryAddress, true)
+	pool := f.config.PoolAccounts[0].Address
+	hz.accounts[pool] = hProtocol.Account{AccountID: pool} // no USDC trustline
+
+	problems := f.CheckTrustlines()
+
+	if len(problems) != 1 || !strings.HasPrefix(problems[0], pool) || !strings.Contains(problems[0], "USDC") {
+		t.Fatalf("problems = %v, want only the pool's missing USDC trustline", problems)
+	}
+}
+
+// A payment from a batched transaction is keyed "hash:position"; its sweep
+// still carries the transaction hash as memo.
+func TestSweep_MemoFromBatchedDepositKey(t *testing.T) {
+	rpc := successRPC(t, "sweep-hash")
+	f, _, _ := sweepForwarder(t, rpc)
+	inbound := strings.Repeat("cd", 32)
+
+	if _, err := f.sweep(context.Background(), inbound+":2", f.config.PoolAccounts[0].Address, "1.0000000", "native"); err != nil {
+		t.Fatal(err)
+	}
+	memo, ok := parseTx(t, rpc.sentXDR[0]).Memo().(txnbuild.MemoHash)
+	if !ok || hex.EncodeToString(memo[:]) != inbound {
+		t.Fatalf("memo = %#v, want MemoHash(%s)", memo, inbound)
+	}
+}

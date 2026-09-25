@@ -216,6 +216,13 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 		return
 	}
 
+	if !f.accepts(asset) {
+		metrics.ForwardsTotal.WithLabelValues("unsupported_asset").Inc()
+		slog.Warn("forwarder: asset not accepted, sweeping to recovery", "tx_hash", txHash, "asset", asset)
+		f.startSweep(ctx, txHash, poolAddress, amount, asset, "unsupported asset "+asset)
+		return
+	}
+
 	intent, err := f.store.GetIntentByMemoID(ctx, memoID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The alertable outcome: a deposit carrying a reference this relayer never
@@ -388,6 +395,11 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 			return
 		}
 		f.sweepDeposit(ctx, fwd.TxHash, fwd.PoolAddress, fwd.Amount, fwd.Asset)
+		return
+	}
+
+	if !f.accepts(fwd.Asset) && fwd.PoolAddress != "" {
+		f.startSweep(ctx, fwd.TxHash, fwd.PoolAddress, fwd.Amount, fwd.Asset, "unsupported asset "+fwd.Asset)
 		return
 	}
 
@@ -964,7 +976,7 @@ func classifyResultXDR(resultXDR string) error {
 // asset. Nothing is sent — a payment would only fail on-chain and burn its fee —
 // and the sweep is retried each tick, so adding the trustline is enough to let
 // it through.
-var errAwaitingTrustline = errors.New("recovery account has no authorized trustline for the asset")
+var errAwaitingTrustline = errors.New("no authorized trustline for the asset")
 
 // startSweep returns a deposit that cannot be credited to the recovery account.
 // The decision is persisted before anything is sent, so a retry after a crash
@@ -1024,16 +1036,20 @@ func (f *Forwarder) sweep(ctx context.Context, inboundHash, poolAddress, amount,
 	if err != nil {
 		return "", permanent(err)
 	}
-	if err := f.checkRecoveryTrustline(parsedAsset); err != nil {
-		return "", err
+	if !parsedAsset.IsNative() {
+		if err := f.checkTrustline(f.config.RecoveryAddress, parsedAsset); err != nil {
+			return "", err
+		}
 	}
 
 	// Tie the recovery payment to the deposit it returns, on-chain: whoever
 	// reconciles the recovery account can find the original payment by hash.
+	// The deposit key is the transaction hash, suffixed with the operation's
+	// position when the transaction paid the pool more than once.
 	var memo txnbuild.Memo
 	var h txnbuild.MemoHash
-	if len(inboundHash) == 2*len(h) {
-		if _, err := hex.Decode(h[:], []byte(inboundHash)); err == nil {
+	if txHash, _, _ := strings.Cut(inboundHash, ":"); len(txHash) == 2*len(h) {
+		if _, err := hex.Decode(h[:], []byte(txHash)); err == nil {
 			memo = h
 		}
 	}
@@ -1068,17 +1084,14 @@ func (f *Forwarder) sweep(ctx context.Context, inboundHash, poolAddress, amount,
 	})
 }
 
-// checkRecoveryTrustline confirms the recovery account can receive an issued
-// asset before any payment is sent. Without an authorized trustline the payment
-// is included and fails (op_no_trust / op_not_authorized), which costs a fee and
-// proves nothing; checking first lets the sweep wait for the trustline instead.
-func (f *Forwarder) checkRecoveryTrustline(asset txnbuild.Asset) error {
-	if asset.IsNative() {
-		return nil
-	}
-	acct, err := f.horizon.AccountDetail(horizonclient.AccountRequest{AccountID: f.config.RecoveryAddress})
+// checkTrustline confirms account can receive an issued asset. For a sweep it
+// runs before any payment is sent: without an authorized trustline the payment
+// is included and fails (op_no_trust / op_not_authorized), which costs a fee
+// and proves nothing, so the sweep waits for the trustline instead.
+func (f *Forwarder) checkTrustline(account string, asset txnbuild.Asset) error {
+	acct, err := f.horizon.AccountDetail(horizonclient.AccountRequest{AccountID: account})
 	if err != nil {
-		return transient(fmt.Errorf("load recovery account: %w", err))
+		return transient(fmt.Errorf("load account %s: %w", account, err))
 	}
 	for _, b := range acct.Balances {
 		if b.Code == asset.GetCode() && b.Issuer == asset.GetIssuer() {
@@ -1089,6 +1102,49 @@ func (f *Forwarder) checkRecoveryTrustline(asset txnbuild.Asset) error {
 		}
 	}
 	return fmt.Errorf("%w (%s:%s)", errAwaitingTrustline, asset.GetCode(), asset.GetIssuer())
+}
+
+// accepts reports whether deposits may be credited in asset. An empty
+// allowlist accepts everything; config.Load always sets one.
+func (f *Forwarder) accepts(asset string) bool {
+	if len(f.config.AcceptedAssets) == 0 {
+		return true
+	}
+	for _, a := range f.config.AcceptedAssets {
+		if a == asset {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckTrustlines reports, at startup, any pool or recovery account that lacks
+// an authorized trustline for an accepted issued asset. A pool without one
+// cannot receive that asset at all; a recovery account without one leaves such
+// deposits waiting in pending_retry whenever they need sweeping. It returns the
+// problems found rather than failing: on testnet a reset account is expected,
+// and refusing to start would stop every other deposit too.
+func (f *Forwarder) CheckTrustlines() []string {
+	accounts := []string{f.config.RecoveryAddress}
+	for _, p := range f.config.PoolAccounts {
+		accounts = append(accounts, p.Address)
+	}
+	var problems []string
+	for _, a := range f.config.AcceptedAssets {
+		asset, err := parseAsset(a)
+		if err != nil || asset.IsNative() {
+			continue
+		}
+		for _, acct := range accounts {
+			if acct == "" {
+				continue
+			}
+			if err := f.checkTrustline(acct, asset); err != nil {
+				problems = append(problems, fmt.Sprintf("%s: %v", acct, err))
+			}
+		}
+	}
+	return problems
 }
 
 // keypairFor finds the signing keypair for a given pool address.
