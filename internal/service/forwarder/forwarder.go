@@ -23,6 +23,8 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/latch/relayer/internal/config"
+	"github.com/latch/relayer/internal/gasless/channels"
+	"github.com/latch/relayer/internal/gasless/keys"
 	"github.com/latch/relayer/internal/metrics"
 	"github.com/latch/relayer/internal/store"
 )
@@ -87,6 +89,17 @@ const (
 	// forward is retried within a few minutes.
 	txValidity = 2 * time.Minute
 
+	// channelLeaseTTL bounds how long a channel is held: from acquiring it to
+	// the network accepting the transaction (build, simulate, the
+	// TRY_AGAIN_LATER loop and fee retries). It is released before the
+	// confirmation poll. A holder that dies loses the lease after this, and
+	// the next holder resyncs the channel's sequence.
+	channelLeaseTTL = 3 * time.Minute
+
+	// channelWait is how long a transfer waits for a free channel before it
+	// is requeued without charge, like losing the pool's slot.
+	channelWait = 30 * time.Second
+
 	// landingGrace is added to a transaction's max time before treating "not
 	// found" as "never landed", to absorb clock skew against ledger close times
 	// and RPC ingestion lag.
@@ -102,10 +115,35 @@ type Forwarder struct {
 
 	seqOnce   sync.Once
 	sequencer *sequencer
+
+	// channels, when set, supplies a leased channel account as every
+	// transaction's source (#48); channelKeys holds their keys by address.
+	channels    channelLeaser
+	channelKeys map[string]*keypair.Full
+}
+
+// channelLeaser is the subset of channels.Pool the forwarder uses.
+type channelLeaser interface {
+	AcquireWait(ctx context.Context, ttl, wait time.Duration) (*channels.Lease, error)
+	Release(ctx context.Context, l *channels.Lease, seq *int64, resync bool) error
 }
 
 func New(st *store.Store, cfg *config.Config, hz *horizonclient.Client, rpc *rpcclient.Client) *Forwarder {
 	return &Forwarder{store: st, config: cfg, horizon: hz, rpc: rpc}
+}
+
+// UseChannels makes every forward and sweep take a leased channel account as
+// its transaction source instead of the pool. Stellar accepts one pending
+// transaction per source account, so with the pool as source each pool lands
+// about one transfer per ledger; with channels it is one per channel per
+// ledger, from the same pool key. The pool remains the payment's operation
+// source (it owns and authorizes the funds) and pays the fees by fee-bump.
+func (f *Forwarder) UseChannels(leaser channelLeaser, chans []keys.Channel) {
+	f.channels = leaser
+	f.channelKeys = make(map[string]*keypair.Full, len(chans))
+	for _, ch := range chans {
+		f.channelKeys[ch.Address()] = ch.Keypair
+	}
 }
 
 // seq returns the shared sequencer, building it on first use so a Forwarder
@@ -625,7 +663,7 @@ func parseAsset(asset string) (txnbuild.Asset, error) {
 // is recorded against before it is sent; see RecordSubmission.
 func (f *Forwarder) submit(ctx context.Context, inboundHash, cAddress, poolAddress, amount, asset string) (string, error) {
 	return f.transfer(ctx, inboundHash, poolAddress, func(src *txnbuild.SimpleAccount, validUntil time.Time) (prepared, error) {
-		return f.prepareContractPayment(ctx, src, cAddress, amount, asset, validUntil)
+		return f.prepareContractPayment(ctx, src, poolAddress, cAddress, amount, asset, validUntil)
 	})
 }
 
@@ -650,6 +688,9 @@ func (f *Forwarder) transfer(
 	kp, err := f.keypairFor(poolAddress)
 	if err != nil {
 		return "", permanent(err)
+	}
+	if f.channels != nil {
+		return f.transferViaChannel(ctx, inboundHash, kp, prepare)
 	}
 
 	// Sequence comes from the shared sequencer, not a per-attempt Horizon read.
@@ -702,7 +743,7 @@ func (f *Forwarder) transfer(
 	inclusionFee := uint32(txnbuild.MinBaseFee)
 	for feeAttempt := range maxFeeRetries + 1 {
 		p.setFee(&p.env, inclusionFee)
-		hash, err = f.signAndSend(ctx, inboundHash, kp, p.env, validUntil)
+		hash, err = f.signAndSend(ctx, inboundHash, f.sealAsPool(kp), p.env, validUntil)
 		if err == nil {
 			// Accepted by the network, so this sequence number is spent and the
 			// next forward may proceed. Confirmation is polled without the lock.
@@ -735,12 +776,113 @@ func (f *Forwarder) transfer(
 	return "", transient(fmt.Errorf("insufficient fee after %d retries", maxFeeRetries))
 }
 
+// transferViaChannel is transfer with a leased channel as the transaction's
+// source: its sequence number comes from the channel, not the pool, so
+// transfers from one pool no longer queue behind each other. The same
+// guarantees hold — recorded before it is sent, an unknown outcome returned as
+// unconfirmed — and the channel is released as soon as the network has
+// accepted the transaction, with what is known about its sequence.
+func (f *Forwarder) transferViaChannel(
+	ctx context.Context,
+	inboundHash string,
+	pool *keypair.Full,
+	prepare func(src *txnbuild.SimpleAccount, validUntil time.Time) (prepared, error),
+) (hash string, err error) {
+	lease, err := f.channels.AcquireWait(ctx, channelLeaseTTL, channelWait)
+	if errors.Is(err, channels.ErrPoolCapacity) {
+		// Every channel is busy: waiting its turn, not failing.
+		return "", contention(errors.New("all deposit channels are busy"))
+	}
+	if err != nil {
+		return "", transient(fmt.Errorf("lease channel: %w", err))
+	}
+
+	// Release exactly once. Released without work to a caller who returns
+	// early: resync, the safe default when nothing is known.
+	released := false
+	release := func(consumed *int64, resync bool) {
+		if released {
+			return
+		}
+		released = true
+		// Not the request context: a lease must be returned even if the
+		// forward is being cancelled, or the channel sits idle until expiry.
+		if err := f.channels.Release(context.WithoutCancel(ctx), lease, consumed, resync); err != nil {
+			slog.Warn("forwarder: release channel", "channel", lease.Address, "err", err)
+		}
+	}
+	defer release(nil, true)
+
+	channelKey := f.channelKeys[lease.Address]
+	if channelKey == nil {
+		return "", transient(fmt.Errorf("no key for leased channel %s", lease.Address))
+	}
+
+	last := lease.Seq
+	if lease.NeedsResync {
+		acct, err := f.horizon.AccountDetail(horizonclient.AccountRequest{AccountID: lease.Address})
+		if err != nil {
+			return "", transient(fmt.Errorf("load channel %s: %w", lease.Address, err))
+		}
+		if last, err = acct.GetSequenceNumber(); err != nil {
+			return "", transient(fmt.Errorf("channel %s sequence: %w", lease.Address, err))
+		}
+	}
+	seq := last + 1
+
+	validUntil := time.Now().Add(txValidity).Truncate(time.Second)
+	p, err := prepare(&txnbuild.SimpleAccount{AccountID: lease.Address, Sequence: seq}, validUntil)
+	if err != nil {
+		release(&last, false) // nothing was sent: the channel is where it was
+		return "", err
+	}
+
+	seal := f.sealViaChannel(channelKey, pool)
+	inclusionFee := uint32(txnbuild.MinBaseFee)
+	for feeAttempt := range maxFeeRetries + 1 {
+		p.setFee(&p.env, inclusionFee)
+		hash, err = f.signAndSend(ctx, inboundHash, seal, p.env, validUntil)
+		if err == nil {
+			// Accepted: this sequence number is spent.
+			release(&seq, false)
+			hash, err = f.pollResult(ctx, hash)
+			if err != nil && !isUnconfirmed(err) {
+				f.forgetSubmission(ctx, inboundHash)
+			}
+			return hash, err
+		}
+
+		var fe *feeError
+		if errors.As(err, &fe) && feeAttempt < maxFeeRetries {
+			inclusionFee *= 2
+			slog.Warn("forwarder: tx_insufficient_fee, bumping inclusion fee",
+				"fee_attempt", feeAttempt+1, "new_inclusion_fee", inclusionFee)
+			continue
+		}
+		switch {
+		case isUnconfirmed(err), isContention(err):
+			// May have been queued, or the channel's sequence is off:
+			// the next holder reloads it from the network.
+			release(nil, true)
+		default:
+			// Rejected before entering the queue: the number is unused.
+			release(&last, false)
+		}
+		if errors.As(err, &fe) {
+			return "", transient(fmt.Errorf("%s (fee retries exhausted)", fe.msg))
+		}
+		return "", err
+	}
+	release(&last, false)
+	return "", transient(fmt.Errorf("insufficient fee after %d retries", maxFeeRetries))
+}
+
 // prepareContractPayment builds the SAC transfer to a C-address and simulates
 // it for its footprint and resource fee.
 func (f *Forwarder) prepareContractPayment(
 	ctx context.Context,
 	src *txnbuild.SimpleAccount,
-	cAddress, amount, asset string,
+	poolAddress, cAddress, amount, asset string,
 	validUntil time.Time,
 ) (prepared, error) {
 	parsedAsset, err := parseAsset(asset)
@@ -755,7 +897,10 @@ func (f *Forwarder) prepareContractPayment(
 		Destination:       cAddress,
 		Amount:            amount,
 		Asset:             parsedAsset,
-		SourceAccount:     src.AccountID,
+		// The pool owns the funds and authorizes the transfer as the
+		// operation's source, whether the transaction's source is the pool
+		// itself or a leased channel.
+		SourceAccount: poolAddress,
 	})
 	if err != nil {
 		return prepared{}, permanent(fmt.Errorf("build payment-to-contract: %w", err))
@@ -819,7 +964,93 @@ func (f *Forwarder) prepareContractPayment(
 	}, nil
 }
 
-// signAndSend signs a fully priced envelope and submits it via Stellar RPC.
+// sealFunc signs a fully priced envelope and returns what goes on the wire:
+// the signed transaction as base64 and its hash, which is the hash the
+// network, sendTransaction and getTransaction all know it by.
+type sealFunc func(env xdr.TransactionEnvelope) (b64, hash string, err error)
+
+// reparse re-parses env so signatures cover the final fee and footprint.
+func reparse(env xdr.TransactionEnvelope) (*txnbuild.Transaction, error) {
+	b, err := env.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("marshal tx: %w", err)
+	}
+	generic, err := txnbuild.TransactionFromXDR(base64.StdEncoding.EncodeToString(b))
+	if err != nil {
+		return nil, fmt.Errorf("parse tx: %w", err)
+	}
+	tx, ok := generic.Transaction()
+	if !ok {
+		return nil, errors.New("envelope is not a simple transaction")
+	}
+	return tx, nil
+}
+
+// sealAsPool signs with the pool, which is the transaction's source.
+func (f *Forwarder) sealAsPool(pool *keypair.Full) sealFunc {
+	return func(env xdr.TransactionEnvelope) (string, string, error) {
+		tx, err := reparse(env)
+		if err != nil {
+			return "", "", err
+		}
+		if tx, err = tx.Sign(f.config.NetworkPassphrase, pool); err != nil {
+			return "", "", fmt.Errorf("sign tx: %w", err)
+		}
+		b64, err := tx.Base64()
+		if err != nil {
+			return "", "", fmt.Errorf("encode tx: %w", err)
+		}
+		hash, err := tx.HashHex(f.config.NetworkPassphrase)
+		if err != nil {
+			return "", "", fmt.Errorf("hash tx: %w", err)
+		}
+		return b64, hash, nil
+	}
+}
+
+// sealViaChannel signs a transaction whose source is a leased channel: the
+// channel signs for its sequence number, the pool for the payment it owns
+// (the operation's source), and the pool then fee-bumps it, so channels never
+// pay fees and hold only their reserve. The fee-bump's hash is the one
+// recorded, sent and looked up.
+func (f *Forwarder) sealViaChannel(channel, pool *keypair.Full) sealFunc {
+	return func(env xdr.TransactionEnvelope) (string, string, error) {
+		inner, err := reparse(env)
+		if err != nil {
+			return "", "", err
+		}
+		if inner, err = inner.Sign(f.config.NetworkPassphrase, channel, pool); err != nil {
+			return "", "", fmt.Errorf("sign inner tx: %w", err)
+		}
+		// txnbuild requires the outer base fee to be at least the inner one,
+		// which for a Soroban transaction already includes the resource fee,
+		// so the outer inclusion bid is higher than the inner's. It is a cap:
+		// outside surge pricing the network charges the going inclusion fee
+		// plus the resources actually used.
+		outer, err := txnbuild.NewFeeBumpTransaction(txnbuild.FeeBumpTransactionParams{
+			Inner:      inner,
+			FeeAccount: pool.Address(),
+			BaseFee:    inner.BaseFee(),
+		})
+		if err != nil {
+			return "", "", fmt.Errorf("fee-bump tx: %w", err)
+		}
+		if outer, err = outer.Sign(f.config.NetworkPassphrase, pool); err != nil {
+			return "", "", fmt.Errorf("sign fee-bump: %w", err)
+		}
+		b64, err := outer.Base64()
+		if err != nil {
+			return "", "", fmt.Errorf("encode fee-bump: %w", err)
+		}
+		hash, err := outer.HashHex(f.config.NetworkPassphrase)
+		if err != nil {
+			return "", "", fmt.Errorf("hash fee-bump: %w", err)
+		}
+		return b64, hash, nil
+	}
+}
+
+// signAndSend seals a fully priced envelope and submits it via Stellar RPC.
 //
 // submits via rpc.SendTransaction (not horizon.SubmitTransaction) so we receive
 // Stellar-native status codes including TRY_AGAIN_LATER and ERROR result codes.
@@ -834,38 +1065,13 @@ func (f *Forwarder) prepareContractPayment(
 func (f *Forwarder) signAndSend(
 	ctx context.Context,
 	inboundHash string,
-	kp *keypair.Full,
+	seal sealFunc,
 	env xdr.TransactionEnvelope,
 	validUntil time.Time,
 ) (string, error) {
-	// Marshal, re-parse, and sign so the signature covers the updated fee and footprint.
-	updatedBytes, err := env.MarshalBinary()
+	signedB64, txHash, err := seal(env)
 	if err != nil {
-		return "", permanent(fmt.Errorf("marshal updated tx: %w", err))
-	}
-	generic, err := txnbuild.TransactionFromXDR(base64.StdEncoding.EncodeToString(updatedBytes))
-	if err != nil {
-		return "", permanent(fmt.Errorf("parse updated tx: %w", err))
-	}
-	tx, ok := generic.Transaction()
-	if !ok {
-		return "", permanent(fmt.Errorf("updated envelope is not a simple transaction"))
-	}
-	tx, err = tx.Sign(f.config.NetworkPassphrase, kp)
-	if err != nil {
-		return "", permanent(fmt.Errorf("sign tx: %w", err))
-	}
-
-	signedEnv := tx.ToXDR()
-	signedBytes, err := signedEnv.MarshalBinary()
-	if err != nil {
-		return "", permanent(fmt.Errorf("marshal signed tx: %w", err))
-	}
-	signedB64 := base64.StdEncoding.EncodeToString(signedBytes)
-
-	txHash, err := tx.HashHex(f.config.NetworkPassphrase)
-	if err != nil {
-		return "", permanent(fmt.Errorf("hash tx: %w", err))
+		return "", permanent(err)
 	}
 	if err := f.store.RecordSubmission(ctx, inboundHash, txHash, validUntil); err != nil {
 		// Nothing sent: without the record, a lost response could not be told
@@ -969,6 +1175,14 @@ func classifyResultXDR(resultXDR string) error {
 	}
 
 	code := result.Result.Code
+	// A fee-bumped transaction (a transfer sent through a channel) reports
+	// the inner transaction's outcome wrapped. What failed is the inner
+	// transaction, so classify that: an inner txBadSeq is the channel's
+	// sequence being off (contention), not a permanent failure.
+	if (code == xdr.TransactionResultCodeTxFeeBumpInnerFailed || code == xdr.TransactionResultCodeTxFeeBumpInnerSuccess) &&
+		result.Result.InnerResultPair != nil {
+		code = result.Result.InnerResultPair.Result.Result.Code
+	}
 	switch code {
 	// ── Fee error — handled by the fee-bump loop in submit() ──────────────────
 	case xdr.TransactionResultCodeTxInsufficientFee:
@@ -1089,9 +1303,10 @@ func (f *Forwarder) sweep(ctx context.Context, inboundHash, poolAddress, amount,
 			IncrementSequenceNum: false,
 			Operations: []txnbuild.Operation{
 				&txnbuild.Payment{
-					Destination: f.config.RecoveryAddress,
-					Amount:      amount,
-					Asset:       parsedAsset,
+					Destination:   f.config.RecoveryAddress,
+					Amount:        amount,
+					Asset:         parsedAsset,
+					SourceAccount: poolAddress,
 				},
 			},
 			Memo:    memo,

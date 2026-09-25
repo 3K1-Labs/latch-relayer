@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"github.com/stellar/go-stellar-sdk/keypair"
 	"github.com/stellar/go-stellar-sdk/network"
 	"github.com/stellar/go-stellar-sdk/strkey"
+
+	"github.com/latch/relayer/internal/gasless/keys"
 )
 
 // Circle's USDC issuers. Accepted by default on the matching network.
@@ -42,6 +45,13 @@ type Config struct {
 	// else is swept to recovery instead of forwarded. Defaults to XLM and
 	// Circle's USDC for the configured network (ACCEPTED_ASSETS overrides).
 	AcceptedAssets []string
+
+	// Channels are the deposit bridge's channel accounts (#48), derived from
+	// DEPOSIT_CHANNEL_SEED. Empty (DEPOSIT_CHANNEL_COUNT unset or 0) keeps the
+	// pool as every transaction's source: one transaction per pool per ledger.
+	Channels []keys.Channel
+	// InstanceID identifies this process in channel leases.
+	InstanceID string
 
 	// RetryInterval is how often the background worker sweeps forwards that are
 	// waiting for another attempt. It bounds how long a deposit that lost the
@@ -105,6 +115,15 @@ func Load() (*Config, error) {
 		return nil, errors.New("at least one pool account is required (POOL_ADDRESS_1 + POOL_PRIVATE_KEY_1)")
 	}
 
+	if cfg.Channels, err = depositChannels(cfg); err != nil {
+		return nil, err
+	}
+	cfg.InstanceID = os.Getenv("INSTANCE_ID")
+	if cfg.InstanceID == "" {
+		host, _ := os.Hostname()
+		cfg.InstanceID = fmt.Sprintf("%s-%d", host, os.Getpid())
+	}
+
 	return cfg, nil
 }
 
@@ -133,4 +152,41 @@ func acceptedAssets(raw, passphrase string) ([]string, error) {
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+// depositChannels derives the deposit bridge's channel accounts from
+// DEPOSIT_CHANNEL_SEED when DEPOSIT_CHANNEL_COUNT is positive. The seed must
+// differ from the gasless service's CHANNEL_SEED: the two services lease from
+// separate tables, and sharing a seed would have both send from the same
+// accounts and collide on sequence numbers.
+func depositChannels(cfg *Config) ([]keys.Channel, error) {
+	if v := strings.TrimSpace(os.Getenv("DEPOSIT_CHANNEL_COUNT")); v == "" || v == "0" {
+		return nil, nil
+	}
+	count, err := envInt("DEPOSIT_CHANNEL_COUNT", 0)
+	if err != nil {
+		return nil, err
+	}
+	seed, err := hex.DecodeString(os.Getenv("DEPOSIT_CHANNEL_SEED"))
+	if err != nil || len(seed) < keys.MinSeedBytes {
+		return nil, fmt.Errorf("DEPOSIT_CHANNEL_SEED is required when DEPOSIT_CHANNEL_COUNT > 0: hex, at least %d bytes (generate with: openssl rand -hex 32)", keys.MinSeedBytes)
+	}
+	if gasless := os.Getenv("CHANNEL_SEED"); gasless != "" && strings.EqualFold(gasless, os.Getenv("DEPOSIT_CHANNEL_SEED")) {
+		return nil, errors.New("DEPOSIT_CHANNEL_SEED must differ from the gasless service's CHANNEL_SEED")
+	}
+	chans, err := keys.DeriveChannels(seed, count)
+	if err != nil {
+		return nil, err
+	}
+	for _, ch := range chans {
+		if ch.Address() == cfg.RecoveryAddress {
+			return nil, fmt.Errorf("deposit channel %d derives to RECOVERY_ADDRESS; use a different DEPOSIT_CHANNEL_SEED", ch.Index)
+		}
+		for _, p := range cfg.PoolAccounts {
+			if ch.Address() == p.Address {
+				return nil, fmt.Errorf("deposit channel %d derives to pool %s; use a different DEPOSIT_CHANNEL_SEED", ch.Index, p.Address)
+			}
+		}
+	}
+	return chans, nil
 }

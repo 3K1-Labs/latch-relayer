@@ -241,3 +241,45 @@ func TestLoad_AcceptedAssetsOverride(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_DepositChannelsOffByDefault(t *testing.T) {
+	validEnv(t)
+	for _, v := range []string{"", "0"} {
+		t.Setenv("DEPOSIT_CHANNEL_COUNT", v)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cfg.Channels) != 0 {
+			t.Fatalf("DEPOSIT_CHANNEL_COUNT=%q derived %d channels", v, len(cfg.Channels))
+		}
+	}
+}
+
+func TestLoad_DepositChannels(t *testing.T) {
+	validEnv(t)
+	t.Setenv("DEPOSIT_CHANNEL_COUNT", "3")
+
+	t.Setenv("DEPOSIT_CHANNEL_SEED", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("channels without a seed accepted")
+	}
+
+	seed := "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	t.Setenv("DEPOSIT_CHANNEL_SEED", seed)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Channels) != 3 || cfg.Channels[2].Index != 2 {
+		t.Fatalf("channels = %+v", cfg.Channels)
+	}
+	if cfg.InstanceID == "" {
+		t.Error("no instance id for channel leases")
+	}
+
+	t.Setenv("CHANNEL_SEED", seed)
+	if _, err := Load(); err == nil {
+		t.Fatal("deposit channels sharing the gasless CHANNEL_SEED accepted")
+	}
+}
