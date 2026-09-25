@@ -115,7 +115,7 @@ Config supports `POOL_ADDRESS_N` / `POOL_PRIVATE_KEY_N` for N pool accounts. One
 Stellar Core holds one pending transaction per source account, so a pool that sources its own transfers lands at most one per ledger (about 12 a minute). Channel accounts (#48) lift that limit without adding pool keys:
 - `DEPOSIT_CHANNEL_COUNT` accounts are derived from `DEPOSIT_CHANNEL_SEED` and tracked in `deposit_channel_accounts`. The lease pool is shared with the gasless service (`internal/gasless/channels`) but uses its own table and seed.
 - Each forward or sweep leases a free channel as its transaction source, so its sequence number comes from the channel. The pool stays the payment's operation source, authorizing the SAC transfer (or the recovery payment) with its own signature, and pays the fee by fee-bump. Funds never touch a channel.
-- The channel is released as soon as the network accepts the transaction, with the sequence it consumed. After an unconfirmed send or a txBadSeq it is released for resync instead, and the next holder reloads its sequence from Horizon.
+- The channel is held until its transaction settles, because Stellar Core queues only one transaction per source account. It is then released with the sequence it consumed. After an unconfirmed send or poll, a txBadSeq, or fee retries running out, it is released for resync instead, and the next holder reloads its sequence from Horizon.
 - When every channel is busy, the forward is requeued without charging its retry budget.
 - Unset or 0 keeps the pool as the transaction source. If no channel exists on-chain at startup, the relayer logs an error and stays in pool mode. Create them with `make deposit-channels`.
 

@@ -89,12 +89,15 @@ const (
 	// forward is retried within a few minutes.
 	txValidity = 2 * time.Minute
 
-	// channelLeaseTTL bounds how long a channel is held: from acquiring it to
-	// the network accepting the transaction (build, simulate, the
-	// TRY_AGAIN_LATER loop and fee retries). It is released before the
-	// confirmation poll. A holder that dies loses the lease after this, and
-	// the next holder resyncs the channel's sequence.
-	channelLeaseTTL = 3 * time.Minute
+	// channelLeaseTTL bounds how long a channel is held: from acquiring it
+	// until its transaction is confirmed (build, simulate, the
+	// TRY_AGAIN_LATER loop, fee retries and the pollTimeout confirmation
+	// poll). The lease is kept through the poll because Stellar Core queues
+	// one transaction per source account: a channel handed on while its
+	// transaction is still pending gets txBadSeq or TRY_AGAIN_LATER for the
+	// next one. A holder that dies loses the lease after this, and the next
+	// holder resyncs the channel's sequence.
+	channelLeaseTTL = 4 * time.Minute
 
 	// channelWait is how long a transfer waits for a free channel before it
 	// is requeued without charge, like losing the pool's slot.
@@ -374,7 +377,7 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 	if isContention(lastErr) {
 		metrics.ContentionTotal.Inc()
 		_ = f.store.RequeueForContention(ctx, txHash, lastErr.Error())
-		slog.Warn("forwarder: lost the pool slot, queued for retry without charge",
+		slog.Warn("forwarder: source account busy, queued for retry without charge",
 			"tx_hash", txHash, "err", lastErr)
 		return
 	}
@@ -512,7 +515,7 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 		if isContention(err) {
 			metrics.ContentionTotal.Inc()
 			_ = f.store.RequeueForContention(ctx, fwd.TxHash, err.Error())
-			slog.Warn("forwarder: retry lost the pool slot, re-queued without charge",
+			slog.Warn("forwarder: retry found source account busy, re-queued without charge",
 				"tx_hash", fwd.TxHash, "retries", fwd.Retries, "err", err)
 			return
 		}
@@ -780,8 +783,8 @@ func (f *Forwarder) transfer(
 // source: its sequence number comes from the channel, not the pool, so
 // transfers from one pool no longer queue behind each other. The same
 // guarantees hold — recorded before it is sent, an unknown outcome returned as
-// unconfirmed — and the channel is released as soon as the network has
-// accepted the transaction, with what is known about its sequence.
+// unconfirmed — and the channel is released once the transaction's outcome is
+// known, with what is known about its sequence.
 func (f *Forwarder) transferViaChannel(
 	ctx context.Context,
 	inboundHash string,
@@ -843,10 +846,19 @@ func (f *Forwarder) transferViaChannel(
 		p.setFee(&p.env, inclusionFee)
 		hash, err = f.signAndSend(ctx, inboundHash, seal, p.env, validUntil)
 		if err == nil {
-			// Accepted: this sequence number is spent.
-			release(&seq, false)
+			// Accepted. Hold the channel until the transaction settles: while
+			// it is pending, the channel's next sequence number can't be
+			// queued behind it.
 			hash, err = f.pollResult(ctx, hash)
-			if err != nil && !isUnconfirmed(err) {
+			switch {
+			case err == nil:
+				release(&seq, false)
+			case isUnconfirmed(err):
+				// May still be queued: the next holder reloads the sequence.
+				release(nil, true)
+			default:
+				// Failed in a ledger, which still consumed the sequence number.
+				release(&seq, false)
 				f.forgetSubmission(ctx, inboundHash)
 			}
 			return hash, err
@@ -860,9 +872,12 @@ func (f *Forwarder) transferViaChannel(
 			continue
 		}
 		switch {
-		case isUnconfirmed(err), isContention(err):
-			// May have been queued, or the channel's sequence is off:
-			// the next holder reloads it from the network.
+		case isUnconfirmed(err), isContention(err), errors.As(err, &fe):
+			// May have been queued, or the channel's sequence is off: the
+			// next holder reloads it from the network. Fee retries running
+			// out counts too: on a channel, which pays no fee itself, it
+			// usually means this sequence number is already queued, and Core
+			// treats a resubmission as a replace-by-fee needing 10x the fee.
 			release(nil, true)
 		default:
 			// Rejected before entering the queue: the number is unused.
@@ -873,7 +888,7 @@ func (f *Forwarder) transferViaChannel(
 		}
 		return "", err
 	}
-	release(&last, false)
+	release(nil, true)
 	return "", transient(fmt.Errorf("insufficient fee after %d retries", maxFeeRetries))
 }
 

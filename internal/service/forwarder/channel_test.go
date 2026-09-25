@@ -274,3 +274,86 @@ func TestClassifyResultXDR_feeBumpInner(t *testing.T) {
 		t.Errorf("inner txInsufficientFee = %v, want fee error", err)
 	}
 }
+
+// Stellar Core queues one transaction per source account. A channel handed on
+// while its transaction is pending gets txBadSeq for the next one, so the
+// lease is held until the transaction settles.
+func TestChannel_leaseHeldUntilConfirmed(t *testing.T) {
+	rpc := successRPC(t, "out-held")
+	f, st, l, _ := channelForwarder(t, rpc)
+	releasedDuringPoll := -1
+	rpc.onPoll = func() {
+		l.mu.Lock()
+		releasedDuringPoll = len(l.released)
+		l.mu.Unlock()
+	}
+
+	forward(f, "in-held")
+
+	if len(st.doneCalls) != 1 {
+		t.Fatalf("forward not completed: %v", st.markFailedCalls)
+	}
+	if releasedDuringPoll != 0 {
+		t.Fatalf("channel released %d times before the poll, want held until confirmed", releasedDuringPoll)
+	}
+	if r := l.only(t); r.resync || r.seq == nil || *r.seq != 501 {
+		t.Fatalf("release = %+v, want sequence 501 consumed", r)
+	}
+}
+
+// Accepted but never seen to settle: it may still be queued, so the next
+// holder reloads the sequence.
+func TestChannel_unconfirmedPollResyncs(t *testing.T) {
+	rpc := successRPC(t, "out")
+	rpc.pollErr = errors.New("poll timed out")
+	f, _, l, _ := channelForwarder(t, rpc)
+
+	forward(f, "in-poll-unconfirmed")
+
+	if r := l.only(t); !r.resync || r.seq != nil {
+		t.Fatalf("release = %+v, want resync", r)
+	}
+}
+
+// Failed in a ledger: the sequence number was still consumed.
+func TestChannel_failedOnChainConsumesSequence(t *testing.T) {
+	rpc := successRPC(t, "out")
+	rpc.pollResp = rpcprotocol.GetTransactionResponse{
+		TransactionDetails: rpcprotocol.TransactionDetails{
+			Status:    rpcprotocol.TransactionStatusFailed,
+			ResultXDR: makeResultXDR(t, xdr.TransactionResultCodeTxBadAuth),
+		},
+	}
+	f, _, l, _ := channelForwarder(t, rpc)
+
+	forward(f, "in-failed")
+
+	if r := l.only(t); r.resync || r.seq == nil || *r.seq != 501 {
+		t.Fatalf("release = %+v, want sequence 501 consumed", r)
+	}
+}
+
+// txInsufficientFee on every fee retry usually means this sequence number is
+// already queued (Core wants 10x to replace it), so the channel must be
+// resynced rather than released at a sequence the network has moved past.
+func TestChannel_feeRetriesExhaustedResyncs(t *testing.T) {
+	rpc := successRPC(t, "out")
+	rpc.sendResp = rpcprotocol.SendTransactionResponse{Status: "ERROR", ErrorResultXDR: makeResultXDR(t, xdr.TransactionResultCodeTxInsufficientFee)}
+	f, _, l, _ := channelForwarder(t, rpc)
+
+	forward(f, "in-fee")
+
+	if rpc.sent == 0 || rpc.sent%(maxFeeRetries+1) != 0 {
+		t.Fatalf("sent %d, want whole rounds of %d fee attempts", rpc.sent, maxFeeRetries+1)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.released) != rpc.sent/(maxFeeRetries+1) {
+		t.Fatalf("released %d times for %d rounds", len(l.released), rpc.sent/(maxFeeRetries+1))
+	}
+	for _, r := range l.released {
+		if !r.resync || r.seq != nil {
+			t.Fatalf("release = %+v, want resync", r)
+		}
+	}
+}

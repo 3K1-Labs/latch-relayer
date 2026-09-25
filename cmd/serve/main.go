@@ -202,14 +202,23 @@ func enableChannels(ctx context.Context, db *pgxpool.Pool, cfg *config.Config, h
 	live := 0
 	for _, ch := range cfg.Channels {
 		balance := int64(-1) // missing on-chain: out of rotation
-		if acct, err := hz.AccountDetail(horizonclient.AccountRequest{AccountID: ch.Address()}); err == nil {
+		acct, err := hz.AccountDetail(horizonclient.AccountRequest{AccountID: ch.Address()})
+		switch {
+		case err == nil:
 			if native, err := acct.GetNativeBalance(); err == nil {
 				if b, err := sdkamount.ParseInt64(native); err == nil {
 					balance = b
 				}
 			}
-		} else {
+		case horizonclient.IsNotFoundError(err):
 			slog.Error("deposit channel not on-chain, out of rotation", "index", ch.Index, "address", ch.Address(), "err", err)
+		default:
+			// Horizon unreachable or erroring says nothing about the channel:
+			// leave its status as it was rather than take it out of rotation
+			// over a network blip.
+			slog.Warn("deposit channel: could not check on-chain, status unchanged", "index", ch.Index, "address", ch.Address(), "err", err)
+			live++
+			continue
 		}
 		if err := chanPool.RecordBalance(ctx, ch.Index, balance, 0); err != nil {
 			slog.Error("deposit channels: record balance", "index", ch.Index, "err", err)
