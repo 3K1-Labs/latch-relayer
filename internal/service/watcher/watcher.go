@@ -49,11 +49,12 @@ type Watcher struct {
 
 // forwardJob is one inbound payment waiting to be forwarded.
 type forwardJob struct {
-	txHash string
-	memoID uint64
-	from   string
-	amount string
-	asset  string
+	txHash   string
+	landedAt time.Time
+	memoID   uint64
+	from     string
+	amount   string
+	asset    string
 }
 
 // New builds a watcher. Its workers run on work rather than the stream's
@@ -117,7 +118,7 @@ func (w *Watcher) startWorkers(intake context.Context) {
 // forward runs one job. This watcher only sees payments to its own pool, so
 // that is the pool holding the money for every job it dispatches.
 func (w *Watcher) forward(ctx context.Context, job forwardJob) {
-	w.forwarder.Forward(ctx, w.pool.Address, job.txHash, job.memoID, job.from, job.amount, job.asset)
+	w.forwarder.Forward(ctx, w.pool.Address, job.txHash, job.memoID, job.from, job.amount, job.asset, job.landedAt)
 }
 
 // Run starts the SSE stream and reconnects automatically on any error.
@@ -188,10 +189,11 @@ func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
 	}
 
 	job := forwardJob{
-		txHash: depositKey(payment.TransactionHash, payment.ID, payment.Transaction.OperationCount),
-		from:   payment.From,
-		amount: payment.Amount,
-		asset:  assetID(payment),
+		txHash:   depositKey(payment.TransactionHash, payment.ID, payment.Transaction.OperationCount),
+		landedAt: payment.LedgerCloseTime,
+		from:     payment.From,
+		amount:   payment.Amount,
+		asset:    assetID(payment),
 	}
 
 	memoID, err := routingID(payment)

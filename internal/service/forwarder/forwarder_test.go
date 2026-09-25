@@ -428,7 +428,7 @@ func TestForward_insertError(t *testing.T) {
 	st := &mockStore{insertErr: errors.New("db down")}
 	f := &Forwarder{store: st, config: testConfig(t), horizon: &mockHorizon{}, rpc: &mockRPC{}}
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "txhash", 1, "GABC", "10.0", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "txhash", 1, "GABC", "10.0", "native", time.Now())
 
 	// InsertForward failed — nothing else should be called
 	if len(st.markFailedCalls) != 0 || len(st.permFailCalls) != 0 {
@@ -440,7 +440,7 @@ func TestForward_unknownMemoID(t *testing.T) {
 	f, st := forwarderWith(t, successRPC(t, "sweep-hash"))
 	st.intent, st.intentErr = nil, pgx.ErrNoRows
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "txhash-unk", 999, "GABC", "5.0", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "txhash-unk", 999, "GABC", "5.0", "native", time.Now())
 
 	if len(st.sweepCalls) != 1 || st.sweepCalls[0] != [2]string{"txhash-unk", "unknown memo_id"} {
 		t.Fatalf("sweep decision = %v", st.sweepCalls)
@@ -457,7 +457,7 @@ func TestForward_expiredIntent(t *testing.T) {
 	f, st := forwarderWith(t, successRPC(t, "sweep-hash"))
 	st.intent = &store.Intent{MemoID: 55, Status: store.IntentExpired, CAddress: testCAddress}
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "txhash-exp", 55, "GABC", "5.0", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "txhash-exp", 55, "GABC", "5.0", "native", time.Now())
 
 	if len(st.sweepCalls) != 1 || st.sweepCalls[0][1] != "intent expired" {
 		t.Fatalf("sweep decision = %v, want intent expired", st.sweepCalls)
@@ -480,7 +480,7 @@ func TestForward_duplicateTxHash(t *testing.T) {
 		rpc:     successRPC(t, "out-dup"),
 	}
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-dup", 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-dup", 1, "GABC", "10.0000000", "native", time.Now())
 
 	if len(st.doneCalls) != 0 || len(st.completeIntentCalls) != 0 {
 		t.Errorf("duplicate tx_hash was forwarded again: done=%v complete=%v",
@@ -504,7 +504,7 @@ func TestForward_intentPastExpiryButStillPending(t *testing.T) {
 	}}
 	f := &Forwarder{store: st, config: testConfig(t), horizon: &mockHorizon{}, rpc: &mockRPC{}}
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-late", 77, "GABC", "5.0", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-late", 77, "GABC", "5.0", "native", time.Now())
 
 	if len(st.doneCalls) != 0 {
 		t.Errorf("deposit past expires_at was credited: %v", st.doneCalls)
@@ -562,7 +562,7 @@ func TestForward_amountMismatchStillCredits(t *testing.T) {
 		rpc:     successRPC(t, "out-mismatch"),
 	}
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-mismatch", 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-mismatch", 1, "GABC", "10.0000000", "native", time.Now())
 
 	if len(st.doneCalls) != 1 {
 		t.Fatalf("want the deposit credited despite the mismatch, got %d done calls", len(st.doneCalls))
@@ -580,7 +580,7 @@ func TestForward_permanentError(t *testing.T) {
 	rpc := &mockRPC{simResp: rpcprotocol.SimulateTransactionResponse{Error: "contract not deployed"}}
 	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: rpc}
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-perm", 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-perm", 1, "GABC", "10.0000000", "native", time.Now())
 
 	// Permanent error on first attempt → StatusFailed, no pending_retry
 	if len(st.markFailedCalls) != 1 {
@@ -598,7 +598,7 @@ func TestForward_transientAllAttempts(t *testing.T) {
 	hz := &mockHorizon{accountErr: errors.New("horizon timeout")}
 	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: &mockRPC{}}
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-trans", 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-trans", 1, "GABC", "10.0000000", "native", time.Now())
 
 	// All 3 attempts transient → StatusPendingRetry
 	if len(st.markFailedCalls) != 1 {
@@ -616,7 +616,7 @@ func TestForward_success(t *testing.T) {
 	rpc := successRPC(t, "out-hash-xyz")
 	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: rpc}
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-hash-abc", 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-hash-abc", 1, "GABC", "10.0000000", "native", time.Now())
 
 	if len(st.doneCalls) != 1 {
 		t.Fatalf("want 1 MarkForwardDone, got %d", len(st.doneCalls))
@@ -682,7 +682,7 @@ func TestForward_issuedAssetSucceeds(t *testing.T) {
 	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: rpc}
 
 	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-hash-usdc", 1, "GABC", "25.0000000",
-		"USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
+		"USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", time.Now())
 
 	if len(st.doneCalls) != 1 {
 		t.Fatalf("want 1 MarkForwardDone for an issued asset, got %d (markFailed: %v)",
@@ -702,7 +702,7 @@ func TestForward_unparseableAssetIsPermanent(t *testing.T) {
 	rpc := successRPC(t, "unused")
 	f := &Forwarder{store: st, config: testConfigWithKeypair(t, kp), horizon: hz, rpc: rpc}
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-hash-bad", 1, "GABC", "1.0000000", "NOTANASSET")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-hash-bad", 1, "GABC", "1.0000000", "NOTANASSET", time.Now())
 
 	if len(st.doneCalls) != 0 {
 		t.Fatalf("want no MarkForwardDone for an unparseable asset, got %d", len(st.doneCalls))
@@ -823,7 +823,7 @@ func TestSweep_PaysOutOfReceivingPool(t *testing.T) {
 			rpc := successRPC(t, "sweep-hash")
 			f := &Forwarder{store: st, config: cfg, horizon: hz, rpc: rpc}
 
-			f.Forward(context.Background(), p2.Address(), "in-"+name, 55, "GABC", "5.0000000", "native")
+			f.Forward(context.Background(), p2.Address(), "in-"+name, 55, "GABC", "5.0000000", "native", time.Now())
 
 			if st.insertPool != p2.Address() {
 				t.Errorf("forward recorded pool %s, want receiving pool %s", st.insertPool, p2.Address())
@@ -851,7 +851,7 @@ func TestForward_WrongPoolForwardsFromReceivingPool(t *testing.T) {
 	rpc := successRPC(t, "out-wrong-pool")
 	f := &Forwarder{store: st, config: cfg, horizon: hz, rpc: rpc}
 
-	f.Forward(context.Background(), p2.Address(), "in-wrong-pool", 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), p2.Address(), "in-wrong-pool", 1, "GABC", "10.0000000", "native", time.Now())
 
 	if len(st.doneCalls) != 1 {
 		t.Fatalf("forward not completed: done=%v failed=%v", st.doneCalls, st.markFailedCalls)

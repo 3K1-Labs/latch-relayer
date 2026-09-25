@@ -26,6 +26,13 @@ pending → completed   (deposit arrived and was forwarded successfully)
 ```
 Intents expire via `ExpireStaleIntents`, called by the retry worker on every tick (every 30s).
 
+Whether a deposit is in time is judged by **when it landed on-chain**, not when the relayer processes it, and not by the intent's status:
+- A payment made inside the window is credited even if it is processed late, for example when the stream replays after a restart or a pool is backlogged.
+- In that case an intent already flipped to `expired` becomes `completed`.
+- A payment that lands after `expires_at` is swept to recovery.
+
+**TTL: 1 hour by default, on purpose for launch.** Callers set `expires_in` (seconds) per flow. One hour may be too short for exchange withdrawals, which can be held for review for hours, and for some on-ramps. Revisit the default once real settlement times per integrated provider are known. A longer TTL is safe because memo_ids are random and unguessable.
+
 ### Database Model
 Three tables:
 

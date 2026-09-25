@@ -136,3 +136,28 @@ func TestSweepRoundTrip(t *testing.T) {
 		t.Fatalf("swept forward still has an in-flight transfer")
 	}
 }
+
+// A deposit that landed inside the window completes its intent even after the
+// retry worker has marked it expired by wall clock.
+func TestCompleteIntentAfterWallClockExpiry(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	in, err := s.CreateIntent(ctx, "CADDR", "GPOOL", nil, time.Now().Add(-time.Minute), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.ExpireStaleIntents(ctx); err != nil || n != 1 {
+		t.Fatalf("expired %d intents, err %v", n, err)
+	}
+	if err := s.CompleteIntent(ctx, in.MemoID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetIntentByMemoID(ctx, in.MemoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != IntentCompleted {
+		t.Fatalf("status = %s, want completed", got.Status)
+	}
+}

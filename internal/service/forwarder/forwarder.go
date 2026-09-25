@@ -194,7 +194,10 @@ var backoffs = []time.Duration{
 // poolAddress is the pool account the payment arrived at. Every outbound
 // transfer for this deposit — the forward or a recovery sweep — is paid out of
 // that pool, because that is where the money is.
-func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, memoID uint64, fromAddress, amount, asset string) {
+//
+// landedAt is when the payment closed on-chain; it decides whether the intent
+// was still open. Zero means unknown, and the current time is used instead.
+func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, memoID uint64, fromAddress, amount, asset string, landedAt time.Time) {
 	// Measured from when we first see the deposit rather than from submission,
 	// so the number reflects what the customer waits for.
 	started := time.Now()
@@ -241,16 +244,21 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 		return
 	}
 
-	// Two ways to be past the window: the retry worker already flipped the status,
-	// or the TTL elapsed since its last tick. Testing the status alone makes
-	// crediting depend on when that worker last ran, so a deposit landing in the gap
-	// is forwarded against an intent the client already shows as dead — the mobile
-	// app's isDepositIntentExpired keys off expires_at directly.
-	if intent.Status == store.IntentExpired || time.Now().After(intent.ExpiresAt) {
+	// Expiry is judged by when the deposit landed on-chain, not when the
+	// relayer got to it. A payment made inside the window must be credited
+	// even if it is processed after the window closes — the stream replaying
+	// after a restart, or a backlog of forwards on a busy pool. For the same
+	// reason the intent's status is not consulted: the retry worker flips it
+	// to 'expired' by wall clock, which says nothing about this deposit.
+	landed := landedAt
+	if landed.IsZero() {
+		landed = time.Now()
+	}
+	if landed.After(intent.ExpiresAt) {
 		metrics.ForwardsTotal.WithLabelValues("expired").Inc()
 		slog.Warn("forwarder: intent expired, sweeping to recovery",
 			"tx_hash", txHash, "memo_id", memoID,
-			"status", intent.Status, "expires_at", intent.ExpiresAt)
+			"landed_at", landed, "expires_at", intent.ExpiresAt)
 		f.startSweep(ctx, txHash, poolAddress, amount, asset, "intent expired")
 		return
 	}

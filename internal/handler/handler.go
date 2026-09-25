@@ -146,7 +146,17 @@ func (h *Handler) CreateIntent(w http.ResponseWriter, r *http.Request) {
 
 	ttl := req.ExpiresIn
 	if ttl <= 0 {
-		ttl = 3600 // default 1 hour
+		// Default 1 hour — kept deliberately until real provider data says
+		// otherwise. It may be too short for some senders: exchange withdrawals
+		// can sit in review or compliance holds for hours, and on-ramps settle on
+		// their own schedule. A deposit that lands after the intent expires is
+		// swept to recovery instead of credited, which means a manual refund.
+		// Revisit once we see real settlement times per integrated provider;
+		// callers can already pass a longer expires_in per flow. Longer is safe:
+		// memo_ids are random uint64s, so an open intent cannot be guessed.
+		// Expiry is judged by when the deposit landed on-chain, not when the
+		// relayer processes it (see forwarder.Forward).
+		ttl = 3600
 	}
 	expiresAt := time.Now().Add(time.Duration(ttl) * time.Second)
 

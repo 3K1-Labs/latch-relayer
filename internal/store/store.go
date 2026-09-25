@@ -177,11 +177,13 @@ func (s *Store) SetIntentExternalID(ctx context.Context, memoID uint64, external
 	return ErrExternalIDConflict
 }
 
-// CompleteIntent marks a pending intent as completed (deposit forwarded successfully).
+// CompleteIntent marks an intent completed once its deposit is forwarded. An
+// intent already flipped to 'expired' by the retry worker's wall clock is
+// completed too: its deposit landed inside the window and was credited.
 func (s *Store) CompleteIntent(ctx context.Context, memoID uint64) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE intents SET status = $1, updated_at = NOW()
-		WHERE memo_id = $2 AND status = 'pending'
+		WHERE memo_id = $2 AND status IN ('pending', 'expired')
 	`, IntentCompleted, int64(memoID))
 	if err != nil {
 		return fmt.Errorf("complete intent: %w", err)

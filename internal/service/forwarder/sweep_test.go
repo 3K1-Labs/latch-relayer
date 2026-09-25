@@ -57,7 +57,7 @@ func TestSweep_MissingTrustlineWaitsWithoutSending(t *testing.T) {
 	f, st, hz := sweepForwarder(t, rpc)
 	hz.accounts = map[string]hProtocol.Account{f.config.RecoveryAddress: {AccountID: f.config.RecoveryAddress}}
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", usdc)
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", usdc, time.Now())
 
 	if rpc.sent != 0 {
 		t.Fatalf("sent %d payments the recovery account cannot receive", rpc.sent)
@@ -99,7 +99,7 @@ func TestSweep_TransientFailureThenSuccess(t *testing.T) {
 	}
 	f, st, _ := sweepForwarder(t, rpc)
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", "native", time.Now())
 
 	if len(st.sweptCalls) != 0 {
 		t.Fatalf("recorded as swept although the payment was rejected: %v", st.sweptCalls)
@@ -153,7 +153,7 @@ func TestSweep_PollTimeoutDoesNotSendTwice(t *testing.T) {
 	rpc.pollErr = context.DeadlineExceeded
 	f, st, _ := sweepForwarder(t, rpc)
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", "native", time.Now())
 
 	if rpc.sent != 1 || len(st.recordCalls) != 1 || len(st.requeueCalls) != 1 {
 		t.Fatalf("sent=%d record=%d requeue=%d, want one recorded send left to resolve",
@@ -169,7 +169,7 @@ func TestSweep_FailedOnChainIsNotSwept(t *testing.T) {
 	rpc.pollResp = lookup(rpcprotocol.TransactionStatusFailed, makeResultXDR(t, xdr.TransactionResultCodeTxBadAuth))
 	f, st, _ := sweepForwarder(t, rpc)
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", "native", time.Now())
 
 	if len(st.sweptCalls) != 0 {
 		t.Fatalf("recorded as swept although it failed on-chain")
@@ -184,7 +184,7 @@ func TestSweep_NoRecoveryAddressIsNotSwept(t *testing.T) {
 	f, st, _ := sweepForwarder(t, rpc)
 	f.config.RecoveryAddress = ""
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", "native", time.Now())
 
 	if rpc.sent != 0 || len(st.sweptCalls) != 0 {
 		t.Fatalf("sent=%d swept=%v with no recovery address", rpc.sent, st.sweptCalls)
@@ -199,7 +199,7 @@ func TestSweep_DecisionNotPersistedSendsNothing(t *testing.T) {
 	f, st, _ := sweepForwarder(t, rpc)
 	st.sweepErr = errors.New("db down")
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-sweep", 9, "GABC", "5.0000000", "native", time.Now())
 
 	if rpc.sent != 0 {
 		t.Fatalf("swept without persisting the decision")
@@ -216,7 +216,7 @@ func TestForward_IntentLookupErrorDoesNotSweep(t *testing.T) {
 	f, st := forwarderWith(t, rpc)
 	st.intent, st.intentErr = nil, errors.New("connection refused")
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-dberr", 9, "GABC", "5.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-dberr", 9, "GABC", "5.0000000", "native", time.Now())
 
 	if rpc.sent != 0 || len(st.sweepCalls) != 0 {
 		t.Fatalf("sent=%d sweep=%v on a lookup error", rpc.sent, st.sweepCalls)
@@ -298,7 +298,7 @@ func TestForward_UnsupportedAssetIsSwept(t *testing.T) {
 	f.config.AcceptedAssets = []string{"native"}
 	withTrustline(f.horizon.(*mockHorizon), f.config.RecoveryAddress, true)
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-usdc", 1, "GABC", "5.0000000", usdc)
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-usdc", 1, "GABC", "5.0000000", usdc, time.Now())
 
 	if len(st.doneCalls) != 0 {
 		t.Fatalf("credited an asset that is not accepted: %v", st.doneCalls)
@@ -316,7 +316,7 @@ func TestForward_AcceptedAssetIsCredited(t *testing.T) {
 	f, st := forwarderWith(t, rpc)
 	f.config.AcceptedAssets = []string{"native", usdc}
 
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-usdc", 1, "GABC", "5.0000000", usdc)
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-usdc", 1, "GABC", "5.0000000", usdc, time.Now())
 
 	if len(st.doneCalls) != 1 || len(st.sweepCalls) != 0 {
 		t.Fatalf("done=%v sweep=%v, want an accepted asset credited", st.doneCalls, st.sweepCalls)
@@ -351,5 +351,39 @@ func TestSweep_MemoFromBatchedDepositKey(t *testing.T) {
 	memo, ok := parseTx(t, rpc.sentXDR[0]).Memo().(txnbuild.MemoHash)
 	if !ok || hex.EncodeToString(memo[:]) != inbound {
 		t.Fatalf("memo = %#v, want MemoHash(%s)", memo, inbound)
+	}
+}
+
+// Expiry is judged by when the deposit landed, not when it is processed: a
+// payment made inside the window is credited even if the relayer reaches it
+// late (a replay after restart, a backlog), and even if the retry worker has
+// already flipped the intent to 'expired' by wall clock.
+func TestForward_ExpiryJudgedByLandingTime(t *testing.T) {
+	expires := time.Now().Add(-time.Minute)
+	cases := []struct {
+		name     string
+		status   string
+		landedAt time.Time
+		credited bool
+	}{
+		{"landed in window, processed late", store.IntentPending, expires.Add(-time.Second), true},
+		{"landed in window, already flipped to expired", store.IntentExpired, expires.Add(-time.Second), true},
+		{"landed after the window", store.IntentPending, expires.Add(time.Second), false},
+		{"landing time unknown falls back to now", store.IntentPending, time.Time{}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f, st := forwarderWith(t, successRPC(t, "out"))
+			st.intent.Status, st.intent.ExpiresAt = c.status, expires
+
+			f.Forward(context.Background(), f.config.PoolAccounts[0].Address, "in-ttl", 1, "GABC", "5.0000000", "native", c.landedAt)
+
+			if credited := len(st.doneCalls) == 1; credited != c.credited {
+				t.Fatalf("credited = %v, want %v (done=%v sweep=%v)", credited, c.credited, st.doneCalls, st.sweepCalls)
+			}
+			if !c.credited && (len(st.sweepCalls) != 1 || st.sweepCalls[0][1] != "intent expired") {
+				t.Fatalf("sweep = %v, want the expiry sweep", st.sweepCalls)
+			}
+		})
 	}
 }

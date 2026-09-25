@@ -27,7 +27,7 @@ func forwarderWith(t *testing.T, rpc *mockRPC) (*Forwarder, *mockStore) {
 }
 
 func forward(f *Forwarder, inbound string) {
-	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, inbound, 1, "GABC", "10.0000000", "native")
+	f.Forward(context.Background(), f.config.PoolAccounts[0].Address, inbound, 1, "GABC", "10.0000000", "native", time.Now())
 }
 
 func TestForward_pollTimeoutDoesNotSendTwice(t *testing.T) {
