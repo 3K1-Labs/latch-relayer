@@ -69,6 +69,8 @@ type mockStore struct {
 	insertDup    bool   // InsertForward reports the row already existed
 	insertPool   string // pool address InsertForward recorded
 	insertLanded time.Time
+	claimLost    bool // ClaimNewForward / ClaimPendingForward find the row already taken
+	claimCalls   []string
 	intent       *store.Intent
 	intentErr    error
 
@@ -98,6 +100,14 @@ func (m *mockStore) InsertForward(_ context.Context, _ string, _ uint64, poolAdd
 		return false, m.insertErr
 	}
 	return !m.insertDup, nil
+}
+func (m *mockStore) ClaimNewForward(_ context.Context, txHash string) (bool, error) {
+	m.claimCalls = append(m.claimCalls, txHash)
+	return !m.claimLost, nil
+}
+func (m *mockStore) ClaimPendingForward(_ context.Context, txHash string, _ time.Time) (bool, error) {
+	m.claimCalls = append(m.claimCalls, txHash)
+	return !m.claimLost, nil
 }
 func (m *mockStore) GetIntentByMemoID(_ context.Context, _ uint64) (*store.Intent, error) {
 	return m.intent, m.intentErr

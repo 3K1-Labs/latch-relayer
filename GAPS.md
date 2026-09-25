@@ -77,6 +77,8 @@ WHERE status = 'pending_retry'
 ORDER BY created_at ASC
 ```
 
+**Status: resolved.** The `pending` recovery above shipped in July, but it only covers rows that exist. The first half of the gap stayed open: the cursor was saved when a deposit was queued, before its row was written, so a crash with deposits queued, or a failed insert, lost them. Both were reproduced on testnet. The watcher now inserts the row before saving the cursor, and a failed insert stops the stream so it replays from the last saved cursor. Both the watcher's worker and the retry worker claim a `pending` row before processing it, so a queued deposit the retry worker has picked up is not forwarded twice.
+
 ---
 
 ### [P1] No per-forward exponential backoff

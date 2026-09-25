@@ -192,3 +192,73 @@ func TestMarkSweptKeepsReason(t *testing.T) {
 		t.Fatalf("error = %v, want the sweep reason kept", e)
 	}
 }
+
+// A deposit recorded by the watcher is processed exactly once: either by the
+// worker it was queued for or, if that never happened, by the retry worker.
+func TestClaimForward_workerOrRetryNotBoth(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	if _, err := s.InsertForward(ctx, "in-claim", 11, "GPOOL", "GFROM", "1.0000000", "native", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var seen time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT updated_at FROM forwards WHERE tx_hash = 'in-claim'`).Scan(&seen); err != nil {
+		t.Fatal(err)
+	}
+
+	// The retry worker gets there first (the row sat queued past the cutoff).
+	if ok, err := s.ClaimPendingForward(ctx, "in-claim", seen); err != nil || !ok {
+		t.Fatalf("retry claim = %v, %v; want claimed", ok, err)
+	}
+	if ok, err := s.ClaimNewForward(ctx, "in-claim"); err != nil || ok {
+		t.Fatalf("worker claim after retry = %v, %v; want refused", ok, err)
+	}
+	if ok, err := s.ClaimPendingForward(ctx, "in-claim", seen); err != nil || ok {
+		t.Fatalf("second retry claim on a stale read = %v, %v; want refused", ok, err)
+	}
+
+	// The usual order: the worker claims, and a retry holding the insert-time
+	// read is refused.
+	if _, err := s.InsertForward(ctx, "in-claim-2", 12, "GPOOL", "GFROM", "1.0000000", "native", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT updated_at FROM forwards WHERE tx_hash = 'in-claim-2'`).Scan(&seen); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.ClaimNewForward(ctx, "in-claim-2"); err != nil || !ok {
+		t.Fatalf("worker claim = %v, %v; want claimed", ok, err)
+	}
+	if ok, err := s.ClaimPendingForward(ctx, "in-claim-2", seen); err != nil || ok {
+		t.Fatalf("retry claim after worker = %v, %v; want refused", ok, err)
+	}
+}
+
+// A recorded deposit whose worker never ran (the process died with it queued)
+// is handed to the retry worker once it has been untouched for five minutes.
+func TestGetPendingRetries_picksUpUntouchedPending(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	for _, h := range []string{"in-orphan", "in-fresh"} {
+		if _, err := s.InsertForward(ctx, h, 13, "GPOOL", "GFROM", "1.0000000", "native", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE forwards SET created_at = NOW() - INTERVAL '6 minutes', updated_at = NOW() - INTERVAL '6 minutes'
+		WHERE tx_hash = 'in-orphan'`); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetPendingRetries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].TxHash != "in-orphan" {
+		t.Fatalf("pending retries = %v, want only in-orphan", got)
+	}
+	if ok, err := s.ClaimPendingForward(ctx, "in-orphan", got[0].UpdatedAt); err != nil || !ok {
+		t.Fatalf("retry claim with the row it read = %v, %v; want claimed", ok, err)
+	}
+}
