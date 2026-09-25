@@ -104,6 +104,7 @@ Not needed. The relay controls the pooled G-address and is both the signer and f
 - `StreamPayments` with `join=transactions` embeds memo data per event (no extra HTTP call per payment)
 - On startup: read last saved cursor from DB, reconnect from that point — no missed events on restart
 - On any stream error: 5-second backoff then reconnect from last cursor
+- Each deposit is written to `forwards` before its cursor is saved; if that write fails the stream stops and replays from the last saved cursor, so a deposit is never skipped without a record
 - wallet-backend is NOT used for the deposit hot path
 
 ### Multiple Pooled Addresses

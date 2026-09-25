@@ -30,18 +30,36 @@ import (
 // forwards may sit waiting for ledger inclusion at once.
 const forwardWorkers = 32
 
-// forwardQueue bounds how many payments can wait for a worker. Horizon replays
-// from the saved cursor on reconnect, so a full queue means the stream blocks
-// briefly rather than events being dropped.
+// forwardQueue bounds how many payments can wait for a worker. Every queued
+// payment is already recorded in forwards, and Horizon replays from the saved
+// cursor on reconnect, so a full queue means the stream blocks briefly rather
+// than events being dropped.
 const forwardQueue = 256
+
+// watcherStore is the subset of store.Store the watcher uses.
+type watcherStore interface {
+	GetCursor(ctx context.Context, poolAddress string) (string, error)
+	UpsertCursor(ctx context.Context, poolAddress, cursor string) error
+	InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string, landedAt time.Time) (bool, error)
+}
+
+// depositForwarder is the part of forwarder.Forwarder the workers call.
+type depositForwarder interface {
+	ForwardRecorded(ctx context.Context, poolAddress, txHash string, memoID uint64, fromAddress, amount, asset string, landedAt time.Time)
+}
+
+// paymentStreamer is the part of horizonclient.Client the watcher uses.
+type paymentStreamer interface {
+	StreamPayments(ctx context.Context, request horizonclient.OperationRequest, handler horizonclient.OperationHandler) error
+}
 
 // Watcher opens a Horizon SSE stream for one pool address and hands each inbound
 // payment to a bounded pool of forwarder workers.
 type Watcher struct {
 	pool      config.PoolAccount
-	store     *store.Store
-	forwarder *forwarder.Forwarder
-	horizon   *horizonclient.Client
+	store     watcherStore
+	forwarder depositForwarder
+	horizon   paymentStreamer
 	work      *lifecycle.Tracker
 
 	jobs chan forwardJob
@@ -115,10 +133,11 @@ func (w *Watcher) startWorkers(intake context.Context) {
 	}
 }
 
-// forward runs one job. This watcher only sees payments to its own pool, so
-// that is the pool holding the money for every job it dispatches.
+// forward runs one job, whose forwards row handle already inserted. This
+// watcher only sees payments to its own pool, so that is the pool holding the
+// money for every job it dispatches.
 func (w *Watcher) forward(ctx context.Context, job forwardJob) {
-	w.forwarder.Forward(ctx, w.pool.Address, job.txHash, job.memoID, job.from, job.amount, job.asset, job.landedAt)
+	w.forwarder.ForwardRecorded(ctx, w.pool.Address, job.txHash, job.memoID, job.from, job.amount, job.asset, job.landedAt)
 }
 
 // Run starts the SSE stream and reconnects automatically on any error.
@@ -160,13 +179,30 @@ func (w *Watcher) stream(ctx context.Context) error {
 		Join:       "transactions", // embeds memo data on each event — no extra HTTP call
 	}
 
-	return w.horizon.StreamPayments(ctx, req, func(op operations.Operation) {
-		w.handle(ctx, op)
+	// A deposit that can't be recorded must not have the cursor saved past it,
+	// or it is never seen again. The handler can't return an error, so it
+	// stops the stream instead: Run reconnects from the last saved cursor and
+	// the deposit is replayed.
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var handleErr error
+	err = w.horizon.StreamPayments(streamCtx, req, func(op operations.Operation) {
+		if handleErr != nil {
+			return
+		}
+		if handleErr = w.handle(ctx, op); handleErr != nil {
+			cancel()
+		}
 	})
+	if handleErr != nil {
+		return handleErr
+	}
+	return err
 }
 
-// handle processes one payment event from the SSE stream.
-func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
+// handle processes one payment event from the SSE stream. An error means the
+// deposit was not recorded and the cursor was not saved past it.
+func (w *Watcher) handle(ctx context.Context, op operations.Operation) error {
 	payment, ok := paymentTo(op, w.pool.Address)
 	if !ok {
 		// Not a payment into this pool: our own forwards and sweeps, or an
@@ -178,14 +214,14 @@ func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
 				"pool", w.pool.Address, "kind", kind, "op_id", op.GetBase().ID, "tx_hash", op.GetBase().TransactionHash)
 		}
 		w.saveCursor(ctx, op.PagingToken())
-		return
+		return nil
 	}
 
 	// The transaction (with memo) is embedded via join=transactions.
 	if payment.Transaction == nil {
 		slog.Warn("watcher: payment has no transaction data", "op_id", payment.ID)
 		w.saveCursor(ctx, op.PagingToken())
-		return
+		return nil
 	}
 
 	job := forwardJob{
@@ -210,12 +246,31 @@ func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
 			"from", payment.From, "amount", payment.Amount, "asset", job.asset)
 	}
 
+	// Record the deposit before the cursor moves past it. The in-memory queue
+	// then only ever holds deposits that are already in the table: if the
+	// process dies with them queued, the retry worker finds them 'pending'.
+	inserted, err := w.store.InsertForward(ctx, job.txHash, job.memoID, w.pool.Address, job.from, job.amount, job.asset, job.landedAt)
+	if err != nil {
+		return fmt.Errorf("record deposit %s: %w", job.txHash, err)
+	}
+	if !inserted {
+		// Recorded before: a replay after a restart, or a second instance
+		// streaming this pool. If that run never finished it, the retry
+		// worker does.
+		slog.Warn("watcher: deposit already recorded, not dispatching again", "deposit", job.txHash)
+		w.saveCursor(ctx, op.PagingToken())
+		return nil
+	}
+
 	// Hand off to a worker so the stream is not blocked by submission latency.
-	// The forwarder owns all retry logic and DB updates.
+	// The forwarder owns all retry logic and DB updates. If intake stops
+	// first the cursor is not saved; the row is already there, so the retry
+	// worker forwards it either way.
 	if !w.dispatch(ctx, job) {
-		return
+		return nil
 	}
 	w.saveCursor(ctx, op.PagingToken())
+	return nil
 }
 
 // paymentTo returns op as a payment into pool. Path payments count: the
