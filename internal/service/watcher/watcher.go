@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -45,6 +46,7 @@ type Watcher struct {
 	work      *lifecycle.Tracker
 
 	jobs chan forwardJob
+	live liveness
 }
 
 // forwardJob is one inbound payment waiting to be forwarded.
@@ -60,14 +62,48 @@ type forwardJob struct {
 // New builds a watcher. Its workers run on work rather than the stream's
 // context, so a shutdown stops new events without abandoning forwards already
 // in flight or payments already queued.
-func New(pool config.PoolAccount, st *store.Store, fwd *forwarder.Forwarder, hz *horizonclient.Client, work *lifecycle.Tracker) *Watcher {
-	return &Watcher{
+//
+// Each watcher gets its own Horizon client over the shared transport, so its
+// liveness reflects its own stream. Horizon's SSE stream is long-lived and
+// idles between payments, so the client has no Timeout — that applies to the
+// whole request, including reading the streaming body, and would abort a
+// healthy stream after a few seconds of inactivity. The watchdog in Run bounds
+// a stream that has gone silent instead.
+func New(pool config.PoolAccount, st *store.Store, fwd *forwarder.Forwarder, horizonURL string, transport http.RoundTripper, work *lifecycle.Tracker) *Watcher {
+	w := &Watcher{
 		pool:      pool,
 		store:     st,
 		forwarder: fwd,
-		horizon:   hz,
 		work:      work,
 		jobs:      make(chan forwardJob, forwardQueue),
+	}
+	w.horizon = &horizonclient.Client{
+		HorizonURL: horizonURL,
+		HTTP:       &http.Client{Transport: w.live.transport(transport)},
+	}
+	return w
+}
+
+// Pool is the address this watcher streams.
+func (w *Watcher) Pool() string { return w.pool.Address }
+
+// LastHeard reports when this watcher's stream last received anything from
+// Horizon. It advances on reconnects too, so it stays fresh on a pool that
+// sees no deposits at all.
+func (w *Watcher) LastHeard() time.Time { return w.live.LastHeard() }
+
+// watchdog forces a reconnect whenever the stream has been silent for
+// streamIdleTimeout, until ctx is cancelled.
+func (w *Watcher) watchdog(ctx context.Context) {
+	t := time.NewTicker(streamIdleTimeout / 4)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			w.live.closeIfIdle(streamIdleTimeout, w.pool.Address)
+		}
 	}
 }
 
@@ -125,7 +161,9 @@ func (w *Watcher) forward(ctx context.Context, job forwardJob) {
 // Call in a goroutine: go watcher.Run(ctx).
 func (w *Watcher) Run(ctx context.Context) {
 	slog.Info("watcher: starting", "pool", w.pool.Address, "workers", forwardWorkers)
+	w.live.touch() // the staleness clock starts now, not at the epoch
 	w.startWorkers(ctx)
+	go w.watchdog(ctx)
 	for {
 		if err := w.stream(ctx); err != nil {
 			slog.Error("watcher: stream error, reconnecting in 5s", "pool", w.pool.Address, "err", err)

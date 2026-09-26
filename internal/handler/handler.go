@@ -35,10 +35,28 @@ type Handler struct {
 	// Which pool a deposit lands on is fixed at intent creation, because the
 	// address is what the depositor is told to pay.
 	nextPool atomic.Uint64
+
+	// streams are the deposit watchers /health checks, and staleAfter is how
+	// long one may go without hearing from Horizon before it counts as down.
+	streams    []Stream
+	staleAfter time.Duration
+}
+
+// Stream is a deposit watcher as /health sees it.
+type Stream interface {
+	Pool() string
+	LastHeard() time.Time
 }
 
 func New(st *store.Store, cfg *config.Config) *Handler {
 	return &Handler{store: st, config: cfg}
+}
+
+// WatchStreams makes /health report unhealthy while any of streams has not
+// heard from Horizon for staleAfter. Call before serving.
+func (h *Handler) WatchStreams(staleAfter time.Duration, streams ...Stream) {
+	h.staleAfter = staleAfter
+	h.streams = streams
 }
 
 // pickPool returns the next pool account in rotation. Even distribution matters
@@ -108,18 +126,41 @@ type forwardSummary struct {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
+// Health answers 503 when the database is unreachable or any deposit stream
+// has been cut off from Horizon for longer than staleAfter; otherwise 200.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
+	body := map[string]any{"status": "ok"}
+	status := http.StatusOK
 	if err := h.store.Ping(ctx); err != nil {
 		slog.Error("health: db ping failed", "err", err)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"status": "unhealthy",
-			"db":     err.Error(),
-		})
-		return
+		body["db"] = err.Error()
+		status = http.StatusServiceUnavailable
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	// A quiet pool legitimately sees no deposits for months, so this looks at
+	// whether the stream is alive, never at when a deposit last arrived. Pool
+	// addresses go to the log, not the response: /health is unauthenticated.
+	if stale := h.staleStreams(time.Now()); stale > 0 {
+		body["stale_streams"] = stale
+		status = http.StatusServiceUnavailable
+	}
+	if status != http.StatusOK {
+		body["status"] = "unhealthy"
+	}
+	writeJSON(w, status, body)
+}
+
+// staleStreams counts watchers that have not heard from Horizon in staleAfter.
+func (h *Handler) staleStreams(now time.Time) int {
+	n := 0
+	for _, s := range h.streams {
+		if silent := now.Sub(s.LastHeard()); silent > h.staleAfter {
+			slog.Error("health: deposit stream silent", "pool", s.Pool(), "silent", silent.Round(time.Second))
+			n++
+		}
+	}
+	return n
 }
 
 // CreateIntent creates a new funding intent: a unique memo_id tied to a C-address

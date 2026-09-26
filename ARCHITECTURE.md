@@ -76,7 +76,7 @@ updated_at   timestamptz
 ### API Surface
 - `POST /intents` — called by latch-api to create a funding session. Accepts `c_address`, optional `expected_amt`, `external_id`, and `expires_in` (seconds). Returns `intent_id`, `memo_id`, `pool_address`, `expires_at`.
 - `GET /deposit/status/{memo_id}` — returns the intent (status, expires_at, c_address) plus all forward records for that memo_id. Polled by latch-api to surface deposit state to the user.
-- `GET /health` — liveness probe
+- `GET /health` — liveness probe: 503 if the DB is unreachable or any pool's Horizon stream has been silent for 5 min (a watchdog reconnects a stream after 2 min of silence, so an idle pool stays healthy)
 
 ### Who Calls the Relayer
 - **latch-api** calls `POST /intents` when a user initiates a funding session

@@ -45,7 +45,7 @@ make docker   # build Docker image
 |--------|------|-------------|
 | `POST` | `/intents` | Create a deposit intent, returns memo_id + pool address |
 | `GET`  | `/deposit/status/{memo_id}` | Check intent status |
-| `GET`  | `/health` | Health check |
+| `GET`  | `/health` | Health check: 503 if the DB is unreachable or a deposit stream has heard nothing from Horizon for 5 min |
 
 ## Architecture
 

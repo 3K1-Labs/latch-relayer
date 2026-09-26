@@ -82,25 +82,19 @@ func main() {
 		slog.Error("trustline missing for an accepted asset", "detail", p)
 	}
 
-	// Horizon's SSE stream is long-lived and idles between payments, so it can't
-	// share horizonHTTP's 10s Timeout — that applies to the whole request,
-	// including reading the streaming body, and would abort a healthy stream
-	// after 10s of inactivity. Reuse the transport (dial/keep-alive settings)
-	// but rely on ctx cancellation, not a fixed deadline, to bound the stream.
-	hzStream := &horizonclient.Client{
-		HorizonURL: cfg.HorizonURL,
-		HTTP:       &http.Client{Transport: stellarTransport},
-	}
-
 	// ── 5. Background workers ─────────────────────────────────────────────────
 	var workers sync.WaitGroup
 
 	// Retry worker polls every RETRY_INTERVAL_SEC (default 10s) for pending_retry forwards.
 	workers.Go(func() { retry.NewWorker(st, fwd, cfg.RetryInterval).Run(ctx) })
 
-	// One SSE watcher goroutine per pool address.
+	// One SSE watcher goroutine per pool address. Each has its own stream
+	// client (see watcher.New); /health reports any that has gone silent.
+	var streams []handler.Stream
 	for _, pa := range cfg.PoolAccounts {
-		workers.Go(func() { watcher.New(pa, st, fwd, hzStream, work).Run(ctx) })
+		w := watcher.New(pa, st, fwd, cfg.HorizonURL, stellarTransport, work)
+		streams = append(streams, w)
+		workers.Go(func() { w.Run(ctx) })
 	}
 
 	// ── 6. HTTP server ────────────────────────────────────────────────────────
@@ -111,6 +105,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	h := handler.New(st, cfg)
+	h.WatchStreams(watcher.StaleAfter, streams...)
 	h.RegisterRoutes(mux)
 	mux.Handle("GET /metrics", m.Handler())
 
