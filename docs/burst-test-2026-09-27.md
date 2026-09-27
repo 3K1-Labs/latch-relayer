@@ -50,12 +50,16 @@ The sequencer re-reading a stale sequence is the trigger; `transfer`'s own comme
 - **Forwards:** two deposits of the same amount to the same smart account close together, during pool contention. For example, a user funds twice, or an on-ramp splits an order.
 - **Recovery sweeps:** these are the same shape (pool → recovery address, same amount, memo `unknown-memo`), so two same-amount unroutable deposits can collapse into one sweep.
 
-### Proposed fixes (in order of importance)
-1. **One on-chain transaction settles at most one forward.** Add a unique index on the recorded submission hash. If `RecordSubmission` conflicts, treat it as contention and rebuild with a fresh sequence. This closes the hole whatever the trigger.
-2. **Make every outbound transaction unique:** carry the inbound deposit hash as a `MemoHash`. Hashes then can't collide, and each on-chain forward traces back to its deposit.
-3. **Never move the sequencer backwards on resync.** Take `max(local, fetched)`, or read the sequence from RPC `getLedgerEntries` instead of Horizon.
+### Fix
+Fixed in #59:
+- **One on-chain transaction settles at most one forward.** `RecordSubmission` refuses a hash that another forward holds, in flight or settled.
+- The losing forward sends nothing and is re-queued as contention, without spending its retry budget.
+- Regression tests cover this at both the forwarder and the store level.
 
-Each fix needs a test that reproduces it: two same-amount forwards to one C-address with the sequence resynced between them, asserting two distinct transfers.
+Considered and ruled out:
+- **Make every transfer unique with the deposit hash as a memo.** Soroban transactions reject memos; testnet RPC returns "Soroban transactions do not support memos". Recovery sweeps are classic payments, and `main` already gives them this memo.
+
+Follow-up: stop the resync from handing out a number that is still in flight. For example, remember the highest accepted sequence until its deadline passes. This saves the wasted retries; correctness no longer depends on it.
 
 ### Reconciliation
 The 3 XLM for the memos above is still in pool `GB3AET…6I5`, and the relayer database shows those forwards as `done`. This is testnet, but the same state on mainnet would need a manual re-forward.
