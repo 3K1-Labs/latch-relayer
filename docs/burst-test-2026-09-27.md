@@ -48,7 +48,7 @@ The sequencer re-reading a stale sequence is the trigger; `transfer`'s own comme
 
 **Real-world exposure:**
 - **Forwards:** two deposits of the same amount to the same smart account close together, during pool contention. For example, a user funds twice, or an on-ramp splits an order.
-- **Recovery sweeps:** these are the same shape (pool → recovery address, same amount, memo `unknown-memo`), so two same-amount unroutable deposits can collapse into one sweep.
+- **Recovery sweeps:** mostly safe. On `main` they carry the deposit hash as a memo, so each is unique. The exception is one inbound transaction paying the pool twice with the same amount, and the #59 guard covers that too.
 
 ### Fix
 Fixed in #59:

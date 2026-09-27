@@ -19,3 +19,6 @@ coverage.out
 # Local directories not for version control
 learning/
 /.claude/
+
+# Internal-only notes, not meant for the public repo
+MOAT.md
