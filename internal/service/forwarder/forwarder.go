@@ -102,6 +102,9 @@ type Forwarder struct {
 
 	seqOnce   sync.Once
 	sequencer *sequencer
+
+	chanOnce sync.Once
+	channels *channelPool
 }
 
 func New(st *store.Store, cfg *config.Config, hz *horizonclient.Client, rpc *rpcclient.Client) *Forwarder {
@@ -117,6 +120,21 @@ func (f *Forwarder) seq() *sequencer {
 		}
 	})
 	return f.sequencer
+}
+
+// channelPool returns the forward channels from config, or nil when none are
+// configured and forwards are sourced from the pool.
+func (f *Forwarder) channelPool() *channelPool {
+	f.chanOnce.Do(func() {
+		if f.channels == nil && f.config != nil {
+			kps := make([]*keypair.Full, len(f.config.Channels))
+			for i, ch := range f.config.Channels {
+				kps[i] = ch.Keypair
+			}
+			f.channels = newChannelPool(kps)
+		}
+	})
+	return f.channels
 }
 
 // ── Error classification ─────────────────────────────────────────────
@@ -623,9 +641,29 @@ func parseAsset(asset string) (txnbuild.Asset, error) {
 // submit pays amount of asset from poolAddress to the C-address cAddress via
 // the asset's SAC transfer. inboundHash identifies the forward row the transfer
 // is recorded against before it is sent; see RecordSubmission.
+//
+// With channels configured (#48) the transfer is sent from a leased channel
+// instead of the pool, so forwards are not limited to one per pool per ledger.
+// The channel is held until the transfer settles: one in flight per channel.
 func (f *Forwarder) submit(ctx context.Context, inboundHash, cAddress, poolAddress, amount, asset string) (string, error) {
-	return f.transfer(ctx, inboundHash, poolAddress, func(src *txnbuild.SimpleAccount, validUntil time.Time) (prepared, error) {
-		return f.prepareContractPayment(ctx, src, cAddress, amount, asset, validUntil)
+	chans := f.channelPool()
+	if chans == nil {
+		return f.transfer(ctx, inboundHash, poolAddress, func(src *txnbuild.SimpleAccount, validUntil time.Time) (prepared, error) {
+			return f.prepareContractPayment(ctx, src, cAddress, amount, asset, validUntil)
+		})
+	}
+
+	pool, err := f.keypairFor(poolAddress)
+	if err != nil {
+		return "", permanent(err)
+	}
+	ch, release, err := chans.acquire(ctx)
+	if err != nil {
+		return "", transient(err)
+	}
+	defer release()
+	return f.transfer(ctx, inboundHash, ch.Address(), func(src *txnbuild.SimpleAccount, validUntil time.Time) (prepared, error) {
+		return f.prepareChannelPayment(ctx, src, ch, pool, cAddress, amount, asset, validUntil)
 	})
 }
 
@@ -634,22 +672,36 @@ func (f *Forwarder) submit(ctx context.Context, inboundHash, cAddress, poolAddre
 type prepared struct {
 	env    xdr.TransactionEnvelope
 	setFee func(env *xdr.TransactionEnvelope, inclusionFee uint32)
+
+	// sign turns the priced envelope into what is sent. Nil means sign it as
+	// the source account, which must then be a pool.
+	sign func(env xdr.TransactionEnvelope) (signedTx, error)
 }
 
-// transfer runs one outbound payment out of poolAddress end to end: draw the
-// pool's next sequence number, build the transaction with prepare, then sign,
-// record, send and confirm it, bumping the fee on tx_insufficient_fee. Forwards
-// and recovery sweeps share it, so both get the same guarantee: the transaction
-// is recorded against inboundHash before it is sent, and an unknown outcome is
-// returned as unconfirmed rather than retried.
+// signedTx is a transaction ready to send: its base64 envelope and the hash
+// the network knows it by (the outer hash, for a fee-bump).
+type signedTx struct {
+	b64, hash string
+}
+
+// transfer runs one outbound payment from source end to end: draw source's next
+// sequence number, build the transaction with prepare, then sign, record, send
+// and confirm it, bumping the fee on tx_insufficient_fee. Forwards and recovery
+// sweeps share it, so both get the same guarantee: the transaction is recorded
+// against inboundHash before it is sent, and an unknown outcome is returned as
+// unconfirmed rather than retried.
+//
+// source is a pool, or a channel whose prepare supplies its own signing.
 func (f *Forwarder) transfer(
 	ctx context.Context,
 	inboundHash, poolAddress string,
 	prepare func(src *txnbuild.SimpleAccount, validUntil time.Time) (prepared, error),
 ) (hash string, err error) {
-	kp, err := f.keypairFor(poolAddress)
-	if err != nil {
-		return "", permanent(err)
+	var kp *keypair.Full
+	if chans := f.channelPool(); chans == nil || !chans.addrs[poolAddress] {
+		if kp, err = f.keypairFor(poolAddress); err != nil {
+			return "", permanent(err)
+		}
 	}
 
 	// Sequence comes from the shared sequencer, not a per-attempt Horizon read.
@@ -695,6 +747,13 @@ func (f *Forwarder) transfer(
 	if err != nil {
 		return "", err
 	}
+	sign := p.sign
+	if sign == nil {
+		if kp == nil {
+			return "", permanent(fmt.Errorf("no signer for source %s", poolAddress))
+		}
+		sign = func(env xdr.TransactionEnvelope) (signedTx, error) { return f.signAs(env, kp) }
+	}
 
 	// ── Submit with fee-bump retry ────────────────────────────────────────────
 	// Only the inclusion fee changes between attempts (a Soroban transaction
@@ -702,7 +761,11 @@ func (f *Forwarder) transfer(
 	inclusionFee := uint32(txnbuild.MinBaseFee)
 	for feeAttempt := range maxFeeRetries + 1 {
 		p.setFee(&p.env, inclusionFee)
-		hash, err = f.signAndSend(ctx, inboundHash, kp, p.env, validUntil)
+		var st signedTx
+		if st, err = sign(p.env); err != nil {
+			return "", err
+		}
+		hash, err = f.signAndSend(ctx, inboundHash, st, validUntil)
 		if err == nil {
 			// Accepted by the network, so this sequence number is spent and the
 			// next forward may proceed. Confirmation is polled without the lock.
@@ -819,7 +882,37 @@ func (f *Forwarder) prepareContractPayment(
 	}, nil
 }
 
-// signAndSend signs a fully priced envelope and submits it via Stellar RPC.
+// signAs signs a fully priced envelope as kp, its source account. Re-parsing
+// makes the signature cover the updated fee and footprint.
+func (f *Forwarder) signAs(env xdr.TransactionEnvelope, kp *keypair.Full) (signedTx, error) {
+	updatedBytes, err := env.MarshalBinary()
+	if err != nil {
+		return signedTx{}, permanent(fmt.Errorf("marshal updated tx: %w", err))
+	}
+	generic, err := txnbuild.TransactionFromXDR(base64.StdEncoding.EncodeToString(updatedBytes))
+	if err != nil {
+		return signedTx{}, permanent(fmt.Errorf("parse updated tx: %w", err))
+	}
+	tx, ok := generic.Transaction()
+	if !ok {
+		return signedTx{}, permanent(fmt.Errorf("updated envelope is not a simple transaction"))
+	}
+	if tx, err = tx.Sign(f.config.NetworkPassphrase, kp); err != nil {
+		return signedTx{}, permanent(fmt.Errorf("sign tx: %w", err))
+	}
+	b64, err := tx.Base64()
+	if err != nil {
+		return signedTx{}, permanent(fmt.Errorf("marshal signed tx: %w", err))
+	}
+	hash, err := tx.HashHex(f.config.NetworkPassphrase)
+	if err != nil {
+		return signedTx{}, permanent(fmt.Errorf("hash tx: %w", err))
+	}
+	return signedTx{b64: b64, hash: hash}, nil
+}
+
+// signAndSend records a signed transaction against its forward and submits it
+// via Stellar RPC.
 //
 // submits via rpc.SendTransaction (not horizon.SubmitTransaction) so we receive
 // Stellar-native status codes including TRY_AGAIN_LATER and ERROR result codes.
@@ -834,39 +927,10 @@ func (f *Forwarder) prepareContractPayment(
 func (f *Forwarder) signAndSend(
 	ctx context.Context,
 	inboundHash string,
-	kp *keypair.Full,
-	env xdr.TransactionEnvelope,
+	st signedTx,
 	validUntil time.Time,
 ) (string, error) {
-	// Marshal, re-parse, and sign so the signature covers the updated fee and footprint.
-	updatedBytes, err := env.MarshalBinary()
-	if err != nil {
-		return "", permanent(fmt.Errorf("marshal updated tx: %w", err))
-	}
-	generic, err := txnbuild.TransactionFromXDR(base64.StdEncoding.EncodeToString(updatedBytes))
-	if err != nil {
-		return "", permanent(fmt.Errorf("parse updated tx: %w", err))
-	}
-	tx, ok := generic.Transaction()
-	if !ok {
-		return "", permanent(fmt.Errorf("updated envelope is not a simple transaction"))
-	}
-	tx, err = tx.Sign(f.config.NetworkPassphrase, kp)
-	if err != nil {
-		return "", permanent(fmt.Errorf("sign tx: %w", err))
-	}
-
-	signedEnv := tx.ToXDR()
-	signedBytes, err := signedEnv.MarshalBinary()
-	if err != nil {
-		return "", permanent(fmt.Errorf("marshal signed tx: %w", err))
-	}
-	signedB64 := base64.StdEncoding.EncodeToString(signedBytes)
-
-	txHash, err := tx.HashHex(f.config.NetworkPassphrase)
-	if err != nil {
-		return "", permanent(fmt.Errorf("hash tx: %w", err))
-	}
+	signedB64, txHash := st.b64, st.hash
 	if err := f.store.RecordSubmission(ctx, inboundHash, txHash, validUntil); err != nil {
 		// This exact transaction already belongs to another deposit: the
 		// sequencer handed out a number still in flight (resynced from a ledger
@@ -978,6 +1042,14 @@ func classifyResultXDR(resultXDR string) error {
 	}
 
 	code := result.Result.Code
+	// A fee-bumped forward (#48) that failed reports why in its inner result:
+	// the channel's txBadSeq must read as contention, not as a permanent
+	// txFEE_BUMP_INNER_FAILED.
+	if code == xdr.TransactionResultCodeTxFeeBumpInnerFailed {
+		if inner, ok := result.Result.GetInnerResultPair(); ok {
+			code = inner.Result.Result.Code
+		}
+	}
 	switch code {
 	// ── Fee error — handled by the fee-bump loop in submit() ──────────────────
 	case xdr.TransactionResultCodeTxInsufficientFee:

@@ -19,23 +19,12 @@ import (
 	"github.com/latch/relayer/internal/store"
 )
 
-// forwardWorkers is how many forwards run at once per pool account.
-//
-// Previously every inbound payment got its own goroutine with no ceiling, so a
-// burst of deposits produced a burst of concurrent submissions on one account.
-// A bound still matters: unbounded goroutines against a rate-limited Soroban
-// RPC produce TRY_AGAIN_LATER storms rather than throughput. Sends are already
-// serialised per pool by the sequencer, so these workers overlap the slow part
-// — simulation and the confirmation poll — and the number mainly sets how many
-// forwards may sit waiting for ledger inclusion at once.
-const forwardWorkers = 32
-
-// forwardQueue bounds how many payments can wait for a worker. Horizon replays
-// from the saved cursor on reconnect, so a full queue means the stream blocks
-// briefly rather than events being dropped.
+// forwardQueue bounds how many payments can wait for a worker. Polling resumes
+// from the saved cursor after a restart, so a full queue means the poll blocks
+// briefly rather than payments being dropped.
 const forwardQueue = 256
 
-// Watcher opens a Horizon SSE stream for one pool address and hands each inbound
+// Watcher polls Horizon for one pool address's payments and hands each inbound
 // payment to a bounded pool of forwarder workers.
 type Watcher struct {
 	pool      config.PoolAccount
@@ -43,6 +32,7 @@ type Watcher struct {
 	forwarder *forwarder.Forwarder
 	horizon   *horizonclient.Client
 	work      *lifecycle.Tracker
+	workers   int
 
 	jobs chan forwardJob
 }
@@ -60,9 +50,16 @@ type forwardJob struct {
 // New builds a watcher. Its workers run on work rather than the stream's
 // context, so a shutdown stops new events without abandoning forwards already
 // in flight or payments already queued.
-func New(pool config.PoolAccount, st *store.Store, fwd *forwarder.Forwarder, hz *horizonclient.Client, work *lifecycle.Tracker) *Watcher {
+//
+// workers is how many forwards run at once for this pool. A bound matters:
+// unbounded goroutines against a rate-limited RPC produce TRY_AGAIN_LATER storms
+// rather than throughput. Without channels, sends are serialised per pool anyway,
+// so workers overlap only simulation and the confirmation poll; with channels
+// each worker can hold one, so it must be at least the channel count.
+func New(pool config.PoolAccount, st *store.Store, fwd *forwarder.Forwarder, hz *horizonclient.Client, work *lifecycle.Tracker, workers int) *Watcher {
 	return &Watcher{
 		pool:      pool,
+		workers:   max(workers, 1),
 		store:     st,
 		forwarder: fwd,
 		horizon:   hz,
@@ -94,7 +91,7 @@ func (w *Watcher) dispatch(ctx context.Context, job forwardJob) bool {
 // submitted is followed to completion. Drain bounds all of this by the
 // shutdown deadline.
 func (w *Watcher) startWorkers(intake context.Context) {
-	for range forwardWorkers {
+	for range w.workers {
 		w.work.Go(func(workCtx context.Context) {
 			for {
 				select {
@@ -121,14 +118,22 @@ func (w *Watcher) forward(ctx context.Context, job forwardJob) {
 	w.forwarder.Forward(ctx, w.pool.Address, job.txHash, job.memoID, job.from, job.amount, job.asset, job.landedAt)
 }
 
-// Run starts the SSE stream and reconnects automatically on any error.
+// pageSize is Horizon's maximum page size.
+const pageSize = 200
+
+// pollGap is how long the watcher waits after a page that was not full. New
+// payments can only appear when a ledger closes (about every 5s), so a second
+// keeps detection well inside one ledger at one request per second per pool.
+const pollGap = time.Second
+
+// Run polls the pool's payments and restarts automatically on any error.
 // Call in a goroutine: go watcher.Run(ctx).
 func (w *Watcher) Run(ctx context.Context) {
-	slog.Info("watcher: starting", "pool", w.pool.Address, "workers", forwardWorkers)
+	slog.Info("watcher: starting", "pool", w.pool.Address, "workers", w.workers)
 	w.startWorkers(ctx)
 	for {
-		if err := w.stream(ctx); err != nil {
-			slog.Error("watcher: stream error, reconnecting in 5s", "pool", w.pool.Address, "err", err)
+		if err := w.poll(ctx); err != nil {
+			slog.Error("watcher: poll error, retrying in 5s", "pool", w.pool.Address, "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -139,33 +144,78 @@ func (w *Watcher) Run(ctx context.Context) {
 	}
 }
 
-// stream opens one SSE connection and processes events until an error or ctx cancel.
-// On reconnect, Run calls this again from the last saved cursor so no events are missed.
-func (w *Watcher) stream(ctx context.Context) error {
+// poll reads the pool's payments page by page from the last saved cursor until
+// an error or ctx cancel, so a restart resumes exactly where it stopped.
+//
+// Paged requests rather than Horizon's SSE stream: the stream delivered a burst
+// at about 9 payments/s (21/s with a 200-record page), while one paged request
+// returns 200 in under 2s. With channels (#48) forwarding 100 per ledger, the
+// stream had become the relayer's bottleneck. A full page is followed at once
+// by the next, so a backlog drains at request speed.
+func (w *Watcher) poll(ctx context.Context) error {
 	cursor, err := w.store.GetCursor(ctx, w.pool.Address)
 	if err != nil {
 		return err
 	}
 	if cursor == "" {
-		// "now" tells Horizon to stream only new events from this moment forward.
-		// Using "0" would replay all historical payments — expensive and unnecessary.
-		cursor = "now"
+		// No saved position: start from the pool's latest payment, the paged
+		// equivalent of streaming from "now". Starting at the beginning would
+		// replay the pool's whole history.
+		if cursor, err = w.latestCursor(); err != nil {
+			return err
+		}
 	}
+	slog.Info("watcher: polling", "pool", w.pool.Address, "cursor", cursor)
 
-	slog.Info("watcher: connecting", "pool", w.pool.Address, "cursor", cursor)
-
-	req := horizonclient.OperationRequest{
-		ForAccount: w.pool.Address,
-		Cursor:     cursor,
-		Join:       "transactions", // embeds memo data on each event — no extra HTTP call
+	for {
+		page, err := w.horizon.Payments(horizonclient.OperationRequest{
+			ForAccount: w.pool.Address,
+			Cursor:     cursor,
+			Order:      horizonclient.OrderAsc,
+			Limit:      pageSize,
+			Join:       "transactions", // embeds memo data on each record — no extra HTTP call
+		})
+		if err != nil {
+			return err
+		}
+		for _, op := range page.Embedded.Records {
+			w.handle(ctx, op)
+			if ctx.Err() != nil {
+				// Intake stopped mid-page; handle saved the cursor only for
+				// payments it queued, so the rest are read again after restart.
+				return nil
+			}
+			cursor = op.PagingToken()
+		}
+		if len(page.Embedded.Records) == pageSize {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(pollGap):
+		}
 	}
-
-	return w.horizon.StreamPayments(ctx, req, func(op operations.Operation) {
-		w.handle(ctx, op)
-	})
 }
 
-// handle processes one payment event from the SSE stream.
+// latestCursor returns the paging token of the pool's most recent payment, or
+// "0" for a pool that has never had one.
+func (w *Watcher) latestCursor() (string, error) {
+	page, err := w.horizon.Payments(horizonclient.OperationRequest{
+		ForAccount: w.pool.Address,
+		Order:      horizonclient.OrderDesc,
+		Limit:      1,
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(page.Embedded.Records) == 0 {
+		return "0", nil
+	}
+	return page.Embedded.Records[0].PagingToken(), nil
+}
+
+// handle processes one payment record from Horizon.
 func (w *Watcher) handle(ctx context.Context, op operations.Operation) {
 	payment, ok := paymentTo(op, w.pool.Address)
 	if !ok {
