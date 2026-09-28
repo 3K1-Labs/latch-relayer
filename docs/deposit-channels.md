@@ -172,7 +172,7 @@ The watcher now **polls pages** instead: 200 per request, the next page straight
 |---|---|---|
 | Pool-sourced (before channels) | 32,308 | 12,714 |
 | Channel, auth entry (#60 as first written) | 108,382 | 19,449 |
-| Channel, txnbuild bid (#55) | ~94,000 | ~13,100 |
+| Channel, txnbuild bid (#55; computed from the same inner fee) | 86,824 | same as below |
 | **Channel, minimal bid (#60 now)** | **42,408** | **13,128** |
 
 The network charges the going rate, not the bid, so outside surge pricing the charge is about the same either way. The bid matters under **surge pricing**, when the inclusion fee rises toward it: the old bid would have let a busy network charge the pool more than twice as much per forward.
