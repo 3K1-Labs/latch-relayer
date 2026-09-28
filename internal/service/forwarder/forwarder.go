@@ -888,6 +888,9 @@ func (f *Forwarder) transferViaChannel(
 		}
 		return "", err
 	}
+	// Not reached: the last fee attempt never continues, so every path
+	// returns inside the loop. Go still needs a terminating statement here,
+	// and this one is the safe outcome if that ever changes.
 	release(nil, true)
 	return "", transient(fmt.Errorf("insufficient fee after %d retries", maxFeeRetries))
 }
