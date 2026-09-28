@@ -51,6 +51,44 @@ func New(namespace string) *Metrics {
 	return m
 }
 
+// DBPoolStats is what RegisterDBPool reads from the database connection pool
+// on each scrape: pgxpool.Stat's fields, so this package need not import pgx.
+type DBPoolStats struct {
+	MaxConns      int32
+	AcquiredConns int32
+	// WaitedAcquires counts acquires that found no idle connection and had to
+	// wait for one to be released or opened.
+	WaitedAcquires int64
+	// WaitTime is the total time those acquires spent waiting.
+	WaitTime time.Duration
+}
+
+// RegisterDBPool exposes the database connection pool, so it is visible when
+// the pool (DB_MAX_CONNS) rather than the network limits throughput. With
+// channels (#48) each forward makes several short queries, so a pool smaller
+// than the forward concurrency makes workers queue for connections.
+// relayer_db_pool_wait_seconds_total rising during a burst is that queue.
+func (m *Metrics) RegisterDBPool(read func() DBPoolStats) {
+	gauge := func(name, help string, v func(DBPoolStats) float64) prometheus.Collector {
+		return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: name, Help: help},
+			func() float64 { return v(read()) })
+	}
+	counter := func(name, help string, v func(DBPoolStats) float64) prometheus.Collector {
+		return prometheus.NewCounterFunc(prometheus.CounterOpts{Name: name, Help: help},
+			func() float64 { return v(read()) })
+	}
+	m.Registry.MustRegister(
+		gauge("relayer_db_pool_max_conns", "Configured maximum database connections (DB_MAX_CONNS).",
+			func(s DBPoolStats) float64 { return float64(s.MaxConns) }),
+		gauge("relayer_db_pool_acquired_conns", "Database connections currently in use.",
+			func(s DBPoolStats) float64 { return float64(s.AcquiredConns) }),
+		counter("relayer_db_pool_waited_acquires_total", "Connection acquires that had to wait because every connection was in use.",
+			func(s DBPoolStats) float64 { return float64(s.WaitedAcquires) }),
+		counter("relayer_db_pool_wait_seconds_total", "Total time spent waiting for a database connection because every connection was in use.",
+			func(s DBPoolStats) float64 { return s.WaitTime.Seconds() }),
+	)
+}
+
 // Handler serves the registry in the Prometheus text format.
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{})

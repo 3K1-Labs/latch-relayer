@@ -113,6 +113,15 @@ func main() {
 	// ── 6. HTTP server ────────────────────────────────────────────────────────
 	m := metrics.New(cfg.MetricsNamespace)
 	m.RegisterDeposit()
+	m.RegisterDBPool(func() metrics.DBPoolStats {
+		s := pool.Stat()
+		return metrics.DBPoolStats{
+			MaxConns:       s.MaxConns(),
+			AcquiredConns:  s.AcquiredConns(),
+			WaitedAcquires: s.EmptyAcquireCount(),
+			WaitTime:       s.EmptyAcquireWaitTime(),
+		}
+	})
 	draining := &httpx.Draining{}
 	limiter := httpx.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 
