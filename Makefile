@@ -1,4 +1,4 @@
-.PHONY: build test vet fmt lint docker docker-gasless run run-gasless migrate e2e sweep channels deposit-channels
+.PHONY: build test vet fmt lint docker docker-gasless run run-gasless migrate e2e e2e-live burst sweep channels
 
 build:
 	go build ./...
@@ -34,6 +34,16 @@ migrate:
 
 e2e:
 	go run ./scripts/e2e_test/main.go
+
+# Live testnet E2E through latch-api (reads e2e.env, then .env):
+# make e2e-live RUN=happy,nomemo TIMEOUT=5m
+e2e-live:
+	go run ./scripts/e2e_live $(if $(RUN),-run $(RUN)) $(if $(TIMEOUT),-timeout $(TIMEOUT))
+
+# Burst deposits straight at the relayer and time the forwards:
+# make burst N=50 C=CB... (CSV=burst.csv to keep per-deposit rows)
+burst:
+	go run ./scripts/burst $(if $(N),-n $(N)) $(if $(C),-c $(C)) $(if $(AMOUNT),-amount $(AMOUNT)) $(if $(CSV),-csv $(CSV))
 
 sweep:
 	go run ./scripts/sweep_test/main.go

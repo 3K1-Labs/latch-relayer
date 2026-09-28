@@ -87,6 +87,31 @@ func TestForward_nothingSentWithoutRecord(t *testing.T) {
 	}
 }
 
+// A transfer byte-identical to another deposit's (same pool, sequence, amount,
+// destination and deadline) must not be sent: the network would answer
+// DUPLICATE and both deposits would settle on the one transfer that landed.
+// Seen on testnet with a 50-deposit burst; three deposits were marked done and
+// never paid.
+func TestForward_claimedSubmissionIsNotSent(t *testing.T) {
+	rpc := successRPC(t, "out-hash")
+	f, st := forwarderWith(t, rpc)
+	st.recordErr = store.ErrSubmissionClaimed
+
+	forward(f, "in-claimed")
+
+	if rpc.sent != 0 {
+		t.Fatalf("sent %d transactions that belong to another deposit", rpc.sent)
+	}
+	if len(st.doneCalls) != 0 {
+		t.Fatalf("marked done %d time(s) without its own transfer", len(st.doneCalls))
+	}
+	// Losing the sequence number is contention: re-queued for a fresh build,
+	// not charged against the retry budget.
+	if len(st.requeueCalls) != 1 || len(st.markFailedCalls) != 0 {
+		t.Fatalf("want one uncharged requeue; requeue=%d markFailed=%d", len(st.requeueCalls), len(st.markFailedCalls))
+	}
+}
+
 func TestForward_rejectionClearsSubmission(t *testing.T) {
 	rpc := successRPC(t, "out-hash")
 	rpc.sendResp = rpcprotocol.SendTransactionResponse{
