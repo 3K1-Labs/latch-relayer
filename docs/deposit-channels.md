@@ -1,5 +1,7 @@
 # Channel accounts for deposit forwarding (#48)
 
+> **Status (2026-09-28).** Channels shipped in #55. There, the pool is the operation's source and signs the transaction itself, rather than an authorization entry as sketched in section 4. That is cheaper: 13,128 stroops charged per forward, against 19,449 with an auth entry. #60 adds two things on top: the watcher polls Horizon pages instead of streaming (section 5c), and the fee-bump bids exactly what the protocol requires (section 5d). The measurements in 5b and 5c were taken with #60's original auth-entry implementation.
+
 ## 1. The limit we hit
 
 Every forward today is one Soroban transaction whose **source account is the pool**. Stellar accepts **one Soroban transaction per source account per ledger**, and a ledger closes about every 5–6 s. So:
@@ -161,6 +163,21 @@ The watcher now **polls pages** instead: 200 per request, the next page straight
 - **The channel count**, which is configuration. Each channel carries one forward at a time.
 - **Channel turnaround, about 2 ledgers.** A channel is held until its transfer is confirmed. Two things add time there: confirmation polling (the SDK's back-off, 0.5–3.5 s) and the next forward's two simulations. So sustained throughput is about channels per 2 ledgers. The next lever is to confirm faster (a fixed 1 s poll) or to add channels.
 - **External limits:** RPC simulation latency and rate limits, Horizon's request rate, and ledger capacity and surge pricing. None of them pushed back at 100 per ledger.
+
+## 5d. The fee-bump bid (2026-09-28)
+
+`txnbuild.NewFeeBumpTransaction` requires the outer per-operation fee to be at least the inner transaction's **whole** fee. For Soroban that includes the resource fee, and it then adds the resource fee again. So its bid was about `2 × inner fee + resource fee`, far above what the protocol requires: `2 × inner inclusion fee + resource fee`. #60 builds the fee-bump envelope directly, with that minimal bid.
+
+| Forward (per transaction, stroops) | Bid (`max_fee`) | Charged |
+|---|---|---|
+| Pool-sourced (before channels) | 32,308 | 12,714 |
+| Channel, auth entry (#60 as first written) | 108,382 | 19,449 |
+| Channel, txnbuild bid (#55) | ~94,000 | ~13,100 |
+| **Channel, minimal bid (#60 now)** | **42,408** | **13,128** |
+
+The network charges the going rate, not the bid, so outside surge pricing the charge is about the same either way. The bid matters under **surge pricing**, when the inclusion fee rises toward it: the old bid would have let a busy network charge the pool more than twice as much per forward.
+
+Verified on testnet: a 200-deposit burst through 100 channels was accepted at the minimal bid, and all 200 were credited. That run's throughput (141/min) was set by the public testnet RPC, which was degraded at the time: simulations hit the 15 s timeout, and even `getLatestLedger` took 2–5 s. It says nothing about the relayer.
 
 ## 6. Things to verify early (before building it all)
 

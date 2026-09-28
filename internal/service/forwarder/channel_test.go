@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stellar/go-stellar-sdk/keypair"
 	hProtocol "github.com/stellar/go-stellar-sdk/protocols/horizon"
 	rpcprotocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
@@ -355,5 +356,89 @@ func TestChannel_feeRetriesExhaustedResyncs(t *testing.T) {
 		if !r.resync || r.seq != nil {
 			t.Fatalf("release = %+v, want resync", r)
 		}
+	}
+}
+
+// innerEnvelope builds a v1 transaction envelope with ops payments, the given
+// total fee and, when resourceFee > 0, Soroban data declaring that resource fee.
+func innerEnvelope(t *testing.T, ops int, fee uint32, resourceFee int64) xdr.TransactionEnvelope {
+	t.Helper()
+	src := keypair.MustRandom()
+	var built []txnbuild.Operation
+	for range ops {
+		built = append(built, &txnbuild.Payment{Destination: keypair.MustRandom().Address(), Amount: "1", Asset: txnbuild.NativeAsset{}})
+	}
+	tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
+		SourceAccount: &txnbuild.SimpleAccount{AccountID: src.Address(), Sequence: 1},
+		Operations:    built,
+		BaseFee:       txnbuild.MinBaseFee,
+		Preconditions: txnbuild.Preconditions{TimeBounds: txnbuild.NewTimeout(60)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := tx.ToXDR()
+	env.V1.Tx.Fee = xdr.Uint32(fee)
+	if resourceFee > 0 {
+		env.V1.Tx.Ext = xdr.TransactionExt{V: 1, SorobanData: &xdr.SorobanTransactionData{ResourceFee: xdr.Int64(resourceFee)}}
+	}
+	return env
+}
+
+// The fee-bump bids the inner inclusion rate for one more operation, plus the
+// resource fee once. txnbuild's constructor would bid the inner's whole fee per
+// operation and add the resource fee again: 108,382 stroops for the forward
+// below, against the 49,594 the protocol needs.
+func TestFeeBumpAtInnerRate_bidsWhatTheProtocolRequires(t *testing.T) {
+	pool := newTestKeypair(t).Address()
+	cases := []struct {
+		name        string
+		ops         int
+		fee         uint32
+		resourceFee int64
+		want        int64
+	}{
+		// Measured on testnet: inner fee 39,494 of which 29,394 is resources.
+		{"soroban forward", 1, 39_494, 29_394, 2*10_100 + 29_394},
+		{"classic sweep", 1, 100, 0, 200},
+		{"classic, several operations", 3, 300, 0, 400},
+		{"inclusion not divisible by ops rounds up", 3, 301, 0, 4 * 101},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, err := feeBumpAtInnerRate(innerEnvelope(t, tc.ops, tc.fee, tc.resourceFee), pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			env := fb.ToXDR()
+			if got := int64(env.FeeBump.Tx.Fee); got != tc.want {
+				t.Fatalf("outer fee = %d, want %d", got, tc.want)
+			}
+			if fb.FeeAccount() != pool {
+				t.Fatalf("fee account = %s, want %s", fb.FeeAccount(), pool)
+			}
+		})
+	}
+}
+
+// A forward sent through a channel carries that bid, not txnbuild's.
+func TestChannel_forwardBidsInnerRate(t *testing.T) {
+	rpc := successRPC(t, "out-channel")
+	f, _, _, _ := channelForwarder(t, rpc)
+
+	forward(f, "in-fee")
+
+	if rpc.sent != 1 {
+		t.Fatalf("sent %d, want 1", rpc.sent)
+	}
+	outer := feeBump(t, rpc.sentXDR[0]).ToXDR().FeeBump.Tx
+	inner := outer.InnerTx.V1.Tx
+	var resource int64
+	if inner.Ext.SorobanData != nil {
+		resource = int64(inner.Ext.SorobanData.ResourceFee)
+	}
+	want := 2*(int64(inner.Fee)-resource) + resource
+	if int64(outer.Fee) != want {
+		t.Fatalf("outer fee = %d, want %d (inclusion %d twice + resource %d once)", outer.Fee, want, int64(inner.Fee)-resource, resource)
 	}
 }
