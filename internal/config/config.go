@@ -59,21 +59,7 @@ type Config struct {
 	// old 30s default meant a straggler could sit half a minute waiting for a
 	// slot that was already free.
 	RetryInterval time.Duration
-
-	// Channels are powerless accounts used as the transaction source of
-	// forwards, so forwards are not limited to one per pool per ledger (#48).
-	// The pool still owns the funds: it signs the transfer's authorization entry
-	// and pays the fee by fee-bump. Derived from DEPOSIT_CHANNEL_SEED; empty
-	// means forwards are sourced from the pool, as before.
-	Channels []keys.Channel
-
-	// ForwardWorkers is how many forwards each pool's watcher runs at once.
-	// With channels it must be at least the channel count, or channels sit idle.
-	ForwardWorkers int
 }
-
-// forwardWorkersDefault is the per-pool forward concurrency without channels.
-const forwardWorkersDefault = 32
 
 // Load reads environment variables (and an optional .env file), validates all
 // required values, and returns the deposit bridge's Config. Fails fast on
@@ -129,52 +115,16 @@ func Load() (*Config, error) {
 		return nil, errors.New("at least one pool account is required (POOL_ADDRESS_1 + POOL_PRIVATE_KEY_1)")
 	}
 
-	if cfg.Channels, err = depositChannels(cfg.PoolAccounts); err != nil {
+	if cfg.Channels, err = depositChannels(cfg); err != nil {
 		return nil, err
 	}
-	if cfg.ForwardWorkers, err = envInt("FORWARD_WORKERS", max(forwardWorkersDefault, len(cfg.Channels))); err != nil {
-		return nil, err
-	}
-	if cfg.ForwardWorkers < 1 {
-		return nil, errors.New("FORWARD_WORKERS must be at least 1")
+	cfg.InstanceID = os.Getenv("INSTANCE_ID")
+	if cfg.InstanceID == "" {
+		host, _ := os.Hostname()
+		cfg.InstanceID = fmt.Sprintf("%s-%d", host, os.Getpid())
 	}
 
 	return cfg, nil
-}
-
-// depositChannels derives the forward channels from DEPOSIT_CHANNEL_SEED and
-// DEPOSIT_CHANNEL_COUNT, or returns none when the seed is unset.
-//
-// The seed must not be the gasless service's CHANNEL_SEED: both services would
-// derive the same accounts and send on each other's sequence numbers.
-func depositChannels(pools []PoolAccount) ([]keys.Channel, error) {
-	raw := os.Getenv("DEPOSIT_CHANNEL_SEED")
-	if raw == "" {
-		return nil, nil
-	}
-	if gasless := os.Getenv("CHANNEL_SEED"); gasless != "" && strings.EqualFold(gasless, raw) {
-		return nil, errors.New("DEPOSIT_CHANNEL_SEED must differ from the gasless service's CHANNEL_SEED")
-	}
-	seed, err := hex.DecodeString(raw)
-	if err != nil || len(seed) < keys.MinSeedBytes {
-		return nil, fmt.Errorf("DEPOSIT_CHANNEL_SEED must be hex, at least %d bytes (generate with: openssl rand -hex 32)", keys.MinSeedBytes)
-	}
-	count, err := envInt("DEPOSIT_CHANNEL_COUNT", 0)
-	if err != nil || count < 1 {
-		return nil, errors.New("DEPOSIT_CHANNEL_COUNT must be a positive integer when DEPOSIT_CHANNEL_SEED is set")
-	}
-	chans, err := keys.DeriveChannels(seed, count)
-	if err != nil {
-		return nil, err
-	}
-	for _, ch := range chans {
-		for _, p := range pools {
-			if ch.Address() == p.Address {
-				return nil, fmt.Errorf("channel %d derives to pool %s; use a different DEPOSIT_CHANNEL_SEED", ch.Index, p.Address)
-			}
-		}
-	}
-	return chans, nil
 }
 
 // acceptedAssets parses ACCEPTED_ASSETS, a comma-separated list of "native" and
