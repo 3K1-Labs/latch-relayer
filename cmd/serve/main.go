@@ -89,25 +89,16 @@ func main() {
 		enableChannels(ctx, pool, cfg, rpc, fwd)
 	}
 
-	// Horizon's SSE stream is long-lived and idles between payments, so it can't
-	// share horizonHTTP's 10s Timeout — that applies to the whole request,
-	// including reading the streaming body, and would abort a healthy stream
-	// after 10s of inactivity. Reuse the transport (dial/keep-alive settings)
-	// but rely on ctx cancellation, not a fixed deadline, to bound the stream.
-	hzStream := &horizonclient.Client{
-		HorizonURL: cfg.HorizonURL,
-		HTTP:       &http.Client{Transport: stellarTransport},
-	}
-
 	// ── 5. Background workers ─────────────────────────────────────────────────
 	var workers sync.WaitGroup
 
 	// Retry worker polls every RETRY_INTERVAL_SEC (default 10s) for pending_retry forwards.
 	workers.Go(func() { retry.NewWorker(st, fwd, cfg.RetryInterval).Run(ctx) })
 
-	// One SSE watcher goroutine per pool address.
+	// One polling watcher per pool address, on the ordinary Horizon client:
+	// each page request is short, so the 10s request timeout applies.
 	for _, pa := range cfg.PoolAccounts {
-		workers.Go(func() { watcher.New(pa, st, fwd, hzStream, work).Run(ctx) })
+		workers.Go(func() { watcher.New(pa, st, fwd, hz, work, cfg.ForwardWorkers).Run(ctx) })
 	}
 
 	// ── 6. HTTP server ────────────────────────────────────────────────────────

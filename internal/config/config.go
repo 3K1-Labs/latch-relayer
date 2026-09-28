@@ -59,7 +59,16 @@ type Config struct {
 	// old 30s default meant a straggler could sit half a minute waiting for a
 	// slot that was already free.
 	RetryInterval time.Duration
+
+	// ForwardWorkers is how many forwards each pool's watcher runs at once
+	// (FORWARD_WORKERS). With channels it must be at least the channel count,
+	// or channels sit idle waiting for a worker; the default is 32 or the
+	// channel count, whichever is larger.
+	ForwardWorkers int
 }
+
+// forwardWorkersDefault is the per-pool forward concurrency without channels.
+const forwardWorkersDefault = 32
 
 // Load reads environment variables (and an optional .env file), validates all
 // required values, and returns the deposit bridge's Config. Fails fast on
@@ -117,6 +126,12 @@ func Load() (*Config, error) {
 
 	if cfg.Channels, err = depositChannels(cfg); err != nil {
 		return nil, err
+	}
+	if cfg.ForwardWorkers, err = envInt("FORWARD_WORKERS", max(forwardWorkersDefault, len(cfg.Channels))); err != nil {
+		return nil, err
+	}
+	if cfg.ForwardWorkers < 1 {
+		return nil, errors.New("FORWARD_WORKERS must be at least 1")
 	}
 	cfg.InstanceID = os.Getenv("INSTANCE_ID")
 	if cfg.InstanceID == "" {
