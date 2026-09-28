@@ -182,13 +182,17 @@ type mockRPC struct {
 	getResp  rpcprotocol.GetTransactionResponse
 	getErr   error
 
-	simulated []string // transaction XDR of each simulation request
-	sent      int      // SendTransaction calls
-	sentXDR   []string // transaction XDR of each send
-	looked    []string // hashes passed to GetTransaction
+	simulated   []string  // transaction XDR of each simulation request
+	sent        int       // SendTransaction calls
+	sentXDR     []string  // transaction XDR of each send
+	looked      []string  // hashes passed to GetTransaction
+	simDeadline time.Time // deadline of the context the first simulation ran under
 }
 
-func (m *mockRPC) SimulateTransaction(_ context.Context, req rpcprotocol.SimulateTransactionRequest) (rpcprotocol.SimulateTransactionResponse, error) {
+func (m *mockRPC) SimulateTransaction(ctx context.Context, req rpcprotocol.SimulateTransactionRequest) (rpcprotocol.SimulateTransactionResponse, error) {
+	if len(m.simulated) == 0 {
+		m.simDeadline, _ = ctx.Deadline()
+	}
 	m.simulated = append(m.simulated, req.Transaction)
 	return m.simResp, m.simErr
 }

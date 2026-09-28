@@ -69,3 +69,20 @@ func TestRetry_orphanedPendingIsForwarded(t *testing.T) {
 		t.Fatalf("claims=%v done=%v; want the orphaned deposit claimed and forwarded", st.claimCalls, st.doneCalls)
 	}
 }
+
+// The worker must give up before the retry worker's five-minute cutoff, so a
+// hung call can't leave both sending for one deposit.
+func TestForwardRecorded_boundedBelowRetryCutoff(t *testing.T) {
+	rpc := successRPC(t, "out")
+	f, _ := forwarderWith(t, rpc)
+
+	start := time.Now()
+	f.ForwardRecorded(context.Background(), f.config.PoolAccounts[0].Address, "in-bounded", 1, "GABC", "10.0000000", "native", time.Now())
+
+	if rpc.simDeadline.IsZero() {
+		t.Fatal("forward ran without a deadline")
+	}
+	if got := rpc.simDeadline.Sub(start); got > forwardDeadline+time.Second || forwardDeadline >= 5*time.Minute {
+		t.Fatalf("deadline %v after start (forwardDeadline %v), want under the 5 min retry cutoff", got, forwardDeadline)
+	}
+}

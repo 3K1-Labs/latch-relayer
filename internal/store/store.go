@@ -232,8 +232,8 @@ func (s *Store) ExpireStaleIntents(ctx context.Context) (int64, error) {
 // expiry against it.
 func (s *Store) InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string, landedAt time.Time) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO forwards (tx_hash, memo_id, pool_address, from_address, amount, asset, landed_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO forwards (tx_hash, memo_id, pool_address, from_address, amount, asset, landed_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
 		ON CONFLICT (tx_hash) DO NOTHING
 	`, txHash, int64(memoID), poolAddress, fromAddress, amount, asset, landedAt)
 	if err != nil {
@@ -244,7 +244,9 @@ func (s *Store) InsertForward(ctx context.Context, txHash string, memoID uint64,
 
 // ClaimNewForward marks a freshly recorded deposit as taken by the worker that
 // is about to process it. It succeeds only while the row is untouched since
-// InsertForward (updated_at still equal to created_at), so a deposit the retry
+// InsertForward (updated_at still equal to created_at: InsertForward sets both
+// to NOW(), which Postgres fixes at the transaction's start, so every call in
+// one statement returns the same value), so a deposit the retry
 // worker already picked up — its queue slot was waiting longer than the retry
 // cutoff — is not processed a second time.
 func (s *Store) ClaimNewForward(ctx context.Context, txHash string) (bool, error) {
