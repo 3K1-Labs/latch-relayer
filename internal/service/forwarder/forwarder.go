@@ -33,6 +33,8 @@ import (
 // Narrow interface keeps test mocks small.
 type forwardStore interface {
 	InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string, landedAt time.Time) (bool, error)
+	ClaimNewForward(ctx context.Context, txHash string) (bool, error)
+	ClaimPendingForward(ctx context.Context, txHash string, seen time.Time) (bool, error)
 	GetIntentByMemoID(ctx context.Context, memoID uint64) (*store.Intent, error)
 	MarkForwardDone(ctx context.Context, txHash, forwardTx string) error
 	CompleteIntent(ctx context.Context, memoID uint64) error
@@ -224,13 +226,20 @@ func (e *feeError) Error() string { return e.msg }
 // ── Forward ───────────────────────────────────────────────────────────────────
 
 // backoffs are the delays between the three quick in-process attempts in Forward.
+// forwardDeadline bounds a watcher worker's whole forward, from claiming the
+// row to recording the outcome. It must stay below the five-minute cutoff
+// after which GetPendingRetries hands an untouched 'pending' row to the retry
+// worker, so the two never work the same deposit at once.
+const forwardDeadline = 4 * time.Minute
+
 var backoffs = []time.Duration{
 	500 * time.Millisecond,
 	1 * time.Second,
 	2 * time.Second,
 }
 
-// Forward processes one inbound payment end-to-end. Safe to call in a goroutine.
+// ForwardRecorded processes one inbound payment end-to-end, for a deposit whose
+// forwards row the caller has already inserted.
 //
 // poolAddress is the pool account the payment arrived at. Every outbound
 // transfer for this deposit — the forward or a recovery sweep — is paid out of
@@ -238,7 +247,15 @@ var backoffs = []time.Duration{
 //
 // landedAt is when the payment closed on-chain; it decides whether the intent
 // was still open. Zero means unknown, and the current time is used instead.
-func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, memoID uint64, fromAddress, amount, asset string, landedAt time.Time) {
+// The watcher records every deposit before saving the SSE
+// cursor past it, so a deposit is never both skipped by the stream and missing
+// from the table; the forward itself then runs on a worker.
+//
+// The row is claimed first. If the claim fails, the retry worker has already
+// taken the deposit (it was queued longer than the retry cutoff, or recorded by
+// a run that died before forwarding it), and processing it here too could pay
+// it twice.
+func (f *Forwarder) ForwardRecorded(ctx context.Context, poolAddress, txHash string, memoID uint64, fromAddress, amount, asset string, landedAt time.Time) {
 	// Measured from when we first see the deposit rather than from submission,
 	// so the number reflects what the customer waits for.
 	started := time.Now()
@@ -248,22 +265,25 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 		landed = started
 	}
 
-	inserted, err := f.store.InsertForward(ctx, txHash, memoID, poolAddress, fromAddress, amount, asset, landed)
+	claimed, err := f.store.ClaimNewForward(ctx, txHash)
 	if err != nil {
-		slog.Error("forwarder: insert forward", "tx_hash", txHash, "err", err)
+		// Unclaimed, so still 'pending': the retry worker picks it up.
+		slog.Error("forwarder: claim forward, left for the retry worker", "tx_hash", txHash, "err", err)
 		return
 	}
-
-	// A row already existed, so this payment was dispatched before — by a run that
-	// died before saving the SSE cursor, or by a second instance streaming the same
-	// pool. Forwarding again would pay the C-address twice for one deposit. Dropping
-	// it here is safe: if that earlier dispatch never reached submit(), the row is
-	// still `pending` and GetPendingRetries sweeps it up after five minutes.
-	if !inserted {
-		slog.Warn("forwarder: duplicate tx_hash, already dispatched — skipping",
+	if !claimed {
+		slog.Warn("forwarder: deposit already taken by the retry worker — skipping",
 			"tx_hash", txHash, "memo_id", memoID)
 		return
 	}
+
+	// The retry worker treats a 'pending' row untouched for five minutes as
+	// abandoned and claims it. Stop well before that, so a hung RPC or DB call
+	// can't leave this worker still sending when the retry worker takes over.
+	// Whatever is cut short stays on record: an unsent forward is 'pending'
+	// for the retry worker, a sent one has its hash to be resolved by.
+	ctx, cancel := context.WithTimeout(ctx, forwardDeadline)
+	defer cancel()
 
 	if !f.accepts(asset) {
 		metrics.ForwardsTotal.WithLabelValues("unsupported_asset").Inc()
@@ -415,6 +435,21 @@ func mismatchesExpected(expected, received string) bool {
 
 // Retry is called by the background retry worker for pending_retry forwards.
 func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
+	// A 'pending' row is a deposit whose first attempt never finished. A
+	// watcher worker may still be about to take it, so claim it first: only
+	// one of the two processes it.
+	if fwd.Status == store.StatusPending {
+		claimed, err := f.store.ClaimPendingForward(ctx, fwd.TxHash, fwd.UpdatedAt)
+		if err != nil {
+			slog.Error("forwarder: retry — claim pending forward", "tx_hash", fwd.TxHash, "err", err)
+			return
+		}
+		if !claimed {
+			slog.Info("forwarder: retry — pending deposit taken by a watcher worker, skipping", "tx_hash", fwd.TxHash)
+			return
+		}
+	}
+
 	// A transfer already put on the network is resolved before anything else —
 	// ahead of the ceiling too, since one that landed must be recorded as done,
 	// not failed.
