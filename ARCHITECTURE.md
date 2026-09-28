@@ -97,7 +97,9 @@ Implementation: `txnbuild.NewPaymentToContract` builds an `InvokeHostFunction` o
 **Soroban transactions do not support memos** — the outbound forwarding tx carries no memo. Traceability is via the `forwards` table (`tx_hash` → `forward_tx`).
 
 ### Fee Bump
-Not needed. The relay controls the pooled G-address and is both the signer and fee payer. Fees come from the pool's operational balance (which already holds the deposited funds). The "zero pre-balance" goal is met — the user's C-address receives the full amount.
+Without channels, not needed: the pool is the transaction source, signer and fee payer. Fees come from the pool's operational balance (which already holds the deposited funds). The "zero pre-balance" goal is met — the user's C-address receives the full amount.
+
+With channels (see below), the pool fee-bumps each transaction a channel sources, so the pool still pays every fee and channels only need their base reserve. The fee-bump's hash is the one recorded, sent and resolved.
 
 ### Watcher
 - **Horizon SSE stream** — one goroutine per pooled address
@@ -107,7 +109,15 @@ Not needed. The relay controls the pooled G-address and is both the signer and f
 - wallet-backend is NOT used for the deposit hot path
 
 ### Multiple Pooled Addresses
-Config supports `POOL_ADDRESS_N` / `POOL_PRIVATE_KEY_N` for N pool accounts. One watcher goroutine per pool. Intent creation round-robins across the pools (`internal/handler/handler.go`). Each pool account still lands at most one transaction per ledger (Stellar Core holds one pending transaction per source account), so scaling throughput with channel accounts rather than more pool keys is tracked in #48.
+Config supports `POOL_ADDRESS_N` / `POOL_PRIVATE_KEY_N` for N pool accounts. One watcher goroutine per pool. Intent creation round-robins across the pools (`internal/handler/handler.go`).
+
+### Throughput: Channel Accounts
+Stellar Core holds one pending transaction per source account, so a pool that sources its own transfers lands at most one per ledger (about 12 a minute). Channel accounts (#48) lift that limit without adding pool keys:
+- `DEPOSIT_CHANNEL_COUNT` accounts are derived from `DEPOSIT_CHANNEL_SEED` and tracked in `deposit_channel_accounts`. The lease pool is shared with the gasless service (`internal/gasless/channels`) but uses its own table and seed.
+- Each forward or sweep leases a free channel as its transaction source, so its sequence number comes from the channel. The pool stays the payment's operation source, authorizing the SAC transfer (or the recovery payment) with its own signature, and pays the fee by fee-bump. Funds never touch a channel.
+- The channel is held until its transaction settles, because Stellar Core queues only one transaction per source account. It is then released with the sequence it consumed. After an unconfirmed send or poll, a txBadSeq, or fee retries running out, it is released for resync instead, and the next holder reloads its sequence from Horizon.
+- When every channel is busy, the forward is requeued without charging its retry budget.
+- Unset or 0 keeps the pool as the transaction source. If no channel exists on-chain at startup, the relayer logs an error and stays in pool mode. Create them with `make deposit-channels`.
 
 ### Idempotency
 Incoming deposit `tx_hash` is unique on Stellar. `INSERT ... ON CONFLICT (tx_hash) DO NOTHING` ensures replaying the same SSE event is safe.

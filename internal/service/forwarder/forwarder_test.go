@@ -176,6 +176,7 @@ type mockRPC struct {
 	sent      int      // SendTransaction calls
 	sentXDR   []string // transaction XDR of each send
 	looked    []string // hashes passed to GetTransaction
+	onPoll    func()   // called at the start of each PollTransaction, if set
 }
 
 func (m *mockRPC) SimulateTransaction(_ context.Context, req rpcprotocol.SimulateTransactionRequest) (rpcprotocol.SimulateTransactionResponse, error) {
@@ -192,6 +193,9 @@ func (m *mockRPC) GetTransaction(_ context.Context, req rpcprotocol.GetTransacti
 	return m.getResp, m.getErr
 }
 func (m *mockRPC) PollTransaction(_ context.Context, _ string) (rpcprotocol.GetTransactionResponse, error) {
+	if m.onPoll != nil {
+		m.onPoll()
+	}
 	return m.pollResp, m.pollErr
 }
 
