@@ -288,19 +288,41 @@ func (s *Store) MarkSwept(ctx context.Context, txHash, sweepTx string) error {
 	return nil
 }
 
+// ErrSubmissionClaimed means the outbound transaction is already recorded
+// against a different deposit, in flight or settled. One on-chain transfer can
+// only ever pay one deposit, so the caller must not send it.
+var ErrSubmissionClaimed = errors.New("outbound transaction already belongs to another forward")
+
 // RecordSubmission notes the outbound transaction about to be sent for a
 // forward, and the time after which it can no longer land. It must be written
 // before the transaction is sent: from then on the transfer may be in flight,
 // and anything that retries this forward has to resolve this hash rather than
 // build a second transfer.
+//
+// It refuses, with ErrSubmissionClaimed, a hash another forward has already
+// recorded or settled with. Two forwards of the same amount to the same
+// C-address that are handed the same sequence number build byte-identical
+// transactions; the network answers the second with DUPLICATE, and without
+// this check both deposits would settle on the single transfer that landed.
+// Soroban transactions cannot carry a memo, so the transactions themselves
+// cannot be made unique. Callers hold the pool's send lock, and only the same
+// pool can produce the same hash, so check-then-write does not race.
 func (s *Store) RecordSubmission(ctx context.Context, txHash, submittedTx string, until time.Time) error {
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE forwards
 		SET submitted_tx = $1, submitted_until = $2, updated_at = NOW()
 		WHERE tx_hash = $3
+		  AND NOT EXISTS (
+		      SELECT 1 FROM forwards other
+		      WHERE other.tx_hash <> $3
+		        AND (other.submitted_tx = $1 OR other.forward_tx = $1)
+		  )
 	`, submittedTx, until, txHash)
 	if err != nil {
 		return fmt.Errorf("record submission: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrSubmissionClaimed
 	}
 	return nil
 }
