@@ -69,6 +69,8 @@ type mockStore struct {
 	insertDup    bool   // InsertForward reports the row already existed
 	insertPool   string // pool address InsertForward recorded
 	insertLanded time.Time
+	claimLost    bool // ClaimNewForward / ClaimPendingForward find the row already taken
+	claimCalls   []string
 	intent       *store.Intent
 	intentErr    error
 
@@ -98,6 +100,14 @@ func (m *mockStore) InsertForward(_ context.Context, _ string, _ uint64, poolAdd
 		return false, m.insertErr
 	}
 	return !m.insertDup, nil
+}
+func (m *mockStore) ClaimNewForward(_ context.Context, txHash string) (bool, error) {
+	m.claimCalls = append(m.claimCalls, txHash)
+	return !m.claimLost, nil
+}
+func (m *mockStore) ClaimPendingForward(_ context.Context, txHash string, _ time.Time) (bool, error) {
+	m.claimCalls = append(m.claimCalls, txHash)
+	return !m.claimLost, nil
 }
 func (m *mockStore) GetIntentByMemoID(_ context.Context, _ uint64) (*store.Intent, error) {
 	return m.intent, m.intentErr
@@ -172,13 +182,18 @@ type mockRPC struct {
 	getResp  rpcprotocol.GetTransactionResponse
 	getErr   error
 
-	simulated []string // transaction XDR of each simulation request
-	sent      int      // SendTransaction calls
-	sentXDR   []string // transaction XDR of each send
-	looked    []string // hashes passed to GetTransaction
+	simulated   []string  // transaction XDR of each simulation request
+	sent        int       // SendTransaction calls
+	sentXDR     []string  // transaction XDR of each send
+	looked      []string  // hashes passed to GetTransaction
+	simDeadline time.Time // deadline of the context the first simulation ran under
+	onPoll      func()    // called at the start of each PollTransaction, if set
 }
 
-func (m *mockRPC) SimulateTransaction(_ context.Context, req rpcprotocol.SimulateTransactionRequest) (rpcprotocol.SimulateTransactionResponse, error) {
+func (m *mockRPC) SimulateTransaction(ctx context.Context, req rpcprotocol.SimulateTransactionRequest) (rpcprotocol.SimulateTransactionResponse, error) {
+	if len(m.simulated) == 0 {
+		m.simDeadline, _ = ctx.Deadline()
+	}
 	m.simulated = append(m.simulated, req.Transaction)
 	return m.simResp, m.simErr
 }
@@ -192,6 +207,9 @@ func (m *mockRPC) GetTransaction(_ context.Context, req rpcprotocol.GetTransacti
 	return m.getResp, m.getErr
 }
 func (m *mockRPC) PollTransaction(_ context.Context, _ string) (rpcprotocol.GetTransactionResponse, error) {
+	if m.onPoll != nil {
+		m.onPoll()
+	}
 	return m.pollResp, m.pollErr
 }
 

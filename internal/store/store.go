@@ -232,12 +232,45 @@ func (s *Store) ExpireStaleIntents(ctx context.Context) (int64, error) {
 // expiry against it.
 func (s *Store) InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string, landedAt time.Time) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO forwards (tx_hash, memo_id, pool_address, from_address, amount, asset, landed_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO forwards (tx_hash, memo_id, pool_address, from_address, amount, asset, landed_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
 		ON CONFLICT (tx_hash) DO NOTHING
 	`, txHash, int64(memoID), poolAddress, fromAddress, amount, asset, landedAt)
 	if err != nil {
 		return false, fmt.Errorf("insert forward: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ClaimNewForward marks a freshly recorded deposit as taken by the worker that
+// is about to process it. It succeeds only while the row is untouched since
+// InsertForward (updated_at still equal to created_at: InsertForward sets both
+// to NOW(), which Postgres fixes at the transaction's start, so every call in
+// one statement returns the same value), so a deposit the retry
+// worker already picked up — its queue slot was waiting longer than the retry
+// cutoff — is not processed a second time.
+func (s *Store) ClaimNewForward(ctx context.Context, txHash string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE forwards SET updated_at = NOW()
+		WHERE tx_hash = $1 AND status = 'pending' AND updated_at = created_at
+	`, txHash)
+	if err != nil {
+		return false, fmt.Errorf("claim new forward: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ClaimPendingForward is the retry worker's claim on a 'pending' row: it
+// succeeds only if the row has not changed since it was read (seen is the
+// updated_at it was read with), so the retry worker and a watcher worker never
+// both process the same deposit.
+func (s *Store) ClaimPendingForward(ctx context.Context, txHash string, seen time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE forwards SET updated_at = NOW()
+		WHERE tx_hash = $1 AND status = 'pending' AND updated_at = $2
+	`, txHash, seen)
+	if err != nil {
+		return false, fmt.Errorf("claim pending forward: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
 }
@@ -407,7 +440,8 @@ func (s *Store) GetForwardByMemoID(ctx context.Context, memoID uint64) ([]Forwar
 // GetPendingRetries returns all forwards the background worker should attempt.
 // This covers two cases:
 //   - pending_retry: explicit retry queue after Forward() exhausted its in-process attempts
-//   - pending older than 5 minutes: crash-recovery for forwards whose goroutine was killed
+//   - pending and untouched for 5 minutes: crash recovery for a deposit that was
+//     recorded but never finished (the process died with it queued or mid-forward)
 //     before submit() ran, leaving the row stuck in the initial pending state (Gap 5)
 func (s *Store) GetPendingRetries(ctx context.Context) ([]Forward, error) {
 	rows, err := s.pool.Query(ctx, `
@@ -416,7 +450,7 @@ func (s *Store) GetPendingRetries(ctx context.Context) ([]Forward, error) {
 		       COALESCE(pool_address, ''), submitted_tx, submitted_until, sweep, landed_at
 		FROM forwards
 		WHERE status = 'pending_retry'
-		   OR (status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes')
+		   OR (status = 'pending' AND updated_at < NOW() - INTERVAL '5 minutes')
 		ORDER BY retries ASC, created_at ASC
 		LIMIT 200
 	`)

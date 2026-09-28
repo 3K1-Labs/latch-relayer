@@ -23,6 +23,8 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/latch/relayer/internal/config"
+	"github.com/latch/relayer/internal/gasless/channels"
+	"github.com/latch/relayer/internal/gasless/keys"
 	"github.com/latch/relayer/internal/metrics"
 	"github.com/latch/relayer/internal/store"
 )
@@ -31,6 +33,8 @@ import (
 // Narrow interface keeps test mocks small.
 type forwardStore interface {
 	InsertForward(ctx context.Context, txHash string, memoID uint64, poolAddress, fromAddress, amount, asset string, landedAt time.Time) (bool, error)
+	ClaimNewForward(ctx context.Context, txHash string) (bool, error)
+	ClaimPendingForward(ctx context.Context, txHash string, seen time.Time) (bool, error)
 	GetIntentByMemoID(ctx context.Context, memoID uint64) (*store.Intent, error)
 	MarkForwardDone(ctx context.Context, txHash, forwardTx string) error
 	CompleteIntent(ctx context.Context, memoID uint64) error
@@ -87,6 +91,20 @@ const (
 	// forward is retried within a few minutes.
 	txValidity = 2 * time.Minute
 
+	// channelLeaseTTL bounds how long a channel is held: from acquiring it
+	// until its transaction is confirmed (build, simulate, the
+	// TRY_AGAIN_LATER loop, fee retries and the pollTimeout confirmation
+	// poll). The lease is kept through the poll because Stellar Core queues
+	// one transaction per source account: a channel handed on while its
+	// transaction is still pending gets txBadSeq or TRY_AGAIN_LATER for the
+	// next one. A holder that dies loses the lease after this, and the next
+	// holder resyncs the channel's sequence.
+	channelLeaseTTL = 4 * time.Minute
+
+	// channelWait is how long a transfer waits for a free channel before it
+	// is requeued without charge, like losing the pool's slot.
+	channelWait = 30 * time.Second
+
 	// landingGrace is added to a transaction's max time before treating "not
 	// found" as "never landed", to absorb clock skew against ledger close times
 	// and RPC ingestion lag.
@@ -109,6 +127,20 @@ type Forwarder struct {
 
 func New(st *store.Store, cfg *config.Config, hz *horizonclient.Client, rpc *rpcclient.Client) *Forwarder {
 	return &Forwarder{store: st, config: cfg, horizon: hz, rpc: rpc}
+}
+
+// UseChannels makes every forward and sweep take a leased channel account as
+// its transaction source instead of the pool. Stellar accepts one pending
+// transaction per source account, so with the pool as source each pool lands
+// about one transfer per ledger; with channels it is one per channel per
+// ledger, from the same pool key. The pool remains the payment's operation
+// source (it owns and authorizes the funds) and pays the fees by fee-bump.
+func (f *Forwarder) UseChannels(leaser channelLeaser, chans []keys.Channel) {
+	f.channels = leaser
+	f.channelKeys = make(map[string]*keypair.Full, len(chans))
+	for _, ch := range chans {
+		f.channelKeys[ch.Address()] = ch.Keypair
+	}
 }
 
 // seq returns the shared sequencer, building it on first use so a Forwarder
@@ -201,13 +233,20 @@ func (e *feeError) Error() string { return e.msg }
 // ── Forward ───────────────────────────────────────────────────────────────────
 
 // backoffs are the delays between the three quick in-process attempts in Forward.
+// forwardDeadline bounds a watcher worker's whole forward, from claiming the
+// row to recording the outcome. It must stay below the five-minute cutoff
+// after which GetPendingRetries hands an untouched 'pending' row to the retry
+// worker, so the two never work the same deposit at once.
+const forwardDeadline = 4 * time.Minute
+
 var backoffs = []time.Duration{
 	500 * time.Millisecond,
 	1 * time.Second,
 	2 * time.Second,
 }
 
-// Forward processes one inbound payment end-to-end. Safe to call in a goroutine.
+// ForwardRecorded processes one inbound payment end-to-end, for a deposit whose
+// forwards row the caller has already inserted.
 //
 // poolAddress is the pool account the payment arrived at. Every outbound
 // transfer for this deposit — the forward or a recovery sweep — is paid out of
@@ -215,7 +254,15 @@ var backoffs = []time.Duration{
 //
 // landedAt is when the payment closed on-chain; it decides whether the intent
 // was still open. Zero means unknown, and the current time is used instead.
-func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, memoID uint64, fromAddress, amount, asset string, landedAt time.Time) {
+// The watcher records every deposit before saving the SSE
+// cursor past it, so a deposit is never both skipped by the stream and missing
+// from the table; the forward itself then runs on a worker.
+//
+// The row is claimed first. If the claim fails, the retry worker has already
+// taken the deposit (it was queued longer than the retry cutoff, or recorded by
+// a run that died before forwarding it), and processing it here too could pay
+// it twice.
+func (f *Forwarder) ForwardRecorded(ctx context.Context, poolAddress, txHash string, memoID uint64, fromAddress, amount, asset string, landedAt time.Time) {
 	// Measured from when we first see the deposit rather than from submission,
 	// so the number reflects what the customer waits for.
 	started := time.Now()
@@ -225,22 +272,25 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 		landed = started
 	}
 
-	inserted, err := f.store.InsertForward(ctx, txHash, memoID, poolAddress, fromAddress, amount, asset, landed)
+	claimed, err := f.store.ClaimNewForward(ctx, txHash)
 	if err != nil {
-		slog.Error("forwarder: insert forward", "tx_hash", txHash, "err", err)
+		// Unclaimed, so still 'pending': the retry worker picks it up.
+		slog.Error("forwarder: claim forward, left for the retry worker", "tx_hash", txHash, "err", err)
 		return
 	}
-
-	// A row already existed, so this payment was dispatched before — by a run that
-	// died before saving the SSE cursor, or by a second instance streaming the same
-	// pool. Forwarding again would pay the C-address twice for one deposit. Dropping
-	// it here is safe: if that earlier dispatch never reached submit(), the row is
-	// still `pending` and GetPendingRetries sweeps it up after five minutes.
-	if !inserted {
-		slog.Warn("forwarder: duplicate tx_hash, already dispatched — skipping",
+	if !claimed {
+		slog.Warn("forwarder: deposit already taken by the retry worker — skipping",
 			"tx_hash", txHash, "memo_id", memoID)
 		return
 	}
+
+	// The retry worker treats a 'pending' row untouched for five minutes as
+	// abandoned and claims it. Stop well before that, so a hung RPC or DB call
+	// can't leave this worker still sending when the retry worker takes over.
+	// Whatever is cut short stays on record: an unsent forward is 'pending'
+	// for the retry worker, a sent one has its hash to be resolved by.
+	ctx, cancel := context.WithTimeout(ctx, forwardDeadline)
+	defer cancel()
 
 	if !f.accepts(asset) {
 		metrics.ForwardsTotal.WithLabelValues("unsupported_asset").Inc()
@@ -354,7 +404,7 @@ func (f *Forwarder) Forward(ctx context.Context, poolAddress, txHash string, mem
 	if isContention(lastErr) {
 		metrics.ContentionTotal.Inc()
 		_ = f.store.RequeueForContention(ctx, txHash, lastErr.Error())
-		slog.Warn("forwarder: lost the pool slot, queued for retry without charge",
+		slog.Warn("forwarder: source account busy, queued for retry without charge",
 			"tx_hash", txHash, "err", lastErr)
 		return
 	}
@@ -392,6 +442,21 @@ func mismatchesExpected(expected, received string) bool {
 
 // Retry is called by the background retry worker for pending_retry forwards.
 func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
+	// A 'pending' row is a deposit whose first attempt never finished. A
+	// watcher worker may still be about to take it, so claim it first: only
+	// one of the two processes it.
+	if fwd.Status == store.StatusPending {
+		claimed, err := f.store.ClaimPendingForward(ctx, fwd.TxHash, fwd.UpdatedAt)
+		if err != nil {
+			slog.Error("forwarder: retry — claim pending forward", "tx_hash", fwd.TxHash, "err", err)
+			return
+		}
+		if !claimed {
+			slog.Info("forwarder: retry — pending deposit taken by a watcher worker, skipping", "tx_hash", fwd.TxHash)
+			return
+		}
+	}
+
 	// A transfer already put on the network is resolved before anything else —
 	// ahead of the ceiling too, since one that landed must be recorded as done,
 	// not failed.
@@ -492,7 +557,7 @@ func (f *Forwarder) Retry(ctx context.Context, fwd store.Forward) {
 		if isContention(err) {
 			metrics.ContentionTotal.Inc()
 			_ = f.store.RequeueForContention(ctx, fwd.TxHash, err.Error())
-			slog.Warn("forwarder: retry lost the pool slot, re-queued without charge",
+			slog.Warn("forwarder: retry found source account busy, re-queued without charge",
 				"tx_hash", fwd.TxHash, "retries", fwd.Retries, "err", err)
 			return
 		}
@@ -703,6 +768,9 @@ func (f *Forwarder) transfer(
 			return "", permanent(err)
 		}
 	}
+	if f.channels != nil {
+		return f.transferViaChannel(ctx, inboundHash, kp, prepare)
+	}
 
 	// Sequence comes from the shared sequencer, not a per-attempt Horizon read.
 	// Horizon reports the account as of the last closed ledger, so concurrent
@@ -798,12 +866,128 @@ func (f *Forwarder) transfer(
 	return "", transient(fmt.Errorf("insufficient fee after %d retries", maxFeeRetries))
 }
 
+// transferViaChannel is transfer with a leased channel as the transaction's
+// source: its sequence number comes from the channel, not the pool, so
+// transfers from one pool no longer queue behind each other. The same
+// guarantees hold — recorded before it is sent, an unknown outcome returned as
+// unconfirmed — and the channel is released once the transaction's outcome is
+// known, with what is known about its sequence.
+func (f *Forwarder) transferViaChannel(
+	ctx context.Context,
+	inboundHash string,
+	pool *keypair.Full,
+	prepare func(src *txnbuild.SimpleAccount, validUntil time.Time) (prepared, error),
+) (hash string, err error) {
+	lease, err := f.channels.AcquireWait(ctx, channelLeaseTTL, channelWait)
+	if errors.Is(err, channels.ErrPoolCapacity) {
+		// Every channel is busy: waiting its turn, not failing.
+		return "", contention(errors.New("all deposit channels are busy"))
+	}
+	if err != nil {
+		return "", transient(fmt.Errorf("lease channel: %w", err))
+	}
+
+	// Release exactly once. Released without work to a caller who returns
+	// early: resync, the safe default when nothing is known.
+	released := false
+	release := func(consumed *int64, resync bool) {
+		if released {
+			return
+		}
+		released = true
+		// Not the request context: a lease must be returned even if the
+		// forward is being cancelled, or the channel sits idle until expiry.
+		if err := f.channels.Release(context.WithoutCancel(ctx), lease, consumed, resync); err != nil {
+			slog.Warn("forwarder: release channel", "channel", lease.Address, "err", err)
+		}
+	}
+	defer release(nil, true)
+
+	channelKey := f.channelKeys[lease.Address]
+	if channelKey == nil {
+		return "", transient(fmt.Errorf("no key for leased channel %s", lease.Address))
+	}
+
+	last := lease.Seq
+	if lease.NeedsResync {
+		acct, err := f.horizon.AccountDetail(horizonclient.AccountRequest{AccountID: lease.Address})
+		if err != nil {
+			return "", transient(fmt.Errorf("load channel %s: %w", lease.Address, err))
+		}
+		if last, err = acct.GetSequenceNumber(); err != nil {
+			return "", transient(fmt.Errorf("channel %s sequence: %w", lease.Address, err))
+		}
+	}
+	seq := last + 1
+
+	validUntil := time.Now().Add(txValidity).Truncate(time.Second)
+	p, err := prepare(&txnbuild.SimpleAccount{AccountID: lease.Address, Sequence: seq}, validUntil)
+	if err != nil {
+		release(&last, false) // nothing was sent: the channel is where it was
+		return "", err
+	}
+
+	seal := f.sealViaChannel(channelKey, pool)
+	inclusionFee := uint32(txnbuild.MinBaseFee)
+	for feeAttempt := range maxFeeRetries + 1 {
+		p.setFee(&p.env, inclusionFee)
+		hash, err = f.signAndSend(ctx, inboundHash, seal, p.env, validUntil)
+		if err == nil {
+			// Accepted. Hold the channel until the transaction settles: while
+			// it is pending, the channel's next sequence number can't be
+			// queued behind it.
+			hash, err = f.pollResult(ctx, hash)
+			switch {
+			case err == nil:
+				release(&seq, false)
+			case isUnconfirmed(err):
+				// May still be queued: the next holder reloads the sequence.
+				release(nil, true)
+			default:
+				// Failed in a ledger, which still consumed the sequence number.
+				release(&seq, false)
+				f.forgetSubmission(ctx, inboundHash)
+			}
+			return hash, err
+		}
+
+		var fe *feeError
+		if errors.As(err, &fe) && feeAttempt < maxFeeRetries {
+			inclusionFee *= 2
+			slog.Warn("forwarder: tx_insufficient_fee, bumping inclusion fee",
+				"fee_attempt", feeAttempt+1, "new_inclusion_fee", inclusionFee)
+			continue
+		}
+		switch {
+		case isUnconfirmed(err), isContention(err), errors.As(err, &fe):
+			// May have been queued, or the channel's sequence is off: the
+			// next holder reloads it from the network. Fee retries running
+			// out counts too: on a channel, which pays no fee itself, it
+			// usually means this sequence number is already queued, and Core
+			// treats a resubmission as a replace-by-fee needing 10x the fee.
+			release(nil, true)
+		default:
+			// Rejected before entering the queue: the number is unused.
+			release(&last, false)
+		}
+		if errors.As(err, &fe) {
+			return "", transient(fmt.Errorf("%s (fee retries exhausted)", fe.msg))
+		}
+		return "", err
+	}
+	// Not reached: the last fee attempt never continues, so every path
+	// returns inside the loop. Go still needs a terminating statement here,
+	// and this one is the safe outcome if that ever changes.
+	release(nil, true)
+	return "", transient(fmt.Errorf("insufficient fee after %d retries", maxFeeRetries))
+}
+
 // prepareContractPayment builds the SAC transfer to a C-address and simulates
 // it for its footprint and resource fee.
 func (f *Forwarder) prepareContractPayment(
 	ctx context.Context,
 	src *txnbuild.SimpleAccount,
-	cAddress, amount, asset string,
+	poolAddress, cAddress, amount, asset string,
 	validUntil time.Time,
 ) (prepared, error) {
 	parsedAsset, err := parseAsset(asset)
@@ -818,7 +1002,10 @@ func (f *Forwarder) prepareContractPayment(
 		Destination:       cAddress,
 		Amount:            amount,
 		Asset:             parsedAsset,
-		SourceAccount:     src.AccountID,
+		// The pool owns the funds and authorizes the transfer as the
+		// operation's source, whether the transaction's source is the pool
+		// itself or a leased channel.
+		SourceAccount: poolAddress,
 	})
 	if err != nil {
 		return prepared{}, permanent(fmt.Errorf("build payment-to-contract: %w", err))
@@ -1170,9 +1357,10 @@ func (f *Forwarder) sweep(ctx context.Context, inboundHash, poolAddress, amount,
 			IncrementSequenceNum: false,
 			Operations: []txnbuild.Operation{
 				&txnbuild.Payment{
-					Destination: f.config.RecoveryAddress,
-					Amount:      amount,
-					Asset:       parsedAsset,
+					Destination:   f.config.RecoveryAddress,
+					Amount:        amount,
+					Asset:         parsedAsset,
+					SourceAccount: poolAddress,
 				},
 			},
 			Memo:    memo,
