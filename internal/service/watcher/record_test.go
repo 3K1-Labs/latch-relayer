@@ -3,6 +3,8 @@ package watcher
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -39,16 +41,39 @@ func (s *fakeStore) InsertForward(_ context.Context, txHash string, _ uint64, _,
 	return !s.dup, nil
 }
 
-type fakeStream struct{ ops []operations.Operation }
+// fakeStream serves ops as Horizon pages: records after the request's cursor,
+// at most Limit of them. Every request is kept so tests can check paging.
+type fakeStream struct {
+	ops      []operations.Operation
+	requests []horizonclient.OperationRequest
+	at       []time.Time // when each request was made
+	onEmpty  func()      // called when a page comes back empty, e.g. to stop the poll
+}
 
-func (f *fakeStream) StreamPayments(ctx context.Context, _ horizonclient.OperationRequest, handler horizonclient.OperationHandler) error {
-	for _, op := range f.ops {
-		if ctx.Err() != nil {
-			return nil
+func (f *fakeStream) Payments(req horizonclient.OperationRequest) (operations.OperationsPage, error) {
+	f.requests = append(f.requests, req)
+	f.at = append(f.at, time.Now())
+	var page operations.OperationsPage
+	if req.Order == horizonclient.OrderDesc {
+		if n := len(f.ops); n > 0 {
+			page.Embedded.Records = []operations.Operation{f.ops[n-1]}
 		}
-		handler(op)
+		return page, nil
 	}
-	return nil
+	after, _ := strconv.ParseInt(req.Cursor, 10, 64)
+	for _, op := range f.ops {
+		if tok, _ := strconv.ParseInt(op.PagingToken(), 10, 64); tok <= after {
+			continue
+		}
+		if len(page.Embedded.Records) == int(req.Limit) {
+			break
+		}
+		page.Embedded.Records = append(page.Embedded.Records, op)
+	}
+	if len(page.Embedded.Records) == 0 && f.onEmpty != nil {
+		f.onEmpty()
+	}
+	return page, nil
 }
 
 func deposit(txHash, token string) operations.Payment {
@@ -88,12 +113,12 @@ func TestHandle_recordsBeforeSavingCursor(t *testing.T) {
 	}
 }
 
-func TestStream_failedInsertStopsWithoutSavingCursor(t *testing.T) {
+func TestPoll_failedInsertStopsWithoutSavingCursor(t *testing.T) {
 	st := &fakeStore{cursor: "99", insertErr: errors.New("connection refused")}
 	stream := &fakeStream{ops: []operations.Operation{deposit("dep-1", "100"), deposit("dep-2", "101")}}
 	w := testWatcher(st, stream)
 
-	err := w.stream(context.Background())
+	err := w.poll(context.Background())
 
 	if err == nil {
 		t.Fatal("stream returned no error after a deposit could not be recorded")
@@ -118,5 +143,55 @@ func TestHandle_alreadyRecordedIsNotDispatchedAgain(t *testing.T) {
 	}
 	if st.cursor != "100" {
 		t.Fatalf("cursor = %q, want it saved past the replay", st.cursor)
+	}
+}
+
+// A backlog larger than one page is read page after page without waiting:
+// Horizon's SSE stream delivered bursts at about 9 payments/s, which made
+// intake the bottleneck once channels could forward 100 per ledger.
+func TestPoll_drainsFullPagesWithoutWaiting(t *testing.T) {
+	var ops []operations.Operation
+	for i := range pageSize + 50 {
+		ops = append(ops, deposit(fmt.Sprintf("dep-%d", i), strconv.Itoa(1000+i)))
+	}
+	st := &fakeStore{cursor: "999"}
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := &fakeStream{ops: ops, onEmpty: cancel}
+	w := testWatcher(st, stream)
+	w.jobs = make(chan forwardJob, len(ops))
+
+	if err := w.poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if gap := stream.at[1].Sub(stream.at[0]); gap >= pollGap {
+		t.Fatalf("the page after a full one was requested %s later; want at once", gap)
+	}
+	if len(w.jobs) != len(ops) {
+		t.Fatalf("dispatched %d of %d deposits", len(w.jobs), len(ops))
+	}
+	if st.cursor != strconv.Itoa(1000+len(ops)-1) {
+		t.Fatalf("cursor = %s, want the last payment's", st.cursor)
+	}
+	if len(stream.requests) < 2 || stream.requests[0].Limit != pageSize || stream.requests[1].Cursor != strconv.Itoa(1000+pageSize-1) {
+		t.Fatalf("requests = %+v, want a full page then the next from its last token", stream.requests)
+	}
+}
+
+// With no saved cursor, polling starts after the pool's latest payment (the
+// paged "now"), not from the beginning of the pool's history.
+func TestPoll_noCursorStartsFromLatest(t *testing.T) {
+	st := &fakeStore{}
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := &fakeStream{ops: []operations.Operation{deposit("old-1", "500"), deposit("old-2", "501")}, onEmpty: cancel}
+	w := testWatcher(st, stream)
+
+	if err := w.poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.jobs) != 0 {
+		t.Fatalf("replayed %d historical deposits", len(w.jobs))
+	}
+	if last := stream.requests[len(stream.requests)-1]; last.Cursor != "501" {
+		t.Fatalf("polled from cursor %q, want the latest payment's (501)", last.Cursor)
 	}
 }
