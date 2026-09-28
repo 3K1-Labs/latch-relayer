@@ -903,6 +903,15 @@ func (f *Forwarder) signAndSend(
 		return "", permanent(fmt.Errorf("hash tx: %w", err))
 	}
 	if err := f.store.RecordSubmission(ctx, inboundHash, txHash, validUntil); err != nil {
+		// This exact transaction already belongs to another deposit: the
+		// sequencer handed out a number still in flight (resynced from a ledger
+		// that has not closed yet) and this forward rebuilt that deposit's
+		// transfer byte for byte. Sending it would get DUPLICATE and settle two
+		// deposits on one transfer. Nothing is sent; the caller resyncs and a
+		// retry builds on a fresh number, so it is contention, not a failure.
+		if errors.Is(err, store.ErrSubmissionClaimed) {
+			return "", contention(fmt.Errorf("outbound %s already recorded for another deposit", txHash))
+		}
 		// Nothing sent: without the record, a lost response could not be told
 		// apart from a transfer that never happened.
 		return "", transient(err)

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -79,6 +80,50 @@ func TestMarkForwardDoneClearsSubmission(t *testing.T) {
 	}
 	if f.SubmittedTx != nil || f.SubmittedUntil != nil {
 		t.Fatalf("done forward still has an in-flight transfer: %v %v", f.SubmittedTx, f.SubmittedUntil)
+	}
+}
+
+// One outbound transfer settles at most one deposit: a hash already held by
+// another forward, in flight or settled, is refused.
+func TestRecordSubmissionRefusesAnotherForwardsTransfer(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	until := time.Now().Add(time.Minute)
+
+	for i, in := range []string{"in-a", "in-b", "in-c"} {
+		if _, err := s.InsertForward(ctx, in, uint64(20+i), "GPOOL", "GFROM", "1.0000000", "native", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.RecordSubmission(ctx, "in-a", "out-shared", until); err != nil {
+		t.Fatal(err)
+	}
+	// Re-recording its own transfer (a resend of the same envelope) is fine.
+	if err := s.RecordSubmission(ctx, "in-a", "out-shared", until); err != nil {
+		t.Fatalf("re-record own submission: %v", err)
+	}
+
+	// In flight for in-a.
+	if err := s.RecordSubmission(ctx, "in-b", "out-shared", until); !errors.Is(err, ErrSubmissionClaimed) {
+		t.Fatalf("in-flight hash: err = %v, want ErrSubmissionClaimed", err)
+	}
+	if fwds, err := s.GetForwardByMemoID(ctx, 21); err != nil || len(fwds) != 1 {
+		t.Fatalf("in-b forwards = %v, err = %v", fwds, err)
+	} else if fwds[0].SubmittedTx != nil {
+		t.Fatalf("refused submission was recorded: %v", *fwds[0].SubmittedTx)
+	}
+
+	// Settled for in-a: submitted_tx is cleared, forward_tx still holds it.
+	if err := s.MarkForwardDone(ctx, "in-a", "out-shared"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordSubmission(ctx, "in-c", "out-shared", until); !errors.Is(err, ErrSubmissionClaimed) {
+		t.Fatalf("settled hash: err = %v, want ErrSubmissionClaimed", err)
+	}
+
+	// A different transfer is unaffected.
+	if err := s.RecordSubmission(ctx, "in-b", "out-b", until); err != nil {
+		t.Fatalf("distinct hash: %v", err)
 	}
 }
 
