@@ -9,7 +9,7 @@ This mirrors latch-api's deployment (`latch-api/docs/deployment.md`) on the same
 
 No Redis needed here — unlike latch-api, latch-relayer has no OTP/rate-limit/price-cache concerns.
 
-> **Note:** Render's free web service spins down after 15 minutes of inactivity and takes ~30 seconds to wake on the next request. Acceptable for development/testing; upgrade to a paid tier before this backs real production deposits (a sleeping relayer means a delayed deposit-forward, not a lost one — Horizon SSE resumes from the saved cursor on wake — but a paid always-on tier is the right call before this handles real user funds).
+> **Note:** Render's free web service spins down after 15 minutes of inactivity and takes ~30 seconds to wake on the next request. Acceptable for development/testing; upgrade to a paid tier before this backs real production deposits (a sleeping relayer means a delayed deposit-forward, not a lost one — payment polling resumes from the saved cursor on wake — but a paid always-on tier is the right call before this handles real user funds).
 
 ---
 
