@@ -14,16 +14,19 @@ import (
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
+	"github.com/stellar/go-stellar-sdk/keypair"
 
 	"github.com/latch/relayer/internal/config"
 	"github.com/latch/relayer/internal/db"
 	"github.com/latch/relayer/internal/gasless/api"
 	"github.com/latch/relayer/internal/gasless/balance"
 	"github.com/latch/relayer/internal/gasless/channels"
+	"github.com/latch/relayer/internal/gasless/sponsor"
 	"github.com/latch/relayer/internal/gasless/startup"
 	"github.com/latch/relayer/internal/httpx"
 	"github.com/latch/relayer/internal/lifecycle"
 	"github.com/latch/relayer/internal/metrics"
+	"github.com/latch/relayer/internal/signer"
 	"github.com/latch/relayer/migrations"
 )
 
@@ -101,6 +104,42 @@ func main() {
 	monitorDone := make(chan struct{})
 	go func() { monitor.Run(ctx); close(monitorDone) }()
 
+	// Sponsorship: what Latch pays for, through which channels, up to which caps.
+	policy, err := sponsor.ParsePolicy(cfg.SponsoredCalls)
+	if err != nil {
+		slog.Error("SPONSORED_CALLS", "err", err)
+		os.Exit(1)
+	}
+	relayerAccounts := map[string]bool{cfg.Executor.Address(): true, cfg.Funder.Address(): true}
+	channelKeys := make(map[string]*keypair.Full, len(cfg.Channels))
+	for _, ch := range cfg.Channels {
+		channelKeys[ch.Address()] = ch.Keypair
+		relayerAccounts[ch.Address()] = true
+	}
+	records := sponsor.NewStore(pool)
+	submitter := &sponsor.Submitter{
+		RPC:         rpc,
+		Channels:    chanPool,
+		Records:     records,
+		ChannelKeys: channelKeys,
+		Funder:      signer.FromKeypair(cfg.Funder),
+		Passphrase:  cfg.NetworkPassphrase,
+		Policy:      policy,
+		Limits: sponsor.Limits{
+			MaxTxPerWallet:      cfg.SponsorMaxTxPerWallet,
+			MaxStroopsPerWallet: cfg.SponsorMaxStroopsPerWallet,
+			MaxStroopsPerDay:    cfg.SponsorMaxStroopsPerDay,
+		},
+		MaxInclusionFee: cfg.MaxInclusionFeeStroops,
+		Available:       monitor.SponsorshipOK,
+		RelayerAccounts: relayerAccounts,
+	}
+	resolverDone := make(chan struct{})
+	go func() {
+		(&sponsor.Resolver{Submitter: submitter, Interval: 30 * time.Second}).Run(ctx)
+		close(resolverDone)
+	}()
+
 	// ── 6. HTTP server ────────────────────────────────────────────────────────
 	draining := &httpx.Draining{}
 	limiter := httpx.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
@@ -112,6 +151,12 @@ func main() {
 		FeeForwarderID: cfg.FeeForwarderID,
 		Executor:       cfg.Executor.Address(),
 		Funder:         cfg.Funder.Address(),
+	}).Register(mux)
+	(&api.Submissions{
+		Sponsor:  submitter,
+		Records:  records,
+		Work:     work,
+		SyncWait: cfg.SyncWait,
 	}).Register(mux)
 	mux.Handle("GET /metrics", m.Handler())
 
@@ -159,9 +204,11 @@ func main() {
 	if !work.Drain(time.Until(deadline)) {
 		slog.Warn("shutdown: drain deadline passed, cancelled remaining in-flight work")
 	}
-	select {
-	case <-monitorDone:
-	case <-time.After(time.Until(deadline)):
+	for _, done := range []chan struct{}{monitorDone, resolverDone} {
+		select {
+		case <-done:
+		case <-time.After(time.Until(deadline)):
+		}
 	}
 	slog.Info("shutdown complete")
 }
