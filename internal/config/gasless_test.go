@@ -21,6 +21,7 @@ func validGaslessEnv(t *testing.T) (executor, funder *keypair.Full) {
 	t.Setenv("FUNDER_PRIVATE_KEY", funder.Seed())
 	t.Setenv("CHANNEL_SEED", "000102030405060708090a0b0c0d0e0f")
 	t.Setenv("CHANNEL_COUNT", "3")
+	t.Setenv("SPONSORED_CALLS", "wallet:add_context_rule")
 	return executor, funder
 }
 
@@ -65,14 +66,17 @@ func TestLoadGasless_RefusesDepositSettings(t *testing.T) {
 
 func TestLoadGasless_Validation(t *testing.T) {
 	cases := map[string]func(t *testing.T){
-		"missing forwarder": func(t *testing.T) { t.Setenv("FEE_FORWARDER_CONTRACT_ID", "") },
-		"forwarder not C":   func(t *testing.T) { t.Setenv("FEE_FORWARDER_CONTRACT_ID", keypair.MustRandom().Address()) },
-		"executor mismatch": func(t *testing.T) { t.Setenv("EXECUTOR_ADDRESS", keypair.MustRandom().Address()) },
-		"missing funder":    func(t *testing.T) { t.Setenv("FUNDER_PRIVATE_KEY", "") },
-		"short seed":        func(t *testing.T) { t.Setenv("CHANNEL_SEED", "0001") },
-		"seed not hex":      func(t *testing.T) { t.Setenv("CHANNEL_SEED", "not-hex-not-hex-not-hex-not-hex!") },
-		"no channel count":  func(t *testing.T) { t.Setenv("CHANNEL_COUNT", "") },
-		"bad funder floor":  func(t *testing.T) { t.Setenv("FUNDER_MIN_XLM", "lots") },
+		"missing forwarder":  func(t *testing.T) { t.Setenv("FEE_FORWARDER_CONTRACT_ID", "") },
+		"forwarder not C":    func(t *testing.T) { t.Setenv("FEE_FORWARDER_CONTRACT_ID", keypair.MustRandom().Address()) },
+		"executor mismatch":  func(t *testing.T) { t.Setenv("EXECUTOR_ADDRESS", keypair.MustRandom().Address()) },
+		"missing funder":     func(t *testing.T) { t.Setenv("FUNDER_PRIVATE_KEY", "") },
+		"short seed":         func(t *testing.T) { t.Setenv("CHANNEL_SEED", "0001") },
+		"seed not hex":       func(t *testing.T) { t.Setenv("CHANNEL_SEED", "not-hex-not-hex-not-hex-not-hex!") },
+		"no channel count":   func(t *testing.T) { t.Setenv("CHANNEL_COUNT", "") },
+		"bad funder floor":   func(t *testing.T) { t.Setenv("FUNDER_MIN_XLM", "lots") },
+		"no sponsored calls": func(t *testing.T) { t.Setenv("SPONSORED_CALLS", " ") },
+		"bad wallet cap":     func(t *testing.T) { t.Setenv("SPONSOR_MAX_TX_PER_WALLET", "0") },
+		"inclusion too low":  func(t *testing.T) { t.Setenv("MAX_INCLUSION_FEE_STROOPS", "50") },
 		"executor is funder": func(t *testing.T) {
 			kp := keypair.MustRandom()
 			t.Setenv("EXECUTOR_ADDRESS", kp.Address())
