@@ -12,7 +12,7 @@
    /v1/accounts/deposit-intent   ───────────────►  PATCH /intents/{memo_id}
    /v1/accounts/deposit/status/:memo_id ────────►
    /api/on-ramp/session, /intent/:id (webapp) ──►
-                                                        │ watches pool via Horizon SSE
+                                                        │ polls pool payments on Horizon
  depositor wallet ── payment + MEMO_ID ──► pool G-address ┘
                                                         │ SAC transfer
                                                         ▼
@@ -73,7 +73,7 @@ latch-api has wallet sign-in, so a script can get a JWT with just a keypair:
 
 ### Resilience (optional, run by hand)
 - R1 **Cold start:** leave the relayer idle for 15+ min, then create an intent. latch-api should ride out the boot, or return 503 BAD_GATEWAY within its budget.
-- R2 **Deposit while the relayer sleeps:** send the payment while it's asleep, then wake it. The SSE cursor should resume and the payment should still be forwarded.
+- R2 **Deposit while the relayer sleeps:** send the payment while it's asleep, then wake it. The saved cursor should resume and the payment should still be forwarded.
 - R3 **Small burst:** 10 concurrent intents and deposits, all forwarded, no duplicates.
 
 ### Webapp on-ramp path (if it's enabled in prod)
