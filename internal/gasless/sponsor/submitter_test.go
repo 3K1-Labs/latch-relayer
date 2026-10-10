@@ -29,6 +29,10 @@ type fakeRPC struct {
 	pollResp  protocol.GetTransactionResponse
 	pollErr   error
 	accountSq int64
+	// record mode: the auth entries a recording simulation returns
+	recordAuth []string
+	simModes   []string
+	simTxs     []string
 }
 
 func (f *fakeRPC) GetNetwork(context.Context) (protocol.GetNetworkResponse, error) {
@@ -51,7 +55,23 @@ func (f *fakeRPC) GetLedgerEntries(_ context.Context, req protocol.GetLedgerEntr
 	return out, nil
 }
 
+func (f *fakeRPC) GetLatestLedger(context.Context) (protocol.GetLatestLedgerResponse, error) {
+	return protocol.GetLatestLedgerResponse{Sequence: 5000}, nil
+}
+
 func (f *fakeRPC) SimulateTransaction(_ context.Context, req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+	f.mu.Lock()
+	f.simModes = append(f.simModes, req.AuthMode)
+	f.simTxs = append(f.simTxs, req.Transaction)
+	f.mu.Unlock()
+	if req.AuthMode == protocol.AuthModeRecord {
+		if f.recordAuth == nil {
+			return protocol.SimulateTransactionResponse{}, errors.New("unexpected record-mode simulation")
+		}
+		auth := f.recordAuth
+		return protocol.SimulateTransactionResponse{MinResourceFee: f.resource,
+			Results: []protocol.SimulateHostFunctionResult{{AuthXDR: &auth}}}, nil
+	}
 	if req.AuthMode != protocol.AuthModeEnforce {
 		return protocol.SimulateTransactionResponse{}, errors.New("simulation must enforce auth")
 	}

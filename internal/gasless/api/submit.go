@@ -28,10 +28,19 @@ type Background interface {
 	Go(f func(ctx context.Context))
 }
 
-// Submissions serves POST /gasless/submit and GET /gasless/requests/{id}.
+// Quoter is satisfied by *sponsor.Submitter.
+type Quoter interface {
+	Quote(ctx context.Context, token string, resourceFee int64) (sponsor.Quote, error)
+	FeeTokens() []sponsor.FeeToken
+	ForwardAddresses() (feeForwarder, relayer string)
+}
+
+// Submissions serves POST /gasless/submit, GET /gasless/requests/{id}, and
+// forward mode's POST /gasless/quote and GET /gasless/fee-tokens.
 type Submissions struct {
 	Sponsor  Sponsor
 	Records  RecordReader
+	Quoter   Quoter
 	Work     Background
 	SyncWait time.Duration
 }
@@ -41,6 +50,50 @@ const maxSubmitBody = 128 << 10
 func (s *Submissions) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /gasless/submit", s.Submit)
 	mux.HandleFunc("GET /gasless/requests/{id}", s.Get)
+	mux.HandleFunc("POST /gasless/quote", s.Quote)
+	mux.HandleFunc("GET /gasless/fee-tokens", s.FeeTokens)
+}
+
+type quoteRequest struct {
+	FeeToken           string `json:"fee_token"`
+	ResourceFeeStroops int64  `json:"resource_fee_stroops"`
+}
+
+// Quote returns the max_fee_amount a user should sign for a forward() whose
+// simulation reported resource_fee_stroops, plus the FeeForwarder and relayer
+// addresses to build it with.
+func (s *Submissions) Quote(w http.ResponseWriter, r *http.Request) {
+	var req quoteRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "body must be {fee_token, resource_fee_stroops}: "+err.Error())
+		return
+	}
+	q, err := s.Quoter.Quote(r.Context(), req.FeeToken, req.ResourceFeeStroops)
+	if err != nil {
+		status, code := prepareError(err)
+		if status == http.StatusInternalServerError {
+			slog.Error("gasless quote", "err", err)
+			writeError(w, status, code, "internal error")
+			return
+		}
+		writeError(w, status, code, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, q)
+}
+
+// FeeTokens lists the tokens users may pay fees in, with the FeeForwarder
+// and relayer addresses a forward() call is built with.
+func (s *Submissions) FeeTokens(w http.ResponseWriter, _ *http.Request) {
+	tokens := s.Quoter.FeeTokens()
+	if tokens == nil {
+		writeError(w, http.StatusNotImplemented, "not_implemented", sponsor.ErrForwardNotBuilt.Error())
+		return
+	}
+	forwarder, relayer := s.Quoter.ForwardAddresses()
+	writeJSON(w, http.StatusOK, map[string]any{"fee_tokens": tokens, "fee_forwarder": forwarder, "relayer": relayer})
 }
 
 // Submit validates, simulates and reserves a submission, then sends it in
@@ -128,6 +181,10 @@ func prepareError(err error) (int, string) {
 		return http.StatusTooManyRequests, "daily_budget_reached"
 	case errors.Is(err, sponsor.ErrSimulation):
 		return http.StatusUnprocessableEntity, "simulation_failed"
+	case errors.Is(err, sponsor.ErrFeeTooLow):
+		return http.StatusUnprocessableEntity, "max_fee_too_low"
+	case errors.Is(err, sponsor.ErrPriceUnavailable):
+		return http.StatusServiceUnavailable, "price_unavailable"
 	case errors.Is(err, sponsor.ErrUnavailable):
 		return http.StatusServiceUnavailable, "sponsorship_unavailable"
 	default:

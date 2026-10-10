@@ -28,16 +28,18 @@ func (s Status) Final() bool {
 
 // Record is one submission's stored state: what latch-api gets back.
 type Record struct {
-	RequestID         string    `json:"request_id"`
-	Wallet            string    `json:"wallet"`
-	Mode              Mode      `json:"mode"`
-	Status            Status    `json:"status"`
-	TxHash            string    `json:"tx_hash,omitempty"`
-	FeeChargedStroops *int64    `json:"fee_charged_stroops,omitempty"`
-	ErrorCode         string    `json:"error_code,omitempty"`
-	ErrorMessage      string    `json:"error_message,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	RequestID         string `json:"request_id"`
+	Wallet            string `json:"wallet"`
+	Mode              Mode   `json:"mode"`
+	Status            Status `json:"status"`
+	TxHash            string `json:"tx_hash,omitempty"`
+	FeeChargedStroops *int64 `json:"fee_charged_stroops,omitempty"`
+	ErrorCode         string `json:"error_code,omitempty"`
+	ErrorMessage      string `json:"error_message,omitempty"`
+	// UserFee is set in forward mode: what the user reimbursed.
+	UserFee   *UserFee  `json:"user_fee,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 
 	payloadHash string
 }
@@ -64,12 +66,22 @@ type Store struct{ db *pgxpool.Pool }
 func NewStore(db *pgxpool.Pool) *Store { return &Store{db: db} }
 
 const recordColumns = `request_id, payload_hash, wallet, mode, status, COALESCE(tx_hash, ''),
-	fee_charged_stroops, COALESCE(error_code, ''), COALESCE(error_message, ''), created_at, updated_at`
+	fee_charged_stroops, COALESCE(error_code, ''), COALESCE(error_message, ''),
+	user_fee_token, user_fee_symbol, user_fee_amount, created_at, updated_at`
 
 func scanRecord(row pgx.Row) (Record, error) {
 	var r Record
+	var feeToken, feeSymbol *string
+	var feeAmount *int64
 	err := row.Scan(&r.RequestID, &r.payloadHash, &r.Wallet, &r.Mode, &r.Status, &r.TxHash,
-		&r.FeeChargedStroops, &r.ErrorCode, &r.ErrorMessage, &r.CreatedAt, &r.UpdatedAt)
+		&r.FeeChargedStroops, &r.ErrorCode, &r.ErrorMessage,
+		&feeToken, &feeSymbol, &feeAmount, &r.CreatedAt, &r.UpdatedAt)
+	if err == nil && feeToken != nil && feeAmount != nil {
+		r.UserFee = &UserFee{Token: *feeToken, Amount: *feeAmount}
+		if feeSymbol != nil {
+			r.UserFee.Symbol = *feeSymbol
+		}
+	}
 	return r, err
 }
 
@@ -95,6 +107,8 @@ type Reservation struct {
 	Contract      string
 	Function      string
 	MaxFeeStroops int64
+	// UserFee is set in forward mode.
+	UserFee *UserFee
 }
 
 // spendSQL is what a row counts against a cap: the charged fee once known,
@@ -126,41 +140,61 @@ func (s *Store) Reserve(ctx context.Context, res Reservation, lim Limits) (rec R
 			return fmt.Errorf("look up request: %w", err)
 		}
 
-		var count int
-		var walletSpend int64
-		if err := tx.QueryRow(ctx, `SELECT count(*), `+spendSQL+`
-			FROM sponsored_transactions
-			WHERE wallet = $1 AND mode = $2 AND status <> 'rejected'`,
-			res.Wallet, res.Mode).Scan(&count, &walletSpend); err != nil {
-			return fmt.Errorf("wallet usage: %w", err)
-		}
-		if count >= lim.MaxTxPerWallet || walletSpend+res.MaxFeeStroops > lim.MaxStroopsPerWallet {
-			return ErrWalletCap
+		// Caps limit what Latch pays for. In forward mode the user reimburses
+		// the fee, so nothing is counted against them.
+		if res.Mode == ModeSponsored {
+			if err := checkCaps(ctx, tx, res, lim); err != nil {
+				return err
+			}
 		}
 
-		var daySpend int64
-		if err := tx.QueryRow(ctx, `SELECT `+spendSQL+`
-			FROM sponsored_transactions
-			WHERE mode = $1 AND status <> 'rejected' AND created_at > NOW() - INTERVAL '24 hours'`,
-			res.Mode).Scan(&daySpend); err != nil {
-			return fmt.Errorf("daily usage: %w", err)
+		var feeToken, feeSymbol *string
+		var feeAmount *int64
+		if f := res.UserFee; f != nil {
+			feeToken, feeSymbol, feeAmount = &f.Token, &f.Symbol, &f.Amount
 		}
-		if daySpend+res.MaxFeeStroops > lim.MaxStroopsPerDay {
-			return ErrDailyBudget
-		}
-
 		rec, err = scanRecord(tx.QueryRow(ctx, `
 			INSERT INTO sponsored_transactions
-				(request_id, payload_hash, wallet, mode, target_contract, target_function, fee_reserved_stroops)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+				(request_id, payload_hash, wallet, mode, target_contract, target_function, fee_reserved_stroops,
+				 user_fee_token, user_fee_symbol, user_fee_amount)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			RETURNING `+recordColumns,
-			res.RequestID, res.PayloadHash, res.Wallet, res.Mode, res.Contract, res.Function, res.MaxFeeStroops))
+			res.RequestID, res.PayloadHash, res.Wallet, res.Mode, res.Contract, res.Function, res.MaxFeeStroops,
+			feeToken, feeSymbol, feeAmount))
 		if err != nil {
 			return fmt.Errorf("insert sponsored transaction: %w", err)
 		}
 		return nil
 	})
 	return rec, existing, err
+}
+
+// checkCaps refuses a sponsored reservation that would overrun the wallet's
+// allowance or the daily budget. Runs under Reserve's lock.
+func checkCaps(ctx context.Context, tx pgx.Tx, res Reservation, lim Limits) error {
+	var count int
+	var walletSpend int64
+	if err := tx.QueryRow(ctx, `SELECT count(*), `+spendSQL+`
+		FROM sponsored_transactions
+		WHERE wallet = $1 AND mode = $2 AND status <> 'rejected'`,
+		res.Wallet, res.Mode).Scan(&count, &walletSpend); err != nil {
+		return fmt.Errorf("wallet usage: %w", err)
+	}
+	if count >= lim.MaxTxPerWallet || walletSpend+res.MaxFeeStroops > lim.MaxStroopsPerWallet {
+		return ErrWalletCap
+	}
+
+	var daySpend int64
+	if err := tx.QueryRow(ctx, `SELECT `+spendSQL+`
+		FROM sponsored_transactions
+		WHERE mode = $1 AND status <> 'rejected' AND created_at > NOW() - INTERVAL '24 hours'`,
+		res.Mode).Scan(&daySpend); err != nil {
+		return fmt.Errorf("daily usage: %w", err)
+	}
+	if daySpend+res.MaxFeeStroops > lim.MaxStroopsPerDay {
+		return ErrDailyBudget
+	}
+	return nil
 }
 
 // Outcome is how a submission ended (or where it stands).

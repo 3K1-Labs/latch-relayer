@@ -77,6 +77,10 @@ func TestLoadGasless_Validation(t *testing.T) {
 		"no sponsored calls": func(t *testing.T) { t.Setenv("SPONSORED_CALLS", " ") },
 		"bad wallet cap":     func(t *testing.T) { t.Setenv("SPONSOR_MAX_TX_PER_WALLET", "0") },
 		"inclusion too low":  func(t *testing.T) { t.Setenv("MAX_INCLUSION_FEE_STROOPS", "50") },
+		"usdc not C":         func(t *testing.T) { t.Setenv("USDC_CONTRACT_ID", keypair.MustRandom().Address()) },
+		"bad price":          func(t *testing.T) { t.Setenv("XLM_USD_PRICE", "-1") },
+		"bad margin":         func(t *testing.T) { t.Setenv("FEE_MARGIN_BPS", "abc") },
+		"short auth window":  func(t *testing.T) { t.Setenv("EXECUTOR_AUTH_LEDGERS", "2") },
 		"executor is funder": func(t *testing.T) {
 			kp := keypair.MustRandom()
 			t.Setenv("EXECUTOR_ADDRESS", kp.Address())

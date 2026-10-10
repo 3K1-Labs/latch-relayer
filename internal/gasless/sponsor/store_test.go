@@ -156,3 +156,24 @@ func TestStore_Stale(t *testing.T) {
 		t.Fatalf("stale = %+v, want s1 (pending) and s2 (unconfirmed)", stale)
 	}
 }
+
+func TestStore_ForwardModeSkipsCapsAndKeepsUserFee(t *testing.T) {
+	s, ctx := newStore(t), context.Background()
+	tight := Limits{MaxTxPerWallet: 1, MaxStroopsPerWallet: 1, MaxStroopsPerDay: 1}
+	for i := range 3 {
+		res := reservation(fmt.Sprintf("fwd%d", i), "W", 1_000)
+		res.Mode = ModeForward
+		res.UserFee = &UserFee{Token: "CUSDC", Symbol: "USDC", Amount: 12_650}
+		rec, _, err := s.Reserve(ctx, res, tight)
+		if err != nil {
+			t.Fatalf("forward reservation %d: %v", i, err)
+		}
+		if rec.UserFee == nil || rec.UserFee.Amount != 12_650 || rec.UserFee.Symbol != "USDC" {
+			t.Fatalf("user fee = %+v", rec.UserFee)
+		}
+	}
+	// Forward rows don't count against sponsored caps either.
+	if _, _, err := s.Reserve(ctx, reservation("sp1", "W", 1), Limits{MaxTxPerWallet: 1, MaxStroopsPerWallet: 10, MaxStroopsPerDay: 10}); err != nil {
+		t.Fatalf("sponsored after forward rows: %v", err)
+	}
+}
