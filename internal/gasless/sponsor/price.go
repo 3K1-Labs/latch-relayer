@@ -134,3 +134,12 @@ func (s *Submitter) FeeTokens() []FeeToken {
 	}
 	return out
 }
+
+// ForwardAddresses returns the FeeForwarder and the executor (forward()'s
+// relayer argument), or empty strings when forward mode is off.
+func (s *Submitter) ForwardAddresses() (feeForwarder, relayer string) {
+	if s.Forward == nil {
+		return "", ""
+	}
+	return s.Forward.ForwarderID, s.Forward.Executor.Address()
+}

@@ -139,6 +139,8 @@ func (f fakeQuoter) Quote(_ context.Context, token string, resourceFee int64) (s
 	return sponsor.Quote{FeeToken: token, Symbol: "XLM", MaxFeeAmount: resourceFee * 2, Relayer: "GEXEC", FeeForwarder: "CFWD"}, nil
 }
 
+func (f fakeQuoter) ForwardAddresses() (string, string) { return "CFWD", "GEXEC" }
+
 func (f fakeQuoter) FeeTokens() []sponsor.FeeToken {
 	if f.err != nil {
 		return nil
@@ -167,7 +169,7 @@ func TestQuoteEndpoint(t *testing.T) {
 }
 
 func TestFeeTokensEndpoint(t *testing.T) {
-	if code, out := serve(t, &Submissions{Quoter: fakeQuoter{}}, "GET", "/gasless/fee-tokens", ""); code != http.StatusOK || out["fee_tokens"] == nil {
+	if code, out := serve(t, &Submissions{Quoter: fakeQuoter{}}, "GET", "/gasless/fee-tokens", ""); code != http.StatusOK || out["fee_tokens"] == nil || out["fee_forwarder"] != "CFWD" || out["relayer"] != "GEXEC" {
 		t.Fatalf("%d %v", code, out)
 	}
 	if code, _ := serve(t, &Submissions{Quoter: fakeQuoter{err: sponsor.ErrForwardNotBuilt}}, "GET", "/gasless/fee-tokens", ""); code != http.StatusNotImplemented {

@@ -32,6 +32,7 @@ type Background interface {
 type Quoter interface {
 	Quote(ctx context.Context, token string, resourceFee int64) (sponsor.Quote, error)
 	FeeTokens() []sponsor.FeeToken
+	ForwardAddresses() (feeForwarder, relayer string)
 }
 
 // Submissions serves POST /gasless/submit, GET /gasless/requests/{id}, and
@@ -83,14 +84,16 @@ func (s *Submissions) Quote(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, q)
 }
 
-// FeeTokens lists the tokens users may pay fees in.
+// FeeTokens lists the tokens users may pay fees in, with the FeeForwarder
+// and relayer addresses a forward() call is built with.
 func (s *Submissions) FeeTokens(w http.ResponseWriter, _ *http.Request) {
 	tokens := s.Quoter.FeeTokens()
 	if tokens == nil {
 		writeError(w, http.StatusNotImplemented, "not_implemented", sponsor.ErrForwardNotBuilt.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"fee_tokens": tokens})
+	forwarder, relayer := s.Quoter.ForwardAddresses()
+	writeJSON(w, http.StatusOK, map[string]any{"fee_tokens": tokens, "fee_forwarder": forwarder, "relayer": relayer})
 }
 
 // Submit validates, simulates and reserves a submission, then sends it in

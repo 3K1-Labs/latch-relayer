@@ -86,7 +86,7 @@ POST /gasless/quote
 {"fee_forwarder": "C…", "relayer": "G…EXECUTOR", "fee_token": "C…", "symbol": "XLM", "max_fee_amount": 114043}
 ```
 
-`max_fee_amount` is in the token's units (7 decimals). It covers the highest inclusion fee this service will bid plus `FEE_MARGIN_BPS`, so a surge can't push the real fee above it. The user is charged the actual cost, usually much less. `GET /gasless/fee-tokens` lists the accepted tokens.
+`max_fee_amount` is in the token's units (7 decimals). It covers the highest inclusion fee this service will bid plus `FEE_MARGIN_BPS`, so a surge can't push the real fee above it. The user is charged the actual cost, usually much less. `GET /gasless/fee-tokens` lists the accepted tokens with the `fee_forwarder` and `relayer` addresses.
 
 **2. Build and sign** — latch-api wraps the action in `forward(fee_token, fee_amount, max_fee_amount, expiration_ledger, target_contract, target_fn, target_args, user, relayer)` on `fee_forwarder`, with any `fee_amount` (it is replaced) and `relayer` from the quote. It simulates in record mode, keeps the **user's** authorization entry (rooted at `forward` with `(fee_token, max_fee_amount, expiration_ledger, target_contract, target_fn, target_args)`, with the fee token's `approve` and the target call beneath it), has the user sign it, and **drops the executor's entry**.
 
