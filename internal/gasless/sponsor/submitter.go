@@ -49,6 +49,7 @@ var ledgerTime = 5 * time.Second
 type RPC interface {
 	chain.RPC
 	GetFeeStats(ctx context.Context) (protocol.GetFeeStatsResponse, error)
+	GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error)
 	SendTransaction(ctx context.Context, req protocol.SendTransactionRequest) (protocol.SendTransactionResponse, error)
 	GetTransaction(ctx context.Context, req protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error)
 	PollTransaction(ctx context.Context, hash string) (protocol.GetTransactionResponse, error)
@@ -88,6 +89,8 @@ type Submitter struct {
 	// RelayerAccounts are this service's own addresses: no auth entry may
 	// claim to act for them.
 	RelayerAccounts map[string]bool
+	// Forward enables forward mode (user pays in XLM or USDC); nil disables it.
+	Forward *Forward
 }
 
 // Prepare-time errors. Validation errors (ErrInvalid, ErrNotSponsorable,
@@ -111,7 +114,7 @@ type Prepared struct {
 // request_id already exists with the same body, it returns that record and
 // existing=true; the caller must not Run it.
 func (s *Submitter) Prepare(ctx context.Context, req Request) (p Prepared, existing bool, err error) {
-	call, err := Validate(req, s.Policy, s.RelayerAccounts)
+	call, err := Validate(req, s.Policy, s.RelayerAccounts, s.Forward != nil)
 	if err != nil {
 		return Prepared{}, false, err
 	}
@@ -134,25 +137,118 @@ func (s *Submitter) Prepare(ctx context.Context, req Request) (p Prepared, exist
 		return Prepared{}, false, ErrUnavailable
 	}
 
+	inclusion := s.inclusionFee(ctx)
+	contract, function := call.Contract, call.Function
+	var userFee *UserFee
+	if req.Mode == ModeForward {
+		fc, err := s.Forward.parseForward(call, req.Wallet)
+		if err != nil {
+			return Prepared{}, false, err
+		}
+		if call, userFee, err = s.priceForward(ctx, call, fc, inclusion); err != nil {
+			return Prepared{}, false, err
+		}
+		// Record what the user is really doing, not just "forward".
+		contract, function = fc.target, fc.targetFn
+	}
+
 	sd, err := s.simulate(ctx, call)
 	if err != nil {
 		return Prepared{}, false, err
 	}
-	inclusion := s.inclusionFee(ctx)
 
 	rec, existing, err := s.Records.Reserve(ctx, Reservation{
 		RequestID:     req.RequestID,
 		PayloadHash:   hash,
 		Wallet:        req.Wallet,
 		Mode:          req.Mode,
-		Contract:      call.Contract,
-		Function:      call.Function,
+		Contract:      contract,
+		Function:      function,
 		MaxFeeStroops: s.maxBid(int64(sd.ResourceFee)),
+		UserFee:       userFee,
 	}, s.Limits)
 	if err != nil {
 		return Prepared{}, false, err
 	}
 	return Prepared{Record: rec, call: call, sorobanData: sd, inclusion: inclusion}, existing, nil
+}
+
+// UserFee is what the user pays FeeForwarder for one forward().
+type UserFee struct {
+	Token  string `json:"token"` // fee token contract
+	Symbol string `json:"symbol"`
+	Amount int64  `json:"amount"` // in the token's units (7 decimals)
+}
+
+// priceForward fills in fee_amount and the executor's signed authorization:
+//  1. simulate in record mode with fee_amount at the user's maximum, to get
+//     the resource fee and the executor's authorization to sign;
+//  2. price the network cost in the fee token (refused if over the maximum);
+//  3. rewrite fee_amount, sign the executor's entry, and attach it beside the
+//     user's signed entries. The caller's enforce-mode simulation then checks
+//     both signatures before anything is paid.
+func (s *Submitter) priceForward(ctx context.Context, call Call, fc forwardCall, inclusion int64) (Call, *UserFee, error) {
+	f := s.Forward
+	placeholder, err := f.withFee(call, fc.maxFee)
+	if err != nil {
+		return Call{}, nil, err
+	}
+	resp, err := s.simulateRaw(ctx, Call{HostFunction: placeholder}, protocol.AuthModeRecord)
+	if err != nil {
+		return Call{}, nil, err
+	}
+	recorded, err := executorEntry(resp, f.Executor.Address())
+	if err != nil {
+		return Call{}, nil, fmt.Errorf("%w: %v", ErrSimulation, err)
+	}
+
+	cost := 2*inclusion + resp.MinResourceFee
+	fee, err := f.FeeInToken(ctx, fc.token, cost)
+	if err != nil {
+		return Call{}, nil, err
+	}
+	if fee > fc.maxFee {
+		return Call{}, nil, fmt.Errorf("%w: needs %d %s units, user allowed %d", ErrFeeTooLow, fee, fc.token.Symbol, fc.maxFee)
+	}
+
+	hf, err := f.withFee(call, fee)
+	if err != nil {
+		return Call{}, nil, err
+	}
+	entry, err := setRootFeeAmount(recorded, fee)
+	if err != nil {
+		return Call{}, nil, fmt.Errorf("%w: %v", ErrSimulation, err)
+	}
+	latest, err := s.RPC.GetLatestLedger(ctx)
+	if err != nil {
+		return Call{}, nil, fmt.Errorf("latest ledger: %w", err)
+	}
+	signed, err := signExecutorEntry(ctx, f.Executor, s.Passphrase, entry, latest.Sequence+f.AuthLedgers)
+	if err != nil {
+		return Call{}, nil, err
+	}
+
+	out := call
+	out.HostFunction = hf
+	out.Auth = append(append([]xdr.SorobanAuthorizationEntry(nil), call.Auth...), signed)
+	return out, &UserFee{Token: fc.token.Contract, Symbol: fc.token.Symbol, Amount: fee}, nil
+}
+
+// executorEntry finds the executor's recorded authorization.
+func executorEntry(resp protocol.SimulateTransactionResponse, executor string) (xdr.SorobanAuthorizationEntry, error) {
+	if len(resp.Results) == 0 || resp.Results[0].AuthXDR == nil {
+		return xdr.SorobanAuthorizationEntry{}, errors.New("simulation recorded no authorizations")
+	}
+	for _, b64 := range *resp.Results[0].AuthXDR {
+		var e xdr.SorobanAuthorizationEntry
+		if err := xdr.SafeUnmarshalBase64(b64, &e); err != nil {
+			return xdr.SorobanAuthorizationEntry{}, fmt.Errorf("decode recorded auth: %w", err)
+		}
+		if addr, err := authAddress(e.Credentials); err == nil && addr == executor {
+			return e, nil
+		}
+	}
+	return xdr.SorobanAuthorizationEntry{}, errors.New("simulation recorded no executor authorization")
 }
 
 // payloadHash identifies a request body, so a reused request_id with a
@@ -171,32 +267,39 @@ func payloadHash(req Request) (string, error) {
 // The funder is the simulation's source; the footprint and resources don't
 // depend on the source because source-account credentials are refused.
 func (s *Submitter) simulate(ctx context.Context, call Call) (xdr.SorobanTransactionData, error) {
-	env, err := s.envelope(s.Funder.Address(), 0, call, nil, txnbuild.MinBaseFee, time.Now().Add(txValidity))
+	resp, err := s.simulateRaw(ctx, call, protocol.AuthModeEnforce)
 	if err != nil {
 		return xdr.SorobanTransactionData{}, err
-	}
-	b64, err := xdr.MarshalBase64(env)
-	if err != nil {
-		return xdr.SorobanTransactionData{}, fmt.Errorf("encode simulation: %w", err)
-	}
-	resp, err := s.RPC.SimulateTransaction(ctx, protocol.SimulateTransactionRequest{
-		Transaction: b64,
-		AuthMode:    protocol.AuthModeEnforce,
-	})
-	if err != nil {
-		return xdr.SorobanTransactionData{}, fmt.Errorf("simulate: %w", err)
-	}
-	if resp.Error != "" {
-		return xdr.SorobanTransactionData{}, fmt.Errorf("%w: %s", ErrSimulation, resp.Error)
-	}
-	if resp.RestorePreamble != nil {
-		return xdr.SorobanTransactionData{}, fmt.Errorf("%w: contract state is archived and must be restored first", ErrSimulation)
 	}
 	var sd xdr.SorobanTransactionData
 	if err := xdr.SafeUnmarshalBase64(resp.TransactionDataXDR, &sd); err != nil {
 		return xdr.SorobanTransactionData{}, fmt.Errorf("%w: decode transaction data: %v", ErrSimulation, err)
 	}
 	return sd, nil
+}
+
+// simulateRaw simulates call in authMode and returns the response, failing
+// on a simulation error or archived state.
+func (s *Submitter) simulateRaw(ctx context.Context, call Call, authMode string) (protocol.SimulateTransactionResponse, error) {
+	env, err := s.envelope(s.Funder.Address(), 0, call, nil, txnbuild.MinBaseFee, time.Now().Add(txValidity))
+	if err != nil {
+		return protocol.SimulateTransactionResponse{}, err
+	}
+	b64, err := xdr.MarshalBase64(env)
+	if err != nil {
+		return protocol.SimulateTransactionResponse{}, fmt.Errorf("encode simulation: %w", err)
+	}
+	resp, err := s.RPC.SimulateTransaction(ctx, protocol.SimulateTransactionRequest{Transaction: b64, AuthMode: authMode})
+	if err != nil {
+		return protocol.SimulateTransactionResponse{}, fmt.Errorf("simulate: %w", err)
+	}
+	if resp.Error != "" {
+		return protocol.SimulateTransactionResponse{}, fmt.Errorf("%w: %s", ErrSimulation, resp.Error)
+	}
+	if resp.RestorePreamble != nil {
+		return protocol.SimulateTransactionResponse{}, fmt.Errorf("%w: contract state is archived and must be restored first", ErrSimulation)
+	}
+	return resp, nil
 }
 
 // inclusionFee bids the network's recent p90 Soroban inclusion fee, at least

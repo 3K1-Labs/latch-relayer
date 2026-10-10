@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	"github.com/stellar/go-stellar-sdk/keypair"
+	"github.com/stellar/go-stellar-sdk/strkey"
+	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/latch/relayer/internal/config"
 	"github.com/latch/relayer/internal/db"
@@ -134,6 +137,16 @@ func main() {
 		Available:       monitor.SponsorshipOK,
 		RelayerAccounts: relayerAccounts,
 	}
+	if cfg.ForwardEnabled {
+		fwd, err := forwardConfig(cfg)
+		if err != nil {
+			slog.Error("forward mode", "err", err)
+			os.Exit(1)
+		}
+		submitter.Forward = fwd
+		slog.Info("forward mode enabled", "fee_tokens", len(fwd.Tokens), "margin_bps", fwd.MarginBps)
+	}
+
 	resolverDone := make(chan struct{})
 	go func() {
 		(&sponsor.Resolver{Submitter: submitter, Interval: 30 * time.Second}).Run(ctx)
@@ -155,6 +168,7 @@ func main() {
 	(&api.Submissions{
 		Sponsor:  submitter,
 		Records:  records,
+		Quoter:   submitter,
 		Work:     work,
 		SyncWait: cfg.SyncWait,
 	}).Register(mux)
@@ -211,4 +225,40 @@ func main() {
 		}
 	}
 	slog.Info("shutdown complete")
+}
+
+// forwardConfig builds forward mode: XLM (always) and USDC (when configured)
+// as fee tokens, priced with a fixed XLM/USD price or StellarExpert.
+func forwardConfig(cfg *config.Gasless) (*sponsor.Forward, error) {
+	nativeID, err := xdr.MustNewNativeAsset().ContractID(cfg.NetworkPassphrase)
+	if err != nil {
+		return nil, fmt.Errorf("native SAC id: %w", err)
+	}
+	native, err := strkey.Encode(strkey.VersionByteContract, nativeID[:])
+	if err != nil {
+		return nil, fmt.Errorf("encode native SAC id: %w", err)
+	}
+	tokens := map[string]sponsor.FeeToken{native: {Contract: native, Symbol: "XLM", Native: true}}
+	if cfg.USDCContractID != "" {
+		tokens[cfg.USDCContractID] = sponsor.FeeToken{Contract: cfg.USDCContractID, Symbol: "USDC"}
+	}
+
+	var prices sponsor.PriceSource = &sponsor.StellarExpertPrice{
+		URL:    cfg.StellarExpertURL,
+		APIKey: cfg.StellarExpertAPIKey,
+		TTL:    time.Minute,
+		MaxAge: 15 * time.Minute,
+		Client: &http.Client{Timeout: 5 * time.Second, Transport: httpx.OutboundTransport()},
+	}
+	if cfg.XLMUSDPrice > 0 {
+		prices = sponsor.FixedPrice(cfg.XLMUSDPrice)
+	}
+	return &sponsor.Forward{
+		ForwarderID: cfg.FeeForwarderID,
+		Executor:    signer.FromKeypair(cfg.Executor),
+		Tokens:      tokens,
+		Prices:      prices,
+		MarginBps:   cfg.FeeMarginBps,
+		AuthLedgers: uint32(cfg.ExecutorAuthLedgers),
+	}, nil
 }
