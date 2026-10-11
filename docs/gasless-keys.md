@@ -19,6 +19,24 @@ Compare the deposit bridge's **pool keys**, whose leak drains pooled user deposi
 - The **executor** signs the relayer's authorization entry for `forward()` explicitly (Address credentials), so the executor doesn't need to be the transaction source.
 - **Adding capacity needs no contract admin action:** channels hold no role. Raise `CHANNEL_COUNT`, run `make channels`, restart.
 
+## Fee model
+
+A Latch wallet is a C-address contract, and only a G-account can be a transaction's source or fee payer. The funder therefore always pays the XLM network fee. What changes is who reimburses it:
+
+| Wallet holds | Who pays | How |
+|---|---|---|
+| Enough XLM for the fee and the action | User, in XLM | `forward()` with the native XLM SAC as `fee_token`. `fee_amount` = network fee + a small margin. |
+| No XLM, but USDC | User, in USDC | `forward()` with the Circle USDC SAC as `fee_token`. `fee_amount` = network fee converted at a trusted XLM/USDC price keyed by contract ID. |
+| Neither, and the transaction is wallet setup | Latch | Sponsored mode: the funder pays and the user is charged nothing. Only for wallet deployment and the setup-send-rules / setup-swap-rules steps. Capped per wallet. |
+| Neither, any other transaction | Nobody | Refused: "add XLM or USDC to pay network fees". Latch does not sponsor ordinary transactions. |
+
+- The user signs one authorization tree covering `forward()`, the fee token's `approve` up to `max_fee_amount`, and the target call. The relayer fills in the real `fee_amount` (≤ `max_fee_amount`) and the executor co-authorizes. If the target call fails, the fee collection reverts with it.
+- latch-api chooses the fee token when it builds the authorization and shows the maximum fee in that token. "Send max" leaves room for the fee.
+- **Mainnet deployment must call `enable_fee_token` for the XLM and USDC SACs.** Until the first token is enabled, the contract accepts any token as the fee.
+- Fees collected in the contract are withdrawn with the manager-gated `sweep_tokens`.
+
+The open work to ship this (sponsor endpoint, sponsored mode, fee-token pricing, KMS) is tracked in [GAPS.md](../GAPS.md#1--gasless-sponsorship-launch-blockers).
+
 ## Setting up (testnet)
 
 1. **Executor.** Testnet already has one granted: `GBLDLFA2Y3RXGL3LZPFTZYDCAE5OZRUVDLBRWAZGA7ZRWT7BGSA7IHMT` (latch-contracts `docs/BUILD.md`). Put its key in `EXECUTOR_*`. It must exist on-chain; fund it with friendbot if needed.

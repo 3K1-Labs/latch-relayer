@@ -1,7 +1,10 @@
 # Latch Relayer — Architecture Decisions
 
 ## What It Is
-An off-chain Go service that bridges the standard Stellar deposit UX (G-address + memo) to Soroban smart contract addresses (C-addresses). It watches a single pooled G-address, parses incoming payment memos, looks up the funding intent, and forwards funds to the correct C-address via Soroban SAC transfer.
+Two Go services in one repo, deployed separately with their own env, database and API key:
+
+- **Deposit bridge (`cmd/serve`)** bridges the standard Stellar deposit UX (G-address + memo) to Soroban smart contract addresses (C-addresses). It watches pooled G-addresses, parses incoming payment memos, looks up the funding intent, and forwards funds to the correct C-address via Soroban SAC transfer. Most of this document covers it.
+- **Gasless service (`cmd/gasless`)** is the mainnet submitter for wallet transactions. latch-api validates and simulates each transaction; the gasless service submits it through a leased channel account with a fee-bump from the funder, and executes FeeForwarder `forward()` so users reimburse the fee in XLM or USDC (Latch sponsors only a new wallet's setup transactions). Keys and the fee model are in [docs/gasless-keys.md](docs/gasless-keys.md). The sponsor endpoint is not built yet; see [GAPS.md](GAPS.md).
 
 ---
 
@@ -81,7 +84,8 @@ updated_at   timestamptz
 ### Who Calls the Relayer
 - **latch-api** calls `POST /intents` when a user initiates a funding session
 - **latch-api** calls `GET /deposit/status/{memo_id}` to check forward state
-- No other service calls the relayer directly
+- **latch-api** will call the gasless service's sponsor endpoint (not built yet) to submit every wallet transaction after validating it
+- No other service calls the relayer directly. Clients never do.
 
 ### Forwarding: Soroban SAC Transfer (not classic Payment)
 Classic `txnbuild.Payment` validates the destination has a G-address version byte — it rejects C-addresses. C-addresses are Soroban contracts and must be paid via the native XLM Stellar Asset Contract's `transfer` function.
@@ -102,10 +106,9 @@ Without channels, not needed: the pool is the transaction source, signer and fee
 With channels (see below), the pool fee-bumps each transaction a channel sources, so the pool still pays every fee and channels only need their base reserve. The fee-bump's hash is the one recorded, sent and resolved.
 
 ### Watcher
-- **Horizon SSE stream** — one goroutine per pooled address
-- `StreamPayments` with `join=transactions` embeds memo data per event (no extra HTTP call per payment)
-- On startup: read last saved cursor from DB, reconnect from that point — no missed events on restart
-- On any stream error: 5-second backoff then reconnect from last cursor
+- **Horizon payment polling** (replaced the SSE stream, which capped intake at about 10 deposits a second; see [docs/deposit-channels.md](docs/deposit-channels.md)) — one poll loop per pooled address, feeding a bounded queue of forward workers (`FORWARD_WORKERS`)
+- On startup: read last saved cursor from DB and resume from that point — no missed events on restart
+- On any poll error: wait 5 seconds, then resume from the last saved cursor
 - Each deposit is written to `forwards` before its cursor is saved; if that write fails the stream stops and replays from the last saved cursor, so a deposit is never skipped without a record
 - wallet-backend is NOT used for the deposit hot path
 
@@ -121,7 +124,7 @@ Stellar Core holds one pending transaction per source account, so a pool that so
 - Unset or 0 keeps the pool as the transaction source. If no channel exists on-chain at startup, the relayer logs an error and stays in pool mode. Create them with `make deposit-channels`.
 
 ### Idempotency
-Incoming deposit `tx_hash` is unique on Stellar. `INSERT ... ON CONFLICT (tx_hash) DO NOTHING` ensures replaying the same SSE event is safe.
+Incoming deposit `tx_hash` is unique on Stellar. `INSERT ... ON CONFLICT (tx_hash) DO NOTHING` ensures replaying the same payment is safe.
 
 The outbound transfer is guarded separately. The signed transaction's hash and max time are written to `forwards.submitted_tx` and `submitted_until` **before** it is sent.
 
@@ -134,13 +137,13 @@ Forwards are valid for 2 minutes, so an unresolved one is settled within a few m
 
 ### Retry Strategy
 ```
-SSE stream → dispatch goroutine (non-blocking)
+poll loop → bounded forward worker queue
                  ↓
             3 quick attempts (0.5s → 1s → 2s backoff)
-                 ↓ (if all fail)
+                 ↓ (if all fail; permanent errors fail at once)
             mark forward pending_retry, mark intent remains pending
                  ↓
-            retry worker (every 30s) → one final attempt
+            retry worker (every RETRY_INTERVAL_SEC, default 10s) → retried up to maxRetries = 5
                  ↓
             success: mark forward done + intent completed
             failure: mark forward failed + intent failed
@@ -183,6 +186,6 @@ How a sweep is recorded (#32):
 - Transient failures retry through the retry worker. Permanent ones fail with `not swept, funds remain in pool: …`, never with a message claiming the funds were swept.
 
 ### Architecture Split
-- **Relayer** owns the deposit hot path: Horizon SSE → memo parse → intent lookup → forward
-- **wallet-backend** owns the query path: balances, transaction history
-- **latch-api** owns intent creation and user-facing deposit status
+- **Relayer (deposit bridge)** owns the deposit hot path: Horizon payment polling → memo parse → intent lookup → forward
+- **Relayer (gasless)** owns wallet transaction submission: channel leases, fee-bump funder, FeeForwarder executor
+- **latch-api** owns intent creation, user-facing deposit status, transaction validation and simulation, and the query path (balances, token lists, transaction history from its own RPC event worker)
