@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -35,6 +36,10 @@ import (
 )
 
 func main() {
+	downAll := flag.Bool("down", false, "run all down migrations and exit")
+	downStep := flag.Bool("down-step", false, "run one down migration step and exit")
+	flag.Parse()
+
 	// ── 1. Config ─────────────────────────────────────────────────────────────
 	cfg, err := config.LoadGasless()
 	if err != nil {
@@ -64,6 +69,23 @@ func main() {
 		os.Exit(1)
 	}
 	defer pool.Close()
+
+	if *downAll {
+		if err := migrations.Rollback(ctx, pool, migrations.Gasless); err != nil {
+			slog.Error("database: rollback", "err", err)
+			os.Exit(1)
+		}
+		slog.Info("database rollback complete")
+		return
+	}
+	if *downStep {
+		if err := migrations.RollbackStep(ctx, pool, migrations.Gasless); err != nil {
+			slog.Error("database: rollback step", "err", err)
+			os.Exit(1)
+		}
+		slog.Info("database rollback step complete")
+		return
+	}
 
 	if err := migrations.Run(ctx, pool, migrations.Gasless); err != nil {
 		slog.Error("database: migrations", "err", err)

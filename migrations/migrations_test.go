@@ -23,6 +23,34 @@ func TestDepositSetOrdersByVersion(t *testing.T) {
 	}
 }
 
+func TestDepositSetOrdersDownMigrations(t *testing.T) {
+	migs, err := Deposit.LoadDown()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migs) == 0 {
+		t.Fatal("expected down migrations for Deposit set, got 0")
+	}
+	if migs[len(migs)-1].Version != "deposit/001_init" {
+		t.Fatalf("last down migration = %+v, want deposit/001_init", migs[len(migs)-1].Version)
+	}
+	for i := 1; i < len(migs); i++ {
+		if migs[i-1].Version <= migs[i].Version {
+			t.Fatalf("down migrations out of reverse order: %s before %s", migs[i-1].Version, migs[i].Version)
+		}
+	}
+}
+
+func TestGaslessSetOrdersDownMigrations(t *testing.T) {
+	migs, err := Gasless.LoadDown()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migs) == 0 || migs[0].Version != "gasless/001_channel_accounts" {
+		t.Fatalf("first gasless down migration = %+v, want gasless/001_channel_accounts", migs)
+	}
+}
+
 func TestRunIsIdempotent(t *testing.T) {
 	pool := testdb.New(t)
 	ctx := context.Background()
@@ -93,5 +121,91 @@ func TestRunAppliesOnlyItsOwnSetIncrementally(t *testing.T) {
 	var n int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations WHERE version LIKE 'other/%'`).Scan(&n); err != nil || n != 2 {
 		t.Fatalf("other/* versions recorded = %d (err=%v), want 2", n, err)
+	}
+}
+
+func TestRollback(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+
+	set := Set{Name: "custom", FS: fstest.MapFS{
+		"001_first.up.sql":    {Data: []byte(`CREATE TABLE custom_first (id int)`)},
+		"001_first.down.sql":  {Data: []byte(`DROP TABLE IF EXISTS custom_first`)},
+		"002_second.up.sql":   {Data: []byte(`CREATE TABLE custom_second (id int)`)},
+		"002_second.down.sql": {Data: []byte(`DROP TABLE IF EXISTS custom_second`)},
+	}}
+
+	if err := Run(ctx, pool, set); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	var tablesBefore int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables
+		WHERE table_schema = current_schema() AND table_name IN ('custom_first', 'custom_second')`).Scan(&tablesBefore); err != nil {
+		t.Fatal(err)
+	}
+	if tablesBefore != 2 {
+		t.Fatalf("expected 2 tables created, got %d", tablesBefore)
+	}
+
+	if err := Rollback(ctx, pool, set); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	var tablesAfter int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables
+		WHERE table_schema = current_schema() AND table_name IN ('custom_first', 'custom_second')`).Scan(&tablesAfter); err != nil {
+		t.Fatal(err)
+	}
+	if tablesAfter != 0 {
+		t.Fatalf("expected 0 tables after rollback, got %d", tablesAfter)
+	}
+
+	var remainingMigrations int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations WHERE version LIKE 'custom/%'`).Scan(&remainingMigrations); err != nil {
+		t.Fatal(err)
+	}
+	if remainingMigrations != 0 {
+		t.Fatalf("expected 0 recorded migrations after rollback, got %d", remainingMigrations)
+	}
+}
+
+func TestRollbackStep(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+
+	set := Set{Name: "step", FS: fstest.MapFS{
+		"001_one.up.sql":   {Data: []byte(`CREATE TABLE step_one (id int)`)},
+		"001_one.down.sql": {Data: []byte(`DROP TABLE IF EXISTS step_one`)},
+		"002_two.up.sql":   {Data: []byte(`CREATE TABLE step_two (id int)`)},
+		"002_two.down.sql": {Data: []byte(`DROP TABLE IF EXISTS step_two`)},
+	}}
+
+	if err := Run(ctx, pool, set); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if err := RollbackStep(ctx, pool, set); err != nil {
+		t.Fatalf("rollback step: %v", err)
+	}
+
+	// Only 002_two should have been dropped; 001_one should still exist
+	var hasOne, hasTwo bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'step_one')`).Scan(&hasOne); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'step_two')`).Scan(&hasTwo); err != nil {
+		t.Fatal(err)
+	}
+	if !hasOne || hasTwo {
+		t.Fatalf("expected step_one=true, step_two=false, got step_one=%v, step_two=%v", hasOne, hasTwo)
+	}
+
+	var remainingMigrations int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations WHERE version LIKE 'step/%'`).Scan(&remainingMigrations); err != nil {
+		t.Fatal(err)
+	}
+	if remainingMigrations != 1 {
+		t.Fatalf("expected 1 recorded migration after single rollback step, got %d", remainingMigrations)
 	}
 }
