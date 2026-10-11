@@ -159,7 +159,8 @@ func TestStore_Stale(t *testing.T) {
 
 func TestStore_ForwardModeSkipsCapsAndKeepsUserFee(t *testing.T) {
 	s, ctx := newStore(t), context.Background()
-	tight := Limits{MaxTxPerWallet: 1, MaxStroopsPerWallet: 1, MaxStroopsPerDay: 1}
+	tight := Limits{MaxTxPerWallet: 1, MaxStroopsPerWallet: 1, MaxStroopsPerDay: 1,
+		MaxForwardAtRiskPerWallet: 10, MaxForwardLossStroopsDay: 1 << 40}
 	for i := range 3 {
 		res := reservation(fmt.Sprintf("fwd%d", i), "W", 1_000)
 		res.Mode = ModeForward
@@ -175,5 +176,77 @@ func TestStore_ForwardModeSkipsCapsAndKeepsUserFee(t *testing.T) {
 	// Forward rows don't count against sponsored caps either.
 	if _, _, err := s.Reserve(ctx, reservation("sp1", "W", 1), Limits{MaxTxPerWallet: 1, MaxStroopsPerWallet: 10, MaxStroopsPerDay: 10}); err != nil {
 		t.Fatalf("sponsored after forward rows: %v", err)
+	}
+}
+
+func forwardRes(id, wallet string, fee int64) Reservation {
+	r := reservation(id, wallet, fee)
+	r.Mode = ModeForward
+	return r
+}
+
+func TestStore_ForwardExposurePerWallet(t *testing.T) {
+	s, ctx := newStore(t), context.Background()
+	lim := Limits{MaxForwardAtRiskPerWallet: 2, MaxForwardLossStroopsDay: 1 << 40}
+
+	// Two in flight: the third is refused.
+	for _, id := range []string{"w1", "w2"} {
+		if _, _, err := s.Reserve(ctx, forwardRes(id, "A", 100), lim); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := s.Reserve(ctx, forwardRes("w3", "A", 100), lim); !errors.Is(err, ErrForwardAtRisk) {
+		t.Fatalf("third in flight: err = %v", err)
+	}
+	// A success no longer counts; a rejection never did.
+	if _, err := s.Finish(ctx, "w1", Outcome{Status: StatusSuccess}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Reserve(ctx, forwardRes("w3", "A", 100), lim); err != nil {
+		t.Fatalf("after a success: %v", err)
+	}
+	if _, err := s.Finish(ctx, "w3", Outcome{Status: StatusRejected, ErrorCode: "channels_busy"}); err != nil {
+		t.Fatal(err)
+	}
+	// An on-chain failure is unreimbursed and keeps counting.
+	charged := int64(90)
+	if _, err := s.Finish(ctx, "w2", Outcome{Status: StatusFailed, FeeChargedStroops: &charged}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Reserve(ctx, forwardRes("w4", "A", 100), lim); err != nil {
+		t.Fatalf("one failure + nothing in flight: %v", err)
+	}
+	if _, _, err := s.Reserve(ctx, forwardRes("w5", "A", 100), lim); !errors.Is(err, ErrForwardAtRisk) {
+		t.Fatalf("one failure + one in flight: err = %v", err)
+	}
+	// Failures age out of the 24h window.
+	if _, err := s.db.Exec(ctx, `UPDATE sponsored_transactions SET created_at = NOW() - INTERVAL '25 hours' WHERE request_id IN ('w2','w4')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Reserve(ctx, forwardRes("w5", "A", 100), lim); err != nil {
+		t.Fatalf("after the window: %v", err)
+	}
+	// Another wallet is unaffected.
+	if _, _, err := s.Reserve(ctx, forwardRes("b1", "B", 100), lim); err != nil {
+		t.Fatalf("other wallet: %v", err)
+	}
+}
+
+func TestStore_ForwardLossBudget(t *testing.T) {
+	s, ctx := newStore(t), context.Background()
+	lim := Limits{MaxForwardAtRiskPerWallet: 100, MaxForwardLossStroopsDay: 1_000}
+	if _, _, err := s.Reserve(ctx, forwardRes("l1", "A", 600), lim); err != nil {
+		t.Fatal(err)
+	}
+	// 600 in flight + 500 > 1,000, even from another wallet.
+	if _, _, err := s.Reserve(ctx, forwardRes("l2", "B", 500), lim); !errors.Is(err, ErrForwardLossBudget) {
+		t.Fatalf("err = %v", err)
+	}
+	// Once l1 succeeds it's reimbursed: no exposure left.
+	if _, err := s.Finish(ctx, "l1", Outcome{Status: StatusSuccess}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Reserve(ctx, forwardRes("l2", "B", 500), lim); err != nil {
+		t.Fatalf("after reimbursement: %v", err)
 	}
 }

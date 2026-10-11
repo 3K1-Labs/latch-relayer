@@ -132,6 +132,9 @@ func main() {
 			MaxTxPerWallet:      cfg.SponsorMaxTxPerWallet,
 			MaxStroopsPerWallet: cfg.SponsorMaxStroopsPerWallet,
 			MaxStroopsPerDay:    cfg.SponsorMaxStroopsPerDay,
+
+			MaxForwardAtRiskPerWallet: cfg.ForwardMaxAtRiskPerWallet,
+			MaxForwardLossStroopsDay:  cfg.ForwardMaxLossStroopsPerDay,
 		},
 		MaxInclusionFee: cfg.MaxInclusionFeeStroops,
 		Available:       monitor.SponsorshipOK,
@@ -260,5 +263,7 @@ func forwardConfig(cfg *config.Gasless) (*sponsor.Forward, error) {
 		Prices:      prices,
 		MarginBps:   cfg.FeeMarginBps,
 		AuthLedgers: uint32(cfg.ExecutorAuthLedgers),
+		MinXLMUSD:   cfg.XLMUSDMin,
+		MaxXLMUSD:   cfg.XLMUSDMax,
 	}, nil
 }

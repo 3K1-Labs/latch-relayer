@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/keypair"
@@ -202,6 +203,9 @@ func (s *Submitter) priceForward(ctx context.Context, call Call, fc forwardCall,
 		return Call{}, nil, fmt.Errorf("%w: %v", ErrSimulation, err)
 	}
 
+	if resp.MinResourceFee < 0 || resp.MinResourceFee > MaxResourceFeeStroops {
+		return Call{}, nil, fmt.Errorf("%w: implausible resource fee %d", ErrSimulation, resp.MinResourceFee)
+	}
 	cost := 2*inclusion + resp.MinResourceFee
 	fee, err := f.FeeInToken(ctx, fc.token, cost)
 	if err != nil {
@@ -319,7 +323,11 @@ func (s *Submitter) inclusionFee(ctx context.Context) int64 {
 // highest inclusion fee the retries can reach.
 func (s *Submitter) maxBid(resourceFee int64) int64 {
 	// A one-operation inner transaction fee-bumped at its own rate bids the
-	// inclusion fee twice (ops+1) plus the resource fee once.
+	// inclusion fee twice (ops+1) plus the resource fee once. Saturates
+	// rather than wrapping; callers bound resourceFee well below this.
+	if resourceFee > math.MaxInt64-2*s.MaxInclusionFee {
+		return math.MaxInt64
+	}
 	return 2*s.MaxInclusionFee + resourceFee
 }
 

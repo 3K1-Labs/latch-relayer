@@ -70,6 +70,12 @@ type Gasless struct {
 	// optional, for production quotas.
 	StellarExpertURL    string
 	StellarExpertAPIKey string
+	// XLMUSDMin/Max bound a plausible XLM price; outside them USDC fees are
+	// refused instead of priced.
+	XLMUSDMin, XLMUSDMax float64
+	// Forward exposure caps: a forward that fails on-chain isn't reimbursed.
+	ForwardMaxAtRiskPerWallet   int   // failed + in-flight forwards per wallet, rolling 24h
+	ForwardMaxLossStroopsPerDay int64 // unreimbursed + in-flight exposure, all wallets, rolling 24h
 }
 
 // forbiddenInGasless are deposit-bridge settings. The gasless process must
@@ -234,6 +240,24 @@ func loadForward(cfg *Gasless) error {
 	net := "testnet"
 	if cfg.NetworkPassphrase == network.PublicNetworkPassphrase {
 		net = "public"
+	}
+	if cfg.XLMUSDMin, err = envFloat("XLM_USD_MIN", 0.01); err != nil {
+		return err
+	}
+	if cfg.XLMUSDMax, err = envFloat("XLM_USD_MAX", 10); err != nil {
+		return err
+	}
+	if cfg.XLMUSDMin >= cfg.XLMUSDMax {
+		return errors.New("XLM_USD_MIN must be below XLM_USD_MAX")
+	}
+	if cfg.XLMUSDPrice > 0 && (cfg.XLMUSDPrice < cfg.XLMUSDMin || cfg.XLMUSDPrice > cfg.XLMUSDMax) {
+		return fmt.Errorf("XLM_USD_PRICE %v is outside [XLM_USD_MIN, XLM_USD_MAX]", cfg.XLMUSDPrice)
+	}
+	if cfg.ForwardMaxAtRiskPerWallet, err = envInt("FORWARD_MAX_AT_RISK_PER_WALLET", 3); err != nil || cfg.ForwardMaxAtRiskPerWallet <= 0 {
+		return errors.New("FORWARD_MAX_AT_RISK_PER_WALLET must be a positive integer")
+	}
+	if cfg.ForwardMaxLossStroopsPerDay, err = envXLM("FORWARD_MAX_LOSS_XLM_PER_DAY", "50"); err != nil {
+		return err
 	}
 	cfg.StellarExpertURL = getEnv("STELLAR_EXPERT_PRICE_URL", "https://api.stellar.expert/explorer/"+net+"/asset/XLM")
 	cfg.StellarExpertAPIKey = os.Getenv("STELLAR_EXPERT_API_KEY")

@@ -81,6 +81,13 @@ func TestLoadGasless_Validation(t *testing.T) {
 		"bad price":          func(t *testing.T) { t.Setenv("XLM_USD_PRICE", "-1") },
 		"bad margin":         func(t *testing.T) { t.Setenv("FEE_MARGIN_BPS", "abc") },
 		"short auth window":  func(t *testing.T) { t.Setenv("EXECUTOR_AUTH_LEDGERS", "2") },
+		"price bounds inverted": func(t *testing.T) {
+			t.Setenv("XLM_USD_MIN", "5")
+			t.Setenv("XLM_USD_MAX", "1")
+		},
+		"fixed price out of bounds": func(t *testing.T) { t.Setenv("XLM_USD_PRICE", "50") },
+		"no at-risk allowance":      func(t *testing.T) { t.Setenv("FORWARD_MAX_AT_RISK_PER_WALLET", "0") },
+		"bad loss budget":           func(t *testing.T) { t.Setenv("FORWARD_MAX_LOSS_XLM_PER_DAY", "lots") },
 		"executor is funder": func(t *testing.T) {
 			kp := keypair.MustRandom()
 			t.Setenv("EXECUTOR_ADDRESS", kp.Address())

@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
 )
+
+// maxPriceBody bounds a StellarExpert response read.
+const maxPriceBody = 64 << 10
 
 // FixedPrice is a configured XLM/USD price. For testnet, where no market
 // price exists, and for tests.
@@ -72,7 +76,8 @@ func (s *StellarExpertPrice) fetch(ctx context.Context) (float64, error) {
 	var body struct {
 		Price *float64 `json:"price"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	// The asset document is a few KB; never read more than maxPriceBody.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPriceBody)).Decode(&body); err != nil {
 		return 0, fmt.Errorf("stellar.expert: decode: %w", err)
 	}
 	if body.Price == nil || *body.Price <= 0 {
@@ -96,6 +101,11 @@ type Quote struct {
 	MaxFeeAmount int64 `json:"max_fee_amount"`
 }
 
+// MaxResourceFeeStroops bounds the resource fee a quote accepts: 100 XLM,
+// far above any real Soroban transaction, and far below where the fee math
+// could overflow.
+const MaxResourceFeeStroops = 1_000_000_000
+
 // Quote prices the most a forward() whose simulation reported resourceFee
 // stroops can cost, in token.
 func (s *Submitter) Quote(ctx context.Context, token string, resourceFee int64) (Quote, error) {
@@ -107,8 +117,8 @@ func (s *Submitter) Quote(ctx context.Context, token string, resourceFee int64) 
 	if !ok {
 		return Quote{}, invalid("fee_token %s is not an accepted fee token", token)
 	}
-	if resourceFee < 0 {
-		return Quote{}, invalid("resource_fee_stroops must not be negative")
+	if resourceFee < 0 || resourceFee > MaxResourceFeeStroops {
+		return Quote{}, invalid("resource_fee_stroops must be between 0 and %d", MaxResourceFeeStroops)
 	}
 	maxFee, err := f.FeeInToken(ctx, ft, s.maxBid(resourceFee))
 	if err != nil {

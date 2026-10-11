@@ -5,7 +5,7 @@ How latch-api submits wallet transactions through the gasless service. latch-api
 Two modes:
 
 - **Sponsored:** Latch pays and the user is charged nothing. Only a new wallet's setup calls qualify (`SPONSORED_CALLS`), within per-wallet and daily caps.
-- **Forward:** the user reimburses the fee in XLM, or USDC if they hold no XLM, through the FeeForwarder contract. See [Forward mode](#forward-mode). No caps apply: the user pays.
+- **Forward:** the user reimburses the fee in XLM, or USDC if they hold no XLM, through the FeeForwarder contract. See [Forward mode](#forward-mode). Sponsorship caps don't apply, but exposure caps do: see [Forward exposure caps](#forward-exposure-caps).
 
 All routes need `Authorization: Bearer <RELAYER_API_KEY>`. Clients never call this service.
 
@@ -67,9 +67,9 @@ Refusals before anything is reserved come back as `{"error": {"code", "message"}
 | 403 | `not_sponsorable` |
 | 409 | `request_id_conflict` |
 | 422 | `simulation_failed`, `max_fee_too_low` (forward: the signed maximum doesn't cover the fee; quote again and re-sign) |
-| 429 | `wallet_cap_reached`, `daily_budget_reached` |
+| 429 | `wallet_cap_reached`, `daily_budget_reached`, `forward_limit_reached` (wallet has too many failed or in-flight forwards; retry once one settles) |
 | 501 | `not_implemented` (forward mode not configured) |
-| 503 | `sponsorship_unavailable` (funder below its floor), `price_unavailable` (no XLM price for a USDC fee) |
+| 503 | `sponsorship_unavailable` (funder below its floor), `price_unavailable` (no XLM price for a USDC fee, or one outside `XLM_USD_MIN`–`XLM_USD_MAX`), `forward_budget_reached` (daily forward loss budget spent) |
 
 ## Forward mode
 
@@ -99,6 +99,19 @@ POST /gasless/quote
 - submits like a sponsored transaction. The record carries `user_fee: {token, symbol, amount}`.
 
 The user's tree depends on the forwarder's allowance at build time (`approve` is included only when it's short). If it changed before submit, enforce simulation fails with `simulation_failed` and nothing is charged: rebuild and re-sign.
+
+### Forward exposure caps
+
+The user reimburses the fee only if the transaction succeeds. If it fails on-chain, FeeForwarder's fee collection reverts with it, but the network still charges the funder's fee-bump. A wallet can cause that deliberately by moving its funds between simulation and inclusion. Two caps bound the loss, both over a rolling 24 hours and checked under the same lock as reservations:
+
+- **Per wallet** (`FORWARD_MAX_AT_RISK_PER_WALLET`, default 3): forwards that failed on-chain plus those still pending or unconfirmed. A success or a rejection (nothing charged) frees a slot.
+- **All wallets** (`FORWARD_MAX_LOSS_XLM_PER_DAY`, default 50 XLM): what failed forwards cost plus the maximum in-flight ones could.
+
+### Price and input bounds
+
+- USDC fees convert at XLM/USD, which must fall within `XLM_USD_MIN`–`XLM_USD_MAX` (defaults 0.01–10). Outside it, USDC fees are refused rather than priced, so a bad feed can't make them free or extortionate. XLM fees need no price.
+- The StellarExpert response read is capped at 64 KB.
+- `resource_fee_stroops` must be between 0 and 1,000,000,000 (100 XLM). Fee arithmetic uses big integers, so it can't wrap.
 
 ## `GET /gasless/requests/{request_id}`
 

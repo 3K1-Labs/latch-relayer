@@ -4,7 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/keypair"
 	"github.com/stellar/go-stellar-sdk/network"
@@ -290,5 +294,83 @@ func TestFeeInTokenRoundsUp(t *testing.T) {
 	got, err := f.FeeInToken(context.Background(), FeeToken{Symbol: "USDC"}, 7)
 	if err != nil || got != 3 { // 7 × 0.3 = 2.1 → 3
 		t.Fatalf("got %d err %v", got, err)
+	}
+}
+
+func TestFeeInToken_PriceBounds(t *testing.T) {
+	f := &Forward{MarginBps: 0, MinXLMUSD: 0.01, MaxXLMUSD: 10}
+	usdc := FeeToken{Symbol: "USDC"}
+	for _, p := range []float64{0.0000001, 0.009, 11, 1e9} {
+		f.Prices = FixedPrice(p)
+		if _, err := f.FeeInToken(context.Background(), usdc, 1000); !errors.Is(err, ErrPriceUnavailable) {
+			t.Errorf("price %v: err = %v, want ErrPriceUnavailable", p, err)
+		}
+	}
+	f.Prices = FixedPrice(0.2)
+	if got, err := f.FeeInToken(context.Background(), usdc, 1000); err != nil || got != 200 {
+		t.Fatalf("in-range price: %d %v", got, err)
+	}
+	// XLM needs no price, so a broken feed doesn't stop XLM fees.
+	f.Prices = FixedPrice(1e9)
+	if got, err := f.FeeInToken(context.Background(), FeeToken{Native: true}, 1000); err != nil || got != 1000 {
+		t.Fatalf("native with a bad feed: %d %v", got, err)
+	}
+}
+
+func TestFeeInToken_NoOverflow(t *testing.T) {
+	f := &Forward{MarginBps: 50_000, Prices: FixedPrice(10), MaxXLMUSD: 10}
+	// stroops × (10,000 + margin) would pass int64 in plain arithmetic.
+	big := int64(1) << 62 // × 6 = 2.8e19, past int64
+	if _, err := f.FeeInToken(context.Background(), FeeToken{Native: true}, big); err == nil {
+		t.Fatal("a result past int64 must be an error, not a wrapped number")
+	}
+	got, err := f.FeeInToken(context.Background(), FeeToken{Native: true}, MaxResourceFeeStroops)
+	if err != nil || got != 6*MaxResourceFeeStroops {
+		t.Fatalf("largest accepted cost: %d %v", got, err)
+	}
+	if _, err := f.FeeInToken(context.Background(), FeeToken{Native: true}, -1); err == nil {
+		t.Fatal("negative cost must be refused")
+	}
+}
+
+func TestQuote_RejectsOutOfRangeResourceFee(t *testing.T) {
+	ff := newForwardFixture(t)
+	for _, fee := range []int64{-1, MaxResourceFeeStroops + 1, 1 << 62} {
+		if _, err := ff.sub.Quote(context.Background(), ff.xlm, fee); !errors.Is(err, ErrInvalid) {
+			t.Errorf("resource fee %d: err = %v", fee, err)
+		}
+	}
+}
+
+func TestForward_ImplausibleResourceFeeIsRefused(t *testing.T) {
+	ff := newForwardFixture(t)
+	ff.req = ff.request(t, ff.xlm, 1_000_000)
+	ff.rpc.resource = MaxResourceFeeStroops + 1
+	if _, _, err := ff.sub.Prepare(context.Background(), ff.req); !errors.Is(err, ErrSimulation) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(ff.records.reserved) != 0 {
+		t.Fatal("reserved despite an implausible resource fee")
+	}
+}
+
+func TestStellarExpertPrice_BoundedBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// A body far past the limit, with the price at the end.
+		_, _ = w.Write([]byte(`{"pad":"` + strings.Repeat("x", 2*maxPriceBody) + `","price":0.2}`))
+	}))
+	defer srv.Close()
+	p := &StellarExpertPrice{URL: srv.URL, TTL: time.Minute, MaxAge: time.Minute}
+	if _, err := p.XLMUSD(context.Background()); err == nil {
+		t.Fatal("an over-long body must be refused, not read")
+	}
+
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"asset":"XLM","price":0.2}`))
+	}))
+	defer ok.Close()
+	p = &StellarExpertPrice{URL: ok.URL, TTL: time.Minute, MaxAge: time.Minute}
+	if got, err := p.XLMUSD(context.Background()); err != nil || got != 0.2 {
+		t.Fatalf("normal body: %v %v", got, err)
 	}
 }

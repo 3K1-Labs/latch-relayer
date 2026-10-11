@@ -179,6 +179,10 @@ func prepareError(err error) (int, string) {
 		return http.StatusTooManyRequests, "wallet_cap_reached"
 	case errors.Is(err, sponsor.ErrDailyBudget):
 		return http.StatusTooManyRequests, "daily_budget_reached"
+	case errors.Is(err, sponsor.ErrForwardAtRisk):
+		return http.StatusTooManyRequests, "forward_limit_reached"
+	case errors.Is(err, sponsor.ErrForwardLossBudget):
+		return http.StatusServiceUnavailable, "forward_budget_reached"
 	case errors.Is(err, sponsor.ErrSimulation):
 		return http.StatusUnprocessableEntity, "simulation_failed"
 	case errors.Is(err, sponsor.ErrFeeTooLow):

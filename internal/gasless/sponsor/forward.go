@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/big"
 	"strconv"
@@ -71,6 +72,10 @@ type Forward struct {
 	MarginBps int64
 	// AuthLedgers is how long the executor's signature stays valid.
 	AuthLedgers uint32
+	// MinXLMUSD and MaxXLMUSD bound a plausible XLM price. A price outside
+	// them is refused (ErrPriceUnavailable) rather than used: a bad feed
+	// must not make USDC fees free or extortionate.
+	MinXLMUSD, MaxXLMUSD float64
 }
 
 var (
@@ -154,11 +159,22 @@ func (f *Forward) withFee(call Call, feeAmount int64) (xdr.HostFunction, error) 
 // FeeInToken converts a cost in stroops to the token's units, adding the
 // margin and rounding up.
 func (f *Forward) FeeInToken(ctx context.Context, token FeeToken, stroops int64) (int64, error) {
-	withMargin := new(big.Rat).SetFrac64(stroops*(10_000+f.MarginBps), 10_000)
+	if stroops < 0 {
+		return 0, fmt.Errorf("negative cost %d", stroops)
+	}
+	// Big integers throughout: stroops × (10,000 + margin) can pass int64.
+	withMargin := new(big.Rat).SetFrac(
+		new(big.Int).Mul(big.NewInt(stroops), big.NewInt(10_000+f.MarginBps)),
+		big.NewInt(10_000))
 	if !token.Native {
 		price, err := f.Prices.XLMUSD(ctx)
 		if err != nil || price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
 			return 0, fmt.Errorf("%w: %v", ErrPriceUnavailable, err)
+		}
+		if (f.MinXLMUSD > 0 && price < f.MinXLMUSD) || (f.MaxXLMUSD > 0 && price > f.MaxXLMUSD) {
+			slog.Error("sponsor: XLM price outside its plausible range; refusing USDC fees",
+				"price", price, "min", f.MinXLMUSD, "max", f.MaxXLMUSD)
+			return 0, fmt.Errorf("%w: XLM/USD %v outside [%v, %v]", ErrPriceUnavailable, price, f.MinXLMUSD, f.MaxXLMUSD)
 		}
 		// The shortest decimal form, not SetFloat64: 0.2 as a float64 is a
 		// hair above 0.2, which would round every fee up by a unit.

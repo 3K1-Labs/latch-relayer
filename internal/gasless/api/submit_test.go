@@ -92,14 +92,16 @@ func TestSubmit_ErrorMapping(t *testing.T) {
 		status int
 		code   string
 	}{
-		sponsor.ErrInvalid:         {400, "invalid_request"},
-		sponsor.ErrNotSponsorable:  {403, "not_sponsorable"},
-		sponsor.ErrForwardNotBuilt: {501, "not_implemented"},
-		sponsor.ErrConflict:        {409, "request_id_conflict"},
-		sponsor.ErrWalletCap:       {429, "wallet_cap_reached"},
-		sponsor.ErrDailyBudget:     {429, "daily_budget_reached"},
-		sponsor.ErrSimulation:      {422, "simulation_failed"},
-		sponsor.ErrUnavailable:     {503, "sponsorship_unavailable"},
+		sponsor.ErrInvalid:           {400, "invalid_request"},
+		sponsor.ErrNotSponsorable:    {403, "not_sponsorable"},
+		sponsor.ErrForwardNotBuilt:   {501, "not_implemented"},
+		sponsor.ErrConflict:          {409, "request_id_conflict"},
+		sponsor.ErrWalletCap:         {429, "wallet_cap_reached"},
+		sponsor.ErrDailyBudget:       {429, "daily_budget_reached"},
+		sponsor.ErrForwardAtRisk:     {429, "forward_limit_reached"},
+		sponsor.ErrForwardLossBudget: {503, "forward_budget_reached"},
+		sponsor.ErrSimulation:        {422, "simulation_failed"},
+		sponsor.ErrUnavailable:       {503, "sponsorship_unavailable"},
 	}
 	for err, want := range cases {
 		code, out := serve(t, &Submissions{Sponsor: &fakeSponsor{prepErr: err}, Work: inline{}, SyncWait: time.Second}, "POST", "/gasless/submit", body)

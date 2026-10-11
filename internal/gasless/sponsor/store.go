@@ -44,11 +44,21 @@ type Record struct {
 	payloadHash string
 }
 
-// Limits are the sponsorship caps.
+// Limits are the sponsorship caps, and forward mode's exposure caps.
 type Limits struct {
 	MaxTxPerWallet      int   // sponsored transactions per wallet, ever
 	MaxStroopsPerWallet int64 // sponsored spend per wallet, ever
 	MaxStroopsPerDay    int64 // sponsored spend across all wallets, rolling 24h
+
+	// Forward mode: the user reimburses the fee, but only if the transaction
+	// succeeds. If it fails on-chain, FeeForwarder's fee collection reverts
+	// with it while the funder's fee-bump is still charged — and a wallet can
+	// make that happen on purpose by moving its funds between simulation and
+	// inclusion. So unreimbursed exposure is capped: per wallet, failed
+	// forwards plus those still in flight over a rolling 24h; across all
+	// wallets, what failed forwards cost plus what in-flight ones could.
+	MaxForwardAtRiskPerWallet int
+	MaxForwardLossStroopsDay  int64
 }
 
 var (
@@ -58,6 +68,12 @@ var (
 	ErrWalletCap = errors.New("wallet sponsorship cap reached")
 	// ErrDailyBudget: Latch's daily sponsorship budget is spent.
 	ErrDailyBudget = errors.New("daily sponsorship budget reached")
+	// ErrForwardAtRisk: the wallet has too many forward submissions that
+	// failed unreimbursed or are still in flight.
+	ErrForwardAtRisk = errors.New("too many unreimbursed or in-flight forward submissions for this wallet")
+	// ErrForwardLossBudget: unreimbursed forward losses across all wallets
+	// reached the daily budget.
+	ErrForwardLossBudget = errors.New("daily forward loss budget reached")
 )
 
 // Store keeps sponsored_transactions.
@@ -140,10 +156,15 @@ func (s *Store) Reserve(ctx context.Context, res Reservation, lim Limits) (rec R
 			return fmt.Errorf("look up request: %w", err)
 		}
 
-		// Caps limit what Latch pays for. In forward mode the user reimburses
-		// the fee, so nothing is counted against them.
-		if res.Mode == ModeSponsored {
+		// Sponsored: caps on what Latch pays for. Forward: caps on what Latch
+		// could lose when a forward fails unreimbursed.
+		switch res.Mode {
+		case ModeSponsored:
 			if err := checkCaps(ctx, tx, res, lim); err != nil {
+				return err
+			}
+		case ModeForward:
+			if err := checkForwardExposure(ctx, tx, res, lim); err != nil {
 				return err
 			}
 		}
@@ -243,6 +264,35 @@ func (s *Store) SetHash(ctx context.Context, requestID, hash string) error {
 		WHERE request_id = $1 AND status = 'pending'`, requestID, hash)
 	if err != nil {
 		return fmt.Errorf("record hash: %w", err)
+	}
+	return nil
+}
+
+// checkForwardExposure refuses a forward reservation when the wallet already
+// has MaxForwardAtRiskPerWallet forwards that failed (charged, unreimbursed)
+// or are still in flight in the last 24h, or when unreimbursed losses plus
+// in-flight exposure across all wallets would pass MaxForwardLossStroopsDay.
+// Runs under Reserve's lock, so concurrent submissions can't race past it.
+func checkForwardExposure(ctx context.Context, tx pgx.Tx, res Reservation, lim Limits) error {
+	const atRisk = `mode = 'forward' AND status IN ('pending', 'unconfirmed', 'failed')
+		AND created_at > NOW() - INTERVAL '24 hours'`
+
+	var walletAtRisk int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM sponsored_transactions
+		WHERE wallet = $1 AND `+atRisk, res.Wallet).Scan(&walletAtRisk); err != nil {
+		return fmt.Errorf("forward wallet exposure: %w", err)
+	}
+	if walletAtRisk >= lim.MaxForwardAtRiskPerWallet {
+		return ErrForwardAtRisk
+	}
+
+	var exposure int64
+	if err := tx.QueryRow(ctx, `SELECT `+spendSQL+` FROM sponsored_transactions
+		WHERE `+atRisk).Scan(&exposure); err != nil {
+		return fmt.Errorf("forward exposure: %w", err)
+	}
+	if exposure+res.MaxFeeStroops > lim.MaxForwardLossStroopsDay {
+		return ErrForwardLossBudget
 	}
 	return nil
 }
