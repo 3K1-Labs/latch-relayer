@@ -21,12 +21,12 @@ type FixedPrice float64
 func (p FixedPrice) XLMUSD(context.Context) (float64, error) { return float64(p), nil }
 
 // StellarExpertPrice reads XLM/USD from the StellarExpert API, caching it for
-// TTL. A stale cached price is used for up to MaxAge if a refresh fails.
+// TTL. A failed refresh is an error: Forward decides whether the last good
+// price may stand in, and alerts when it does.
 type StellarExpertPrice struct {
 	URL    string // e.g. https://api.stellar.expert/explorer/public/asset/XLM
 	APIKey string // optional; sent as a bearer token for production quotas
 	TTL    time.Duration
-	MaxAge time.Duration
 	Client *http.Client
 
 	mu      sync.Mutex
@@ -41,14 +41,11 @@ func (s *StellarExpertPrice) XLMUSD(ctx context.Context) (float64, error) {
 		return s.price, nil
 	}
 	p, err := s.fetch(ctx)
-	if err == nil {
-		s.price, s.fetched = p, time.Now()
-		return p, nil
+	if err != nil {
+		return 0, err
 	}
-	if s.price > 0 && time.Since(s.fetched) < s.MaxAge {
-		return s.price, nil
-	}
-	return 0, err
+	s.price, s.fetched = p, time.Now()
+	return p, nil
 }
 
 func (s *StellarExpertPrice) fetch(ctx context.Context) (float64, error) {

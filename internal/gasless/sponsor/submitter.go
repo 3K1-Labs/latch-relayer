@@ -69,6 +69,7 @@ type Records interface {
 	Finish(ctx context.Context, requestID string, o Outcome) (Record, error)
 	SetHash(ctx context.Context, requestID, hash string) error
 	Stale(ctx context.Context, olderThan time.Duration) ([]StaleRecord, error)
+	ForwardLoss(ctx context.Context, window time.Duration) (int64, error)
 }
 
 // Submitter pays for and submits sponsored transactions.

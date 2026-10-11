@@ -9,6 +9,8 @@ import (
 	"math"
 	"math/big"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -73,9 +75,56 @@ type Forward struct {
 	// AuthLedgers is how long the executor's signature stays valid.
 	AuthLedgers uint32
 	// MinXLMUSD and MaxXLMUSD bound a plausible XLM price. A price outside
-	// them is refused (ErrPriceUnavailable) rather than used: a bad feed
-	// must not make USDC fees free or extortionate.
+	// them, or no price at all, is never used: the last good price stands in
+	// for up to PriceMaxStale (with an error log and OnPriceFallback each
+	// time), then USDC fees are refused. A bad feed must not make USDC fees
+	// free or extortionate.
 	MinXLMUSD, MaxXLMUSD float64
+	PriceMaxStale        time.Duration
+	// OnPriceFallback, when set, is told each time the last good price is
+	// used ("unavailable" or "out_of_range") or none is left ("refused").
+	OnPriceFallback func(reason string)
+
+	mu         sync.Mutex
+	lastGood   float64
+	lastGoodAt time.Time
+}
+
+// xlmUSD returns a usable XLM/USD price: the source's when it is plausible,
+// else the last good one while it is fresh enough.
+func (f *Forward) xlmUSD(ctx context.Context) (float64, error) {
+	price, err := f.Prices.XLMUSD(ctx)
+	reason := ""
+	switch {
+	case err != nil || price <= 0 || math.IsNaN(price) || math.IsInf(price, 0):
+		reason = "unavailable"
+	case (f.MinXLMUSD > 0 && price < f.MinXLMUSD) || (f.MaxXLMUSD > 0 && price > f.MaxXLMUSD):
+		reason = "out_of_range"
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if reason == "" {
+		f.lastGood, f.lastGoodAt = price, time.Now()
+		return price, nil
+	}
+	if f.lastGood > 0 && time.Since(f.lastGoodAt) <= f.PriceMaxStale {
+		slog.Error("ALERT gasless: XLM price unusable; using the last good price",
+			"reason", reason, "price", price, "err", err, "last_good", f.lastGood,
+			"age", time.Since(f.lastGoodAt).Round(time.Second), "max_stale", f.PriceMaxStale)
+		f.fallback(reason)
+		return f.lastGood, nil
+	}
+	slog.Error("ALERT gasless: XLM price unusable and no recent good price; refusing USDC fees",
+		"reason", reason, "price", price, "err", err, "min", f.MinXLMUSD, "max", f.MaxXLMUSD)
+	f.fallback("refused")
+	return 0, fmt.Errorf("%w: XLM/USD %v (%s)", ErrPriceUnavailable, price, reason)
+}
+
+func (f *Forward) fallback(reason string) {
+	if f.OnPriceFallback != nil {
+		f.OnPriceFallback(reason)
+	}
 }
 
 var (
@@ -167,14 +216,9 @@ func (f *Forward) FeeInToken(ctx context.Context, token FeeToken, stroops int64)
 		new(big.Int).Mul(big.NewInt(stroops), big.NewInt(10_000+f.MarginBps)),
 		big.NewInt(10_000))
 	if !token.Native {
-		price, err := f.Prices.XLMUSD(ctx)
-		if err != nil || price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
-			return 0, fmt.Errorf("%w: %v", ErrPriceUnavailable, err)
-		}
-		if (f.MinXLMUSD > 0 && price < f.MinXLMUSD) || (f.MaxXLMUSD > 0 && price > f.MaxXLMUSD) {
-			slog.Error("sponsor: XLM price outside its plausible range; refusing USDC fees",
-				"price", price, "min", f.MinXLMUSD, "max", f.MaxXLMUSD)
-			return 0, fmt.Errorf("%w: XLM/USD %v outside [%v, %v]", ErrPriceUnavailable, price, f.MinXLMUSD, f.MaxXLMUSD)
+		price, err := f.xlmUSD(ctx)
+		if err != nil {
+			return 0, err
 		}
 		// The shortest decimal form, not SetFloat64: 0.2 as a float64 is a
 		// hair above 0.2, which would round every fee up by a unit.

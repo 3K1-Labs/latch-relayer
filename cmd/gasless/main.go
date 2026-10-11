@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	"github.com/stellar/go-stellar-sdk/keypair"
 	"github.com/stellar/go-stellar-sdk/strkey"
@@ -133,8 +134,9 @@ func main() {
 			MaxStroopsPerWallet: cfg.SponsorMaxStroopsPerWallet,
 			MaxStroopsPerDay:    cfg.SponsorMaxStroopsPerDay,
 
-			MaxForwardAtRiskPerWallet: cfg.ForwardMaxAtRiskPerWallet,
-			MaxForwardLossStroopsDay:  cfg.ForwardMaxLossStroopsPerDay,
+			MaxForwardFailuresPerWallet: cfg.ForwardMaxFailuresPerWallet,
+			ForwardFailureWindow:        cfg.ForwardFailureWindow,
+			MaxForwardInFlightPerWallet: cfg.ForwardMaxInFlightPerWallet,
 		},
 		MaxInclusionFee: cfg.MaxInclusionFeeStroops,
 		Available:       monitor.SponsorshipOK,
@@ -146,13 +148,32 @@ func main() {
 			slog.Error("forward mode", "err", err)
 			os.Exit(1)
 		}
+		priceFallbacks := prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: cfg.MetricsNamespace,
+			Name:      "price_fallback_total",
+			Help:      "XLM price unusable: last good price used (unavailable, out_of_range) or none left (refused). Alert on any increase.",
+		}, []string{"reason"})
+		m.Registry.MustRegister(priceFallbacks)
+		fwd.OnPriceFallback = func(reason string) { priceFallbacks.WithLabelValues(reason).Inc() }
 		submitter.Forward = fwd
 		slog.Info("forward mode enabled", "fee_tokens", len(fwd.Tokens), "margin_bps", fwd.MarginBps)
 	}
 
+	forwardLoss := prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: cfg.MetricsNamespace,
+		Name:      "forward_loss_stroops_24h",
+		Help:      "Fee-bumps the funder paid for user-paid transactions that failed on-chain (unreimbursed), last 24h.",
+	})
+	m.Registry.MustRegister(forwardLoss)
+
 	resolverDone := make(chan struct{})
 	go func() {
-		(&sponsor.Resolver{Submitter: submitter, Interval: 30 * time.Second}).Run(ctx)
+		(&sponsor.Resolver{
+			Submitter:        submitter,
+			Interval:         30 * time.Second,
+			LossAlertStroops: cfg.ForwardLossAlertStroops,
+			OnForwardLoss:    func(stroops int64) { forwardLoss.Set(float64(stroops)) },
+		}).Run(ctx)
 		close(resolverDone)
 	}()
 
@@ -250,20 +271,20 @@ func forwardConfig(cfg *config.Gasless) (*sponsor.Forward, error) {
 		URL:    cfg.StellarExpertURL,
 		APIKey: cfg.StellarExpertAPIKey,
 		TTL:    time.Minute,
-		MaxAge: 15 * time.Minute,
 		Client: &http.Client{Timeout: 5 * time.Second, Transport: httpx.OutboundTransport()},
 	}
 	if cfg.XLMUSDPrice > 0 {
 		prices = sponsor.FixedPrice(cfg.XLMUSDPrice)
 	}
 	return &sponsor.Forward{
-		ForwarderID: cfg.FeeForwarderID,
-		Executor:    signer.FromKeypair(cfg.Executor),
-		Tokens:      tokens,
-		Prices:      prices,
-		MarginBps:   cfg.FeeMarginBps,
-		AuthLedgers: uint32(cfg.ExecutorAuthLedgers),
-		MinXLMUSD:   cfg.XLMUSDMin,
-		MaxXLMUSD:   cfg.XLMUSDMax,
+		ForwarderID:   cfg.FeeForwarderID,
+		Executor:      signer.FromKeypair(cfg.Executor),
+		Tokens:        tokens,
+		Prices:        prices,
+		MarginBps:     cfg.FeeMarginBps,
+		AuthLedgers:   uint32(cfg.ExecutorAuthLedgers),
+		MinXLMUSD:     cfg.XLMUSDMin,
+		MaxXLMUSD:     cfg.XLMUSDMax,
+		PriceMaxStale: cfg.PriceMaxStale,
 	}, nil
 }

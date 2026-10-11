@@ -52,13 +52,14 @@ type Limits struct {
 
 	// Forward mode: the user reimburses the fee, but only if the transaction
 	// succeeds. If it fails on-chain, FeeForwarder's fee collection reverts
-	// with it while the funder's fee-bump is still charged — and a wallet can
-	// make that happen on purpose by moving its funds between simulation and
-	// inclusion. So unreimbursed exposure is capped: per wallet, failed
-	// forwards plus those still in flight over a rolling 24h; across all
-	// wallets, what failed forwards cost plus what in-flight ones could.
-	MaxForwardAtRiskPerWallet int
-	MaxForwardLossStroopsDay  int64
+	// with it while the funder's fee-bump is still charged — by accident
+	// (swap slippage) or on purpose (moving funds out between simulation and
+	// inclusion). Per wallet, failures are capped over a rolling window, and
+	// in-flight forwards separately so a burst can't race past that cap.
+	// Losses across all wallets raise an alert (Resolver), never a stop.
+	MaxForwardFailuresPerWallet int
+	ForwardFailureWindow        time.Duration
+	MaxForwardInFlightPerWallet int
 }
 
 var (
@@ -68,12 +69,12 @@ var (
 	ErrWalletCap = errors.New("wallet sponsorship cap reached")
 	// ErrDailyBudget: Latch's daily sponsorship budget is spent.
 	ErrDailyBudget = errors.New("daily sponsorship budget reached")
-	// ErrForwardAtRisk: the wallet has too many forward submissions that
-	// failed unreimbursed or are still in flight.
-	ErrForwardAtRisk = errors.New("too many unreimbursed or in-flight forward submissions for this wallet")
-	// ErrForwardLossBudget: unreimbursed forward losses across all wallets
-	// reached the daily budget.
-	ErrForwardLossBudget = errors.New("daily forward loss budget reached")
+	// ErrForwardFailures: the wallet's user-paid transactions failed on-chain
+	// (unreimbursed) too many times within the failure window.
+	ErrForwardFailures = errors.New("too many failed user-paid transactions for this wallet; try again later")
+	// ErrForwardInFlight: the wallet has too many user-paid transactions in
+	// flight at once.
+	ErrForwardInFlight = errors.New("too many user-paid transactions in flight for this wallet; retry once one settles")
 )
 
 // Store keeps sponsored_transactions.
@@ -268,31 +269,38 @@ func (s *Store) SetHash(ctx context.Context, requestID, hash string) error {
 	return nil
 }
 
-// checkForwardExposure refuses a forward reservation when the wallet already
-// has MaxForwardAtRiskPerWallet forwards that failed (charged, unreimbursed)
-// or are still in flight in the last 24h, or when unreimbursed losses plus
-// in-flight exposure across all wallets would pass MaxForwardLossStroopsDay.
-// Runs under Reserve's lock, so concurrent submissions can't race past it.
+// checkForwardExposure refuses a forward reservation when the wallet has had
+// MaxForwardFailuresPerWallet forwards fail on-chain within
+// ForwardFailureWindow, or already has MaxForwardInFlightPerWallet pending or
+// unconfirmed. Runs under Reserve's lock, so concurrent submissions can't
+// race past either limit.
 func checkForwardExposure(ctx context.Context, tx pgx.Tx, res Reservation, lim Limits) error {
-	const atRisk = `mode = 'forward' AND status IN ('pending', 'unconfirmed', 'failed')
-		AND created_at > NOW() - INTERVAL '24 hours'`
-
-	var walletAtRisk int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM sponsored_transactions
-		WHERE wallet = $1 AND `+atRisk, res.Wallet).Scan(&walletAtRisk); err != nil {
+	var failures, inFlight int
+	if err := tx.QueryRow(ctx, `SELECT
+			count(*) FILTER (WHERE status = 'failed' AND created_at > NOW() - make_interval(secs => $2)),
+			count(*) FILTER (WHERE status IN ('pending', 'unconfirmed'))
+		FROM sponsored_transactions
+		WHERE wallet = $1 AND mode = 'forward' AND status <> 'rejected'`,
+		res.Wallet, lim.ForwardFailureWindow.Seconds()).Scan(&failures, &inFlight); err != nil {
 		return fmt.Errorf("forward wallet exposure: %w", err)
 	}
-	if walletAtRisk >= lim.MaxForwardAtRiskPerWallet {
-		return ErrForwardAtRisk
+	if failures >= lim.MaxForwardFailuresPerWallet {
+		return ErrForwardFailures
 	}
-
-	var exposure int64
-	if err := tx.QueryRow(ctx, `SELECT `+spendSQL+` FROM sponsored_transactions
-		WHERE `+atRisk).Scan(&exposure); err != nil {
-		return fmt.Errorf("forward exposure: %w", err)
-	}
-	if exposure+res.MaxFeeStroops > lim.MaxForwardLossStroopsDay {
-		return ErrForwardLossBudget
+	if inFlight >= lim.MaxForwardInFlightPerWallet {
+		return ErrForwardInFlight
 	}
 	return nil
+}
+
+// ForwardLoss is what forwards that failed on-chain within window cost the
+// funder: charged fee-bumps nobody reimbursed.
+func (s *Store) ForwardLoss(ctx context.Context, window time.Duration) (int64, error) {
+	var loss int64
+	if err := s.db.QueryRow(ctx, `SELECT `+spendSQL+` FROM sponsored_transactions
+		WHERE mode = 'forward' AND status = 'failed' AND created_at > NOW() - make_interval(secs => $1)`,
+		window.Seconds()).Scan(&loss); err != nil {
+		return 0, fmt.Errorf("forward loss: %w", err)
+	}
+	return loss, nil
 }

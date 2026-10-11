@@ -297,22 +297,64 @@ func TestFeeInTokenRoundsUp(t *testing.T) {
 	}
 }
 
-func TestFeeInToken_PriceBounds(t *testing.T) {
-	f := &Forward{MarginBps: 0, MinXLMUSD: 0.01, MaxXLMUSD: 10}
+// seqPrice returns its prices in turn, then repeats the last.
+type seqPrice struct {
+	prices []float64
+	errs   []error
+	i      int
+}
+
+func (p *seqPrice) XLMUSD(context.Context) (float64, error) {
+	i := min(p.i, len(p.prices)-1)
+	p.i++
+	var err error
+	if i < len(p.errs) {
+		err = p.errs[i]
+	}
+	return p.prices[i], err
+}
+
+func TestFeeInToken_PriceFallback(t *testing.T) {
 	usdc := FeeToken{Symbol: "USDC"}
+	var reasons []string
+	newF := func(src PriceSource) *Forward {
+		reasons = nil
+		return &Forward{MinXLMUSD: 0.01, MaxXLMUSD: 10, PriceMaxStale: 30 * time.Minute, Prices: src,
+			OnPriceFallback: func(r string) { reasons = append(reasons, r) }}
+	}
+
+	// No good price yet: an implausible one is refused, never used.
 	for _, p := range []float64{0.0000001, 0.009, 11, 1e9} {
-		f.Prices = FixedPrice(p)
+		f := newF(FixedPrice(p))
 		if _, err := f.FeeInToken(context.Background(), usdc, 1000); !errors.Is(err, ErrPriceUnavailable) {
-			t.Errorf("price %v: err = %v, want ErrPriceUnavailable", p, err)
+			t.Errorf("price %v with no last good: err = %v", p, err)
+		}
+		if len(reasons) != 1 || reasons[0] != "refused" {
+			t.Errorf("price %v: reasons = %v", p, reasons)
 		}
 	}
-	f.Prices = FixedPrice(0.2)
-	if got, err := f.FeeInToken(context.Background(), usdc, 1000); err != nil || got != 200 {
-		t.Fatalf("in-range price: %d %v", got, err)
+
+	// After a good price, a bad one (out of range, then unavailable) falls back to it.
+	src := &seqPrice{prices: []float64{0.2, 1e9, 0}, errs: []error{nil, nil, errors.New("feed down")}}
+	f := newF(src)
+	for i, want := range []int64{200, 200, 200} {
+		got, err := f.FeeInToken(context.Background(), usdc, 1000)
+		if err != nil || got != want {
+			t.Fatalf("call %d: %d %v", i, got, err)
+		}
 	}
+	if len(reasons) != 2 || reasons[0] != "out_of_range" || reasons[1] != "unavailable" {
+		t.Fatalf("reasons = %v", reasons)
+	}
+
+	// Past PriceMaxStale the last good price is no longer used.
+	f.lastGoodAt = time.Now().Add(-31 * time.Minute)
+	if _, err := f.FeeInToken(context.Background(), usdc, 1000); !errors.Is(err, ErrPriceUnavailable) {
+		t.Fatalf("stale last good: err = %v", err)
+	}
+
 	// XLM needs no price, so a broken feed doesn't stop XLM fees.
-	f.Prices = FixedPrice(1e9)
-	if got, err := f.FeeInToken(context.Background(), FeeToken{Native: true}, 1000); err != nil || got != 1000 {
+	if got, err := newF(FixedPrice(1e9)).FeeInToken(context.Background(), FeeToken{Native: true}, 1000); err != nil || got != 1000 {
 		t.Fatalf("native with a bad feed: %d %v", got, err)
 	}
 }
@@ -360,7 +402,7 @@ func TestStellarExpertPrice_BoundedBody(t *testing.T) {
 		_, _ = w.Write([]byte(`{"pad":"` + strings.Repeat("x", 2*maxPriceBody) + `","price":0.2}`))
 	}))
 	defer srv.Close()
-	p := &StellarExpertPrice{URL: srv.URL, TTL: time.Minute, MaxAge: time.Minute}
+	p := &StellarExpertPrice{URL: srv.URL, TTL: time.Minute}
 	if _, err := p.XLMUSD(context.Background()); err == nil {
 		t.Fatal("an over-long body must be refused, not read")
 	}
@@ -369,7 +411,7 @@ func TestStellarExpertPrice_BoundedBody(t *testing.T) {
 		_, _ = w.Write([]byte(`{"asset":"XLM","price":0.2}`))
 	}))
 	defer ok.Close()
-	p = &StellarExpertPrice{URL: ok.URL, TTL: time.Minute, MaxAge: time.Minute}
+	p = &StellarExpertPrice{URL: ok.URL, TTL: time.Minute}
 	if got, err := p.XLMUSD(context.Background()); err != nil || got != 0.2 {
 		t.Fatalf("normal body: %v %v", got, err)
 	}

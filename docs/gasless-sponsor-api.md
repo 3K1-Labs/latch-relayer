@@ -67,9 +67,9 @@ Refusals before anything is reserved come back as `{"error": {"code", "message"}
 | 403 | `not_sponsorable` |
 | 409 | `request_id_conflict` |
 | 422 | `simulation_failed`, `max_fee_too_low` (forward: the signed maximum doesn't cover the fee; quote again and re-sign) |
-| 429 | `wallet_cap_reached`, `daily_budget_reached`, `forward_limit_reached` (wallet has too many failed or in-flight forwards; retry once one settles) |
+| 429 | `wallet_cap_reached`, `daily_budget_reached`, `forward_failure_limit` (wallet's user-paid transactions failed on-chain too often recently; try later), `forward_in_flight_limit` (too many in flight; retry once one settles) |
 | 501 | `not_implemented` (forward mode not configured) |
-| 503 | `sponsorship_unavailable` (funder below its floor), `price_unavailable` (no XLM price for a USDC fee, or one outside `XLM_USD_MIN`–`XLM_USD_MAX`), `forward_budget_reached` (daily forward loss budget spent) |
+| 503 | `sponsorship_unavailable` (funder below its floor), `price_unavailable` (no usable XLM price for a USDC fee and none recent enough to stand in) |
 
 ## Forward mode
 
@@ -102,16 +102,17 @@ The user's tree depends on the forwarder's allowance at build time (`approve` is
 
 ### Forward exposure caps
 
-The user reimburses the fee only if the transaction succeeds. If it fails on-chain, FeeForwarder's fee collection reverts with it, but the network still charges the funder's fee-bump. A wallet can cause that deliberately by moving its funds between simulation and inclusion. Two caps bound the loss, both over a rolling 24 hours and checked under the same lock as reservations:
+The user reimburses the fee only if the transaction succeeds. If it fails on-chain, FeeForwarder's fee collection reverts with it, but the network still charges the funder's fee-bump. That happens by accident (a swap's price moves past its minimum output before it lands) or on purpose (moving funds out between simulation and inclusion). Checked under the same lock as reservations:
 
-- **Per wallet** (`FORWARD_MAX_AT_RISK_PER_WALLET`, default 3): forwards that failed on-chain plus those still pending or unconfirmed. A success or a rejection (nothing charged) frees a slot.
-- **All wallets** (`FORWARD_MAX_LOSS_XLM_PER_DAY`, default 50 XLM): what failed forwards cost plus the maximum in-flight ones could.
+- **Failures per wallet** (`FORWARD_MAX_FAILURES_PER_WALLET`, default 24, within `FORWARD_FAILURE_WINDOW_HOURS`, default 6): only forwards that failed on-chain count. Successes and rejections (nothing charged) never do. Over it: `429 forward_failure_limit`.
+- **In flight per wallet** (`FORWARD_MAX_IN_FLIGHT_PER_WALLET`, default 5): pending or unconfirmed at once, so a burst can't race past the failure cap. Over it: `429 forward_in_flight_limit`.
+- **All wallets** (`FORWARD_LOSS_ALERT_XLM_PER_DAY`, default 50 XLM): an **alert, not a stop**. The resolver publishes the last 24h of unreimbursed losses as `<namespace>_forward_loss_stroops_24h` and logs `ALERT gasless: …` once each time it crosses the threshold. User-paid transactions keep running, so many wallets can't be used to block everyone.
 
 ### Price and input bounds
 
-- USDC fees convert at XLM/USD, which must fall within `XLM_USD_MIN`–`XLM_USD_MAX` (defaults 0.01–10). Outside it, USDC fees are refused rather than priced, so a bad feed can't make them free or extortionate. XLM fees need no price.
+- USDC fees convert at XLM/USD. A price that's unavailable or outside `XLM_USD_MIN`–`XLM_USD_MAX` (defaults 0.01–10) is never used: the **last good price** stands in for up to `PRICE_MAX_STALE_MINUTES` (default 30), logging `ALERT gasless: …` and incrementing `<namespace>_price_fallback_total{reason}` (`unavailable`, `out_of_range`) each time. After that, USDC fees are refused (`reason="refused"`, `503 price_unavailable`). XLM fees need no price and are unaffected.
 - The StellarExpert response read is capped at 64 KB.
-- `resource_fee_stroops` must be between 0 and 1,000,000,000 (100 XLM). Fee arithmetic uses big integers, so it can't wrap.
+- `resource_fee_stroops` must be between 0 and 1,000,000,000 (100 XLM), and the relayer's own simulated resource fee is held to the same bound. Fee arithmetic uses big integers, so it can't wrap.
 
 ## `GET /gasless/requests/{request_id}`
 

@@ -86,8 +86,11 @@ func TestLoadGasless_Validation(t *testing.T) {
 			t.Setenv("XLM_USD_MAX", "1")
 		},
 		"fixed price out of bounds": func(t *testing.T) { t.Setenv("XLM_USD_PRICE", "50") },
-		"no at-risk allowance":      func(t *testing.T) { t.Setenv("FORWARD_MAX_AT_RISK_PER_WALLET", "0") },
-		"bad loss budget":           func(t *testing.T) { t.Setenv("FORWARD_MAX_LOSS_XLM_PER_DAY", "lots") },
+		"no failure allowance":      func(t *testing.T) { t.Setenv("FORWARD_MAX_FAILURES_PER_WALLET", "0") },
+		"zero failure window":       func(t *testing.T) { t.Setenv("FORWARD_FAILURE_WINDOW_HOURS", "0") },
+		"no in-flight allowance":    func(t *testing.T) { t.Setenv("FORWARD_MAX_IN_FLIGHT_PER_WALLET", "0") },
+		"negative price staleness":  func(t *testing.T) { t.Setenv("PRICE_MAX_STALE_MINUTES", "-1") },
+		"bad loss alert":            func(t *testing.T) { t.Setenv("FORWARD_LOSS_ALERT_XLM_PER_DAY", "lots") },
 		"executor is funder": func(t *testing.T) {
 			kp := keypair.MustRandom()
 			t.Setenv("EXECUTOR_ADDRESS", kp.Address())

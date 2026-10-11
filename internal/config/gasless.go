@@ -73,9 +73,16 @@ type Gasless struct {
 	// XLMUSDMin/Max bound a plausible XLM price; outside them USDC fees are
 	// refused instead of priced.
 	XLMUSDMin, XLMUSDMax float64
-	// Forward exposure caps: a forward that fails on-chain isn't reimbursed.
-	ForwardMaxAtRiskPerWallet   int   // failed + in-flight forwards per wallet, rolling 24h
-	ForwardMaxLossStroopsPerDay int64 // unreimbursed + in-flight exposure, all wallets, rolling 24h
+	// PriceMaxStale is how long the last good XLM price stands in when the
+	// source is unavailable or implausible, before USDC fees are refused.
+	PriceMaxStale time.Duration
+	// Forward exposure: a forward that fails on-chain isn't reimbursed.
+	ForwardMaxFailuresPerWallet int           // failed forwards per wallet within ForwardFailureWindow
+	ForwardFailureWindow        time.Duration // rolling window for the failure cap
+	ForwardMaxInFlightPerWallet int           // pending/unconfirmed forwards per wallet at once
+	// ForwardLossAlertStroops logs an error when unreimbursed losses across
+	// all wallets pass it over 24h. An alert only: nothing is refused.
+	ForwardLossAlertStroops int64
 }
 
 // forbiddenInGasless are deposit-bridge settings. The gasless process must
@@ -253,10 +260,23 @@ func loadForward(cfg *Gasless) error {
 	if cfg.XLMUSDPrice > 0 && (cfg.XLMUSDPrice < cfg.XLMUSDMin || cfg.XLMUSDPrice > cfg.XLMUSDMax) {
 		return fmt.Errorf("XLM_USD_PRICE %v is outside [XLM_USD_MIN, XLM_USD_MAX]", cfg.XLMUSDPrice)
 	}
-	if cfg.ForwardMaxAtRiskPerWallet, err = envInt("FORWARD_MAX_AT_RISK_PER_WALLET", 3); err != nil || cfg.ForwardMaxAtRiskPerWallet <= 0 {
-		return errors.New("FORWARD_MAX_AT_RISK_PER_WALLET must be a positive integer")
+	staleMin, err := envInt("PRICE_MAX_STALE_MINUTES", 30)
+	if err != nil || staleMin < 0 {
+		return errors.New("PRICE_MAX_STALE_MINUTES must be a non-negative integer")
 	}
-	if cfg.ForwardMaxLossStroopsPerDay, err = envXLM("FORWARD_MAX_LOSS_XLM_PER_DAY", "50"); err != nil {
+	cfg.PriceMaxStale = time.Duration(staleMin) * time.Minute
+	if cfg.ForwardMaxFailuresPerWallet, err = envInt("FORWARD_MAX_FAILURES_PER_WALLET", 24); err != nil || cfg.ForwardMaxFailuresPerWallet <= 0 {
+		return errors.New("FORWARD_MAX_FAILURES_PER_WALLET must be a positive integer")
+	}
+	windowHours, err := envInt("FORWARD_FAILURE_WINDOW_HOURS", 6)
+	if err != nil || windowHours <= 0 {
+		return errors.New("FORWARD_FAILURE_WINDOW_HOURS must be a positive integer")
+	}
+	cfg.ForwardFailureWindow = time.Duration(windowHours) * time.Hour
+	if cfg.ForwardMaxInFlightPerWallet, err = envInt("FORWARD_MAX_IN_FLIGHT_PER_WALLET", 5); err != nil || cfg.ForwardMaxInFlightPerWallet <= 0 {
+		return errors.New("FORWARD_MAX_IN_FLIGHT_PER_WALLET must be a positive integer")
+	}
+	if cfg.ForwardLossAlertStroops, err = envXLM("FORWARD_LOSS_ALERT_XLM_PER_DAY", "50"); err != nil {
 		return err
 	}
 	cfg.StellarExpertURL = getEnv("STELLAR_EXPERT_PRICE_URL", "https://api.stellar.expert/explorer/"+net+"/asset/XLM")
