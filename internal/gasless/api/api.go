@@ -1,5 +1,5 @@
-// Package api is the gasless service's HTTP surface. P1 serves health and
-// operational status; quote/submit/status endpoints arrive in later phases.
+// Package api is the gasless service's HTTP surface: health, operational
+// status, and sponsored submission (submit.go).
 package api
 
 import (

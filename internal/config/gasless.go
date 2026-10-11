@@ -36,6 +36,19 @@ type Gasless struct {
 	BalanceCheckInterval time.Duration
 
 	InstanceID string // identifies this process in channel leases
+
+	// SponsoredCalls is the raw SPONSORED_CALLS list: the only calls Latch
+	// pays for (a new wallet's setup), "CONTRACT:function" or "wallet:function".
+	SponsoredCalls string
+	// Sponsorship caps.
+	SponsorMaxTxPerWallet      int
+	SponsorMaxStroopsPerWallet int64
+	SponsorMaxStroopsPerDay    int64
+	// MaxInclusionFeeStroops caps the per-operation inclusion fee bid.
+	MaxInclusionFeeStroops int64
+	// SyncWait is how long POST /gasless/submit waits for a final outcome
+	// before answering 202 and leaving the caller to poll.
+	SyncWait time.Duration
 }
 
 // forbiddenInGasless are deposit-bridge settings. The gasless process must
@@ -114,6 +127,33 @@ func LoadGasless() (*Gasless, error) {
 	if cfg.InstanceID == "" {
 		host, _ := os.Hostname()
 		cfg.InstanceID = fmt.Sprintf("%s-%d", host, os.Getpid())
+	}
+
+	// Sponsorship: what Latch pays for, and how much.
+	cfg.SponsoredCalls = os.Getenv("SPONSORED_CALLS")
+	if strings.TrimSpace(cfg.SponsoredCalls) == "" {
+		return nil, errors.New("SPONSORED_CALLS is required: the setup calls Latch pays for, e.g. CFACTORY...:create_account,wallet:add_context_rule,wallet:add_signer")
+	}
+	if cfg.SponsorMaxTxPerWallet, err = envInt("SPONSOR_MAX_TX_PER_WALLET", 5); err != nil || cfg.SponsorMaxTxPerWallet <= 0 {
+		return nil, errors.New("SPONSOR_MAX_TX_PER_WALLET must be a positive integer")
+	}
+	if cfg.SponsorMaxStroopsPerWallet, err = envXLM("SPONSOR_MAX_XLM_PER_WALLET", "2"); err != nil {
+		return nil, err
+	}
+	if cfg.SponsorMaxStroopsPerDay, err = envXLM("SPONSOR_MAX_XLM_PER_DAY", "200"); err != nil {
+		return nil, err
+	}
+	maxInclusion, err := envInt("MAX_INCLUSION_FEE_STROOPS", 20_000)
+	if err != nil || maxInclusion < 100 {
+		return nil, errors.New("MAX_INCLUSION_FEE_STROOPS must be an integer of at least 100")
+	}
+	cfg.MaxInclusionFeeStroops = int64(maxInclusion)
+	if cfg.SyncWait, err = envSeconds("SPONSOR_SYNC_WAIT_SECONDS", 20); err != nil {
+		return nil, err
+	}
+	// The HTTP server's write timeout is 30s: answer well before it.
+	if cfg.SyncWait > 25*time.Second {
+		return nil, errors.New("SPONSOR_SYNC_WAIT_SECONDS must be at most 25")
 	}
 	return cfg, nil
 }
