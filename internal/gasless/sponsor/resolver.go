@@ -47,7 +47,20 @@ func (s *Store) Stale(ctx context.Context, olderThan time.Duration) ([]StaleReco
 type Resolver struct {
 	Submitter *Submitter
 	Interval  time.Duration
+
+	// LossAlertStroops: when forwards that failed on-chain (unreimbursed)
+	// cost more than this over the last 24h, log an error once per crossing.
+	// It is an alert, not a stop: user-paid transactions keep flowing. Zero
+	// disables it.
+	LossAlertStroops int64
+	// OnForwardLoss, when set, receives the 24h loss each tick (a gauge).
+	OnForwardLoss func(stroops int64)
+
+	alerting bool
 }
+
+// lossWindow is what the loss alert measures.
+const lossWindow = 24 * time.Hour
 
 // staleAfter is how long a record sits before the resolver looks at it: past
 // the submitter's own poll, so the two don't race.
@@ -69,6 +82,8 @@ func (r *Resolver) Run(ctx context.Context) {
 
 // Tick resolves one batch.
 func (r *Resolver) Tick(ctx context.Context) {
+	// The loss alert runs every tick, even when listing stale rows fails.
+	defer r.checkLoss(ctx)
 	s := r.Submitter
 	stale, err := s.Records.Stale(ctx, staleAfter)
 	if err != nil {
@@ -86,6 +101,28 @@ func (r *Resolver) Tick(ctx context.Context) {
 		}
 		slog.Info("sponsor resolver: settled", "request_id", rec.RequestID, "status", o.Status)
 	}
+}
+
+// checkLoss publishes the last 24h of unreimbursed forward losses and logs an
+// error when they cross LossAlertStroops (once, until they fall back under).
+func (r *Resolver) checkLoss(ctx context.Context) {
+	loss, err := r.Submitter.Records.ForwardLoss(ctx, lossWindow)
+	if err != nil {
+		slog.Error("sponsor resolver: forward loss", "err", err)
+		return
+	}
+	if r.OnForwardLoss != nil {
+		r.OnForwardLoss(loss)
+	}
+	over := r.LossAlertStroops > 0 && loss > r.LossAlertStroops
+	if over && !r.alerting {
+		slog.Error("ALERT gasless: unreimbursed forward losses passed the daily alert threshold; user-paid transactions keep running",
+			"loss_stroops_24h", loss, "alert_stroops", r.LossAlertStroops)
+	}
+	if !over && r.alerting {
+		slog.Info("gasless: forward losses back under the alert threshold", "loss_stroops_24h", loss)
+	}
+	r.alerting = over
 }
 
 // resolve decides a stale record's outcome. done=false leaves it for the

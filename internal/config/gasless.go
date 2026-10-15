@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/stellar/go-stellar-sdk/amount"
 	"github.com/stellar/go-stellar-sdk/keypair"
+	"github.com/stellar/go-stellar-sdk/network"
 	"github.com/stellar/go-stellar-sdk/strkey"
 
 	"github.com/latch/relayer/internal/gasless/keys"
@@ -49,6 +51,38 @@ type Gasless struct {
 	// SyncWait is how long POST /gasless/submit waits for a final outcome
 	// before answering 202 and leaving the caller to poll.
 	SyncWait time.Duration
+
+	// Forward mode (user pays the fee in XLM or USDC through FeeForwarder).
+	ForwardEnabled bool
+	// USDCContractID is the USDC SAC users may pay fees in; empty means XLM
+	// only. XLM's SAC is derived from the network passphrase.
+	USDCContractID string
+	// FeeMarginBps is added to the network cost before converting it into
+	// the fee token (resource drift, price movement).
+	FeeMarginBps int64
+	// ExecutorAuthLedgers is how long the executor's forward() signature
+	// stays valid.
+	ExecutorAuthLedgers int
+	// XLMUSDPrice, when set, is used instead of StellarExpert (testnet has no
+	// market price).
+	XLMUSDPrice float64
+	// StellarExpertURL is where the XLM price is read; StellarExpertAPIKey is
+	// optional, for production quotas.
+	StellarExpertURL    string
+	StellarExpertAPIKey string
+	// XLMUSDMin/Max bound a plausible XLM price; outside them USDC fees are
+	// refused instead of priced.
+	XLMUSDMin, XLMUSDMax float64
+	// PriceMaxStale is how long the last good XLM price stands in when the
+	// source is unavailable or implausible, before USDC fees are refused.
+	PriceMaxStale time.Duration
+	// Forward exposure: a forward that fails on-chain isn't reimbursed.
+	ForwardMaxFailuresPerWallet int           // failed forwards per wallet within ForwardFailureWindow
+	ForwardFailureWindow        time.Duration // rolling window for the failure cap
+	ForwardMaxInFlightPerWallet int           // pending/unconfirmed forwards per wallet at once
+	// ForwardLossAlertStroops logs an error when unreimbursed losses across
+	// all wallets pass it over 24h. An alert only: nothing is refused.
+	ForwardLossAlertStroops int64
 }
 
 // forbiddenInGasless are deposit-bridge settings. The gasless process must
@@ -151,6 +185,9 @@ func LoadGasless() (*Gasless, error) {
 	if cfg.SyncWait, err = envSeconds("SPONSOR_SYNC_WAIT_SECONDS", 20); err != nil {
 		return nil, err
 	}
+	if err := loadForward(cfg); err != nil {
+		return nil, err
+	}
 	// The HTTP server's write timeout is 30s: answer well before it.
 	if cfg.SyncWait > 25*time.Second {
 		return nil, errors.New("SPONSOR_SYNC_WAIT_SECONDS must be at most 25")
@@ -183,4 +220,66 @@ func envXLM(key, fallback string) (int64, error) {
 		return 0, fmt.Errorf("%s must be a positive XLM amount, got %q", key, v)
 	}
 	return stroops, nil
+}
+
+// loadForward reads forward-mode settings.
+func loadForward(cfg *Gasless) error {
+	cfg.ForwardEnabled = getEnv("FORWARD_ENABLED", "true") == "true"
+	cfg.USDCContractID = os.Getenv("USDC_CONTRACT_ID")
+	if cfg.USDCContractID != "" && !strkey.IsValidContractAddress(cfg.USDCContractID) {
+		return errors.New("USDC_CONTRACT_ID must be the USDC SAC's C-address")
+	}
+	margin, err := envInt("FEE_MARGIN_BPS", 2500)
+	if err != nil || margin < 0 || margin > 50_000 {
+		return errors.New("FEE_MARGIN_BPS must be an integer between 0 and 50000")
+	}
+	cfg.FeeMarginBps = int64(margin)
+	if cfg.ExecutorAuthLedgers, err = envInt("EXECUTOR_AUTH_LEDGERS", 60); err != nil || cfg.ExecutorAuthLedgers < 10 {
+		return errors.New("EXECUTOR_AUTH_LEDGERS must be an integer of at least 10")
+	}
+	if v := os.Getenv("XLM_USD_PRICE"); v != "" {
+		p, err := strconv.ParseFloat(v, 64)
+		if err != nil || p <= 0 {
+			return fmt.Errorf("XLM_USD_PRICE must be a positive number, got %q", v)
+		}
+		cfg.XLMUSDPrice = p
+	}
+	net := "testnet"
+	if cfg.NetworkPassphrase == network.PublicNetworkPassphrase {
+		net = "public"
+	}
+	if cfg.XLMUSDMin, err = envFloat("XLM_USD_MIN", 0.01); err != nil {
+		return err
+	}
+	if cfg.XLMUSDMax, err = envFloat("XLM_USD_MAX", 10); err != nil {
+		return err
+	}
+	if cfg.XLMUSDMin >= cfg.XLMUSDMax {
+		return errors.New("XLM_USD_MIN must be below XLM_USD_MAX")
+	}
+	if cfg.XLMUSDPrice > 0 && (cfg.XLMUSDPrice < cfg.XLMUSDMin || cfg.XLMUSDPrice > cfg.XLMUSDMax) {
+		return fmt.Errorf("XLM_USD_PRICE %v is outside [XLM_USD_MIN, XLM_USD_MAX]", cfg.XLMUSDPrice)
+	}
+	staleMin, err := envInt("PRICE_MAX_STALE_MINUTES", 30)
+	if err != nil || staleMin < 0 {
+		return errors.New("PRICE_MAX_STALE_MINUTES must be a non-negative integer")
+	}
+	cfg.PriceMaxStale = time.Duration(staleMin) * time.Minute
+	if cfg.ForwardMaxFailuresPerWallet, err = envInt("FORWARD_MAX_FAILURES_PER_WALLET", 24); err != nil || cfg.ForwardMaxFailuresPerWallet <= 0 {
+		return errors.New("FORWARD_MAX_FAILURES_PER_WALLET must be a positive integer")
+	}
+	windowHours, err := envInt("FORWARD_FAILURE_WINDOW_HOURS", 6)
+	if err != nil || windowHours <= 0 {
+		return errors.New("FORWARD_FAILURE_WINDOW_HOURS must be a positive integer")
+	}
+	cfg.ForwardFailureWindow = time.Duration(windowHours) * time.Hour
+	if cfg.ForwardMaxInFlightPerWallet, err = envInt("FORWARD_MAX_IN_FLIGHT_PER_WALLET", 5); err != nil || cfg.ForwardMaxInFlightPerWallet <= 0 {
+		return errors.New("FORWARD_MAX_IN_FLIGHT_PER_WALLET must be a positive integer")
+	}
+	if cfg.ForwardLossAlertStroops, err = envXLM("FORWARD_LOSS_ALERT_XLM_PER_DAY", "50"); err != nil {
+		return err
+	}
+	cfg.StellarExpertURL = getEnv("STELLAR_EXPERT_PRICE_URL", "https://api.stellar.expert/explorer/"+net+"/asset/XLM")
+	cfg.StellarExpertAPIKey = os.Getenv("STELLAR_EXPERT_API_KEY")
+	return nil
 }

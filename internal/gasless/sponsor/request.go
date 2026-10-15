@@ -27,7 +27,7 @@ const (
 	// new wallet's setup transactions (see Policy).
 	ModeSponsored Mode = "sponsored"
 	// ModeForward: the user reimburses the fee in XLM or USDC through the
-	// FeeForwarder contract. Not implemented yet.
+	// FeeForwarder contract (forward.go).
 	ModeForward Mode = "forward"
 )
 
@@ -60,7 +60,7 @@ type Call struct {
 var (
 	ErrInvalid          = errors.New("invalid request")
 	ErrNotSponsorable   = errors.New("transaction is not eligible for sponsorship")
-	ErrForwardNotBuilt  = errors.New("forward mode is not implemented yet")
+	ErrForwardNotBuilt  = errors.New("forward mode is not configured")
 	requestIDPattern    = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
 	maxTransactionBytes = 64 * 1024
 )
@@ -71,8 +71,9 @@ func invalid(format string, args ...any) error {
 
 // Validate checks req and extracts the call. relayerAccounts are this
 // service's own addresses (executor, funder, channels): no authorization
-// entry may claim to act for them.
-func Validate(req Request, policy Policy, relayerAccounts map[string]bool) (Call, error) {
+// entry may claim to act for them. forwardEnabled says whether forward mode
+// is configured; its call-specific checks are in Forward.parseForward.
+func Validate(req Request, policy Policy, relayerAccounts map[string]bool, forwardEnabled bool) (Call, error) {
 	if !requestIDPattern.MatchString(req.RequestID) {
 		return Call{}, invalid("request_id must be 8-64 characters of [A-Za-z0-9_-]")
 	}
@@ -82,7 +83,9 @@ func Validate(req Request, policy Policy, relayerAccounts map[string]bool) (Call
 	switch req.Mode {
 	case ModeSponsored:
 	case ModeForward:
-		return Call{}, ErrForwardNotBuilt
+		if !forwardEnabled {
+			return Call{}, ErrForwardNotBuilt
+		}
 	default:
 		return Call{}, invalid("mode must be %q or %q", ModeSponsored, ModeForward)
 	}
@@ -130,7 +133,7 @@ func Validate(req Request, policy Policy, relayerAccounts map[string]bool) (Call
 		HostFunction: invoke.HostFunction,
 		Auth:         invoke.Auth,
 	}
-	if !policy.Allows(call, req.Wallet) {
+	if req.Mode == ModeSponsored && !policy.Allows(call, req.Wallet) {
 		return Call{}, fmt.Errorf("%w: %s.%s is not a sponsored setup call for wallet %s",
 			ErrNotSponsorable, call.Contract, call.Function, req.Wallet)
 	}

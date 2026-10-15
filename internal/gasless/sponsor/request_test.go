@@ -112,7 +112,7 @@ func TestValidate(t *testing.T) {
 	userAuth := addressAuth(walletSc, addRule)
 	valid := Request{RequestID: "req_0001", Wallet: wallet, Mode: ModeSponsored, Transaction: envelopeB64(t, invokeOp(addRule, userAuth))}
 
-	call, err := Validate(valid, policy, relayers)
+	call, err := Validate(valid, policy, relayers, false)
 	if err != nil {
 		t.Fatalf("valid wallet setup call: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestValidate(t *testing.T) {
 
 	deploy := valid
 	deploy.Transaction = envelopeB64(t, invokeOp(invokeArgs(factorySc, "create_account")))
-	if _, err := Validate(deploy, policy, relayers); err != nil {
+	if _, err := Validate(deploy, policy, relayers, false); err != nil {
 		t.Fatalf("factory deploy (no auth): %v", err)
 	}
 
@@ -159,7 +159,7 @@ func TestValidate(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			req := valid
 			tc.mutate(&req)
-			if _, err := Validate(req, policy, relayers); !errors.Is(err, tc.want) {
+			if _, err := Validate(req, policy, relayers, false); !errors.Is(err, tc.want) {
 				t.Fatalf("err = %v, want %v", err, tc.want)
 			}
 		})

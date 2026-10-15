@@ -77,6 +77,20 @@ func TestLoadGasless_Validation(t *testing.T) {
 		"no sponsored calls": func(t *testing.T) { t.Setenv("SPONSORED_CALLS", " ") },
 		"bad wallet cap":     func(t *testing.T) { t.Setenv("SPONSOR_MAX_TX_PER_WALLET", "0") },
 		"inclusion too low":  func(t *testing.T) { t.Setenv("MAX_INCLUSION_FEE_STROOPS", "50") },
+		"usdc not C":         func(t *testing.T) { t.Setenv("USDC_CONTRACT_ID", keypair.MustRandom().Address()) },
+		"bad price":          func(t *testing.T) { t.Setenv("XLM_USD_PRICE", "-1") },
+		"bad margin":         func(t *testing.T) { t.Setenv("FEE_MARGIN_BPS", "abc") },
+		"short auth window":  func(t *testing.T) { t.Setenv("EXECUTOR_AUTH_LEDGERS", "2") },
+		"price bounds inverted": func(t *testing.T) {
+			t.Setenv("XLM_USD_MIN", "5")
+			t.Setenv("XLM_USD_MAX", "1")
+		},
+		"fixed price out of bounds": func(t *testing.T) { t.Setenv("XLM_USD_PRICE", "50") },
+		"no failure allowance":      func(t *testing.T) { t.Setenv("FORWARD_MAX_FAILURES_PER_WALLET", "0") },
+		"zero failure window":       func(t *testing.T) { t.Setenv("FORWARD_FAILURE_WINDOW_HOURS", "0") },
+		"no in-flight allowance":    func(t *testing.T) { t.Setenv("FORWARD_MAX_IN_FLIGHT_PER_WALLET", "0") },
+		"negative price staleness":  func(t *testing.T) { t.Setenv("PRICE_MAX_STALE_MINUTES", "-1") },
+		"bad loss alert":            func(t *testing.T) { t.Setenv("FORWARD_LOSS_ALERT_XLM_PER_DAY", "lots") },
 		"executor is funder": func(t *testing.T) {
 			kp := keypair.MustRandom()
 			t.Setenv("EXECUTOR_ADDRESS", kp.Address())

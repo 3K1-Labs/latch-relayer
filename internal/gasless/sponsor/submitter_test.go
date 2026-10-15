@@ -29,6 +29,10 @@ type fakeRPC struct {
 	pollResp  protocol.GetTransactionResponse
 	pollErr   error
 	accountSq int64
+	// record mode: the auth entries a recording simulation returns
+	recordAuth []string
+	simModes   []string
+	simTxs     []string
 }
 
 func (f *fakeRPC) GetNetwork(context.Context) (protocol.GetNetworkResponse, error) {
@@ -51,7 +55,23 @@ func (f *fakeRPC) GetLedgerEntries(_ context.Context, req protocol.GetLedgerEntr
 	return out, nil
 }
 
+func (f *fakeRPC) GetLatestLedger(context.Context) (protocol.GetLatestLedgerResponse, error) {
+	return protocol.GetLatestLedgerResponse{Sequence: 5000}, nil
+}
+
 func (f *fakeRPC) SimulateTransaction(_ context.Context, req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+	f.mu.Lock()
+	f.simModes = append(f.simModes, req.AuthMode)
+	f.simTxs = append(f.simTxs, req.Transaction)
+	f.mu.Unlock()
+	if req.AuthMode == protocol.AuthModeRecord {
+		if f.recordAuth == nil {
+			return protocol.SimulateTransactionResponse{}, errors.New("unexpected record-mode simulation")
+		}
+		auth := f.recordAuth
+		return protocol.SimulateTransactionResponse{MinResourceFee: f.resource,
+			Results: []protocol.SimulateHostFunctionResult{{AuthXDR: &auth}}}, nil
+	}
 	if req.AuthMode != protocol.AuthModeEnforce {
 		return protocol.SimulateTransactionResponse{}, errors.New("simulation must enforce auth")
 	}
@@ -116,6 +136,7 @@ type fakeRecords struct {
 	recs     map[string]Record
 	reserved []Reservation
 	capErr   error
+	loss     int64
 }
 
 func (r *fakeRecords) Get(_ context.Context, id string) (Record, bool, error) {
@@ -149,6 +170,8 @@ func (r *fakeRecords) SetHash(_ context.Context, id, hash string) error {
 }
 
 func (r *fakeRecords) Stale(context.Context, time.Duration) ([]StaleRecord, error) { return nil, nil }
+
+func (r *fakeRecords) ForwardLoss(context.Context, time.Duration) (int64, error) { return r.loss, nil }
 
 // ── fixture ───────────────────────────────────────────────────────────────────
 
@@ -427,5 +450,38 @@ func TestResolver(t *testing.T) {
 	}
 	if o, done := r.resolve(context.Background(), StaleRecord{RequestID: "d", TxHash: "h", UpdatedAt: time.Now().Add(-10 * time.Minute)}); !done || o.Status != StatusRejected {
 		t.Fatalf("expired: %+v %v", o, done)
+	}
+}
+
+func TestResolver_LossAlertIsAnAlertNotAStop(t *testing.T) {
+	f := newFixture(t)
+	var gauge []int64
+	r := &Resolver{Submitter: f.sub, LossAlertStroops: 1_000, OnForwardLoss: func(s int64) { gauge = append(gauge, s) }}
+
+	f.records.loss = 500
+	r.Tick(context.Background())
+	if r.alerting {
+		t.Fatal("alerting under the threshold")
+	}
+	f.records.loss = 1_500
+	r.Tick(context.Background())
+	r.Tick(context.Background())
+	if !r.alerting {
+		t.Fatal("not alerting over the threshold")
+	}
+	f.records.loss = 900
+	r.Tick(context.Background())
+	if r.alerting {
+		t.Fatal("still alerting after falling back under")
+	}
+	if len(gauge) != 4 || gauge[1] != 1_500 || gauge[3] != 900 {
+		t.Fatalf("gauge = %v", gauge)
+	}
+
+	// Over the threshold, user-paid submissions still go through.
+	f.records.loss = 1_000_000
+	r.Tick(context.Background())
+	if rec := f.run(t); rec.Status != StatusSuccess {
+		t.Fatalf("submission blocked by the loss alert: %+v", rec)
 	}
 }

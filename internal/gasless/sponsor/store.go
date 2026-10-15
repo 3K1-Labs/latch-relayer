@@ -28,25 +28,38 @@ func (s Status) Final() bool {
 
 // Record is one submission's stored state: what latch-api gets back.
 type Record struct {
-	RequestID         string    `json:"request_id"`
-	Wallet            string    `json:"wallet"`
-	Mode              Mode      `json:"mode"`
-	Status            Status    `json:"status"`
-	TxHash            string    `json:"tx_hash,omitempty"`
-	FeeChargedStroops *int64    `json:"fee_charged_stroops,omitempty"`
-	ErrorCode         string    `json:"error_code,omitempty"`
-	ErrorMessage      string    `json:"error_message,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	RequestID         string `json:"request_id"`
+	Wallet            string `json:"wallet"`
+	Mode              Mode   `json:"mode"`
+	Status            Status `json:"status"`
+	TxHash            string `json:"tx_hash,omitempty"`
+	FeeChargedStroops *int64 `json:"fee_charged_stroops,omitempty"`
+	ErrorCode         string `json:"error_code,omitempty"`
+	ErrorMessage      string `json:"error_message,omitempty"`
+	// UserFee is set in forward mode: what the user reimbursed.
+	UserFee   *UserFee  `json:"user_fee,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 
 	payloadHash string
 }
 
-// Limits are the sponsorship caps.
+// Limits are the sponsorship caps, and forward mode's exposure caps.
 type Limits struct {
 	MaxTxPerWallet      int   // sponsored transactions per wallet, ever
 	MaxStroopsPerWallet int64 // sponsored spend per wallet, ever
 	MaxStroopsPerDay    int64 // sponsored spend across all wallets, rolling 24h
+
+	// Forward mode: the user reimburses the fee, but only if the transaction
+	// succeeds. If it fails on-chain, FeeForwarder's fee collection reverts
+	// with it while the funder's fee-bump is still charged — by accident
+	// (swap slippage) or on purpose (moving funds out between simulation and
+	// inclusion). Per wallet, failures are capped over a rolling window, and
+	// in-flight forwards separately so a burst can't race past that cap.
+	// Losses across all wallets raise an alert (Resolver), never a stop.
+	MaxForwardFailuresPerWallet int
+	ForwardFailureWindow        time.Duration
+	MaxForwardInFlightPerWallet int
 }
 
 var (
@@ -56,6 +69,12 @@ var (
 	ErrWalletCap = errors.New("wallet sponsorship cap reached")
 	// ErrDailyBudget: Latch's daily sponsorship budget is spent.
 	ErrDailyBudget = errors.New("daily sponsorship budget reached")
+	// ErrForwardFailures: the wallet's user-paid transactions failed on-chain
+	// (unreimbursed) too many times within the failure window.
+	ErrForwardFailures = errors.New("too many failed user-paid transactions for this wallet; try again later")
+	// ErrForwardInFlight: the wallet has too many user-paid transactions in
+	// flight at once.
+	ErrForwardInFlight = errors.New("too many user-paid transactions in flight for this wallet; retry once one settles")
 )
 
 // Store keeps sponsored_transactions.
@@ -64,12 +83,22 @@ type Store struct{ db *pgxpool.Pool }
 func NewStore(db *pgxpool.Pool) *Store { return &Store{db: db} }
 
 const recordColumns = `request_id, payload_hash, wallet, mode, status, COALESCE(tx_hash, ''),
-	fee_charged_stroops, COALESCE(error_code, ''), COALESCE(error_message, ''), created_at, updated_at`
+	fee_charged_stroops, COALESCE(error_code, ''), COALESCE(error_message, ''),
+	user_fee_token, user_fee_symbol, user_fee_amount, created_at, updated_at`
 
 func scanRecord(row pgx.Row) (Record, error) {
 	var r Record
+	var feeToken, feeSymbol *string
+	var feeAmount *int64
 	err := row.Scan(&r.RequestID, &r.payloadHash, &r.Wallet, &r.Mode, &r.Status, &r.TxHash,
-		&r.FeeChargedStroops, &r.ErrorCode, &r.ErrorMessage, &r.CreatedAt, &r.UpdatedAt)
+		&r.FeeChargedStroops, &r.ErrorCode, &r.ErrorMessage,
+		&feeToken, &feeSymbol, &feeAmount, &r.CreatedAt, &r.UpdatedAt)
+	if err == nil && feeToken != nil && feeAmount != nil {
+		r.UserFee = &UserFee{Token: *feeToken, Amount: *feeAmount}
+		if feeSymbol != nil {
+			r.UserFee.Symbol = *feeSymbol
+		}
+	}
 	return r, err
 }
 
@@ -95,6 +124,8 @@ type Reservation struct {
 	Contract      string
 	Function      string
 	MaxFeeStroops int64
+	// UserFee is set in forward mode.
+	UserFee *UserFee
 }
 
 // spendSQL is what a row counts against a cap: the charged fee once known,
@@ -126,41 +157,66 @@ func (s *Store) Reserve(ctx context.Context, res Reservation, lim Limits) (rec R
 			return fmt.Errorf("look up request: %w", err)
 		}
 
-		var count int
-		var walletSpend int64
-		if err := tx.QueryRow(ctx, `SELECT count(*), `+spendSQL+`
-			FROM sponsored_transactions
-			WHERE wallet = $1 AND mode = $2 AND status <> 'rejected'`,
-			res.Wallet, res.Mode).Scan(&count, &walletSpend); err != nil {
-			return fmt.Errorf("wallet usage: %w", err)
-		}
-		if count >= lim.MaxTxPerWallet || walletSpend+res.MaxFeeStroops > lim.MaxStroopsPerWallet {
-			return ErrWalletCap
-		}
-
-		var daySpend int64
-		if err := tx.QueryRow(ctx, `SELECT `+spendSQL+`
-			FROM sponsored_transactions
-			WHERE mode = $1 AND status <> 'rejected' AND created_at > NOW() - INTERVAL '24 hours'`,
-			res.Mode).Scan(&daySpend); err != nil {
-			return fmt.Errorf("daily usage: %w", err)
-		}
-		if daySpend+res.MaxFeeStroops > lim.MaxStroopsPerDay {
-			return ErrDailyBudget
+		// Sponsored: caps on what Latch pays for. Forward: caps on what Latch
+		// could lose when a forward fails unreimbursed.
+		switch res.Mode {
+		case ModeSponsored:
+			if err := checkCaps(ctx, tx, res, lim); err != nil {
+				return err
+			}
+		case ModeForward:
+			if err := checkForwardExposure(ctx, tx, res, lim); err != nil {
+				return err
+			}
 		}
 
+		var feeToken, feeSymbol *string
+		var feeAmount *int64
+		if f := res.UserFee; f != nil {
+			feeToken, feeSymbol, feeAmount = &f.Token, &f.Symbol, &f.Amount
+		}
 		rec, err = scanRecord(tx.QueryRow(ctx, `
 			INSERT INTO sponsored_transactions
-				(request_id, payload_hash, wallet, mode, target_contract, target_function, fee_reserved_stroops)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+				(request_id, payload_hash, wallet, mode, target_contract, target_function, fee_reserved_stroops,
+				 user_fee_token, user_fee_symbol, user_fee_amount)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			RETURNING `+recordColumns,
-			res.RequestID, res.PayloadHash, res.Wallet, res.Mode, res.Contract, res.Function, res.MaxFeeStroops))
+			res.RequestID, res.PayloadHash, res.Wallet, res.Mode, res.Contract, res.Function, res.MaxFeeStroops,
+			feeToken, feeSymbol, feeAmount))
 		if err != nil {
 			return fmt.Errorf("insert sponsored transaction: %w", err)
 		}
 		return nil
 	})
 	return rec, existing, err
+}
+
+// checkCaps refuses a sponsored reservation that would overrun the wallet's
+// allowance or the daily budget. Runs under Reserve's lock.
+func checkCaps(ctx context.Context, tx pgx.Tx, res Reservation, lim Limits) error {
+	var count int
+	var walletSpend int64
+	if err := tx.QueryRow(ctx, `SELECT count(*), `+spendSQL+`
+		FROM sponsored_transactions
+		WHERE wallet = $1 AND mode = $2 AND status <> 'rejected'`,
+		res.Wallet, res.Mode).Scan(&count, &walletSpend); err != nil {
+		return fmt.Errorf("wallet usage: %w", err)
+	}
+	if count >= lim.MaxTxPerWallet || walletSpend+res.MaxFeeStroops > lim.MaxStroopsPerWallet {
+		return ErrWalletCap
+	}
+
+	var daySpend int64
+	if err := tx.QueryRow(ctx, `SELECT `+spendSQL+`
+		FROM sponsored_transactions
+		WHERE mode = $1 AND status <> 'rejected' AND created_at > NOW() - INTERVAL '24 hours'`,
+		res.Mode).Scan(&daySpend); err != nil {
+		return fmt.Errorf("daily usage: %w", err)
+	}
+	if daySpend+res.MaxFeeStroops > lim.MaxStroopsPerDay {
+		return ErrDailyBudget
+	}
+	return nil
 }
 
 // Outcome is how a submission ended (or where it stands).
@@ -211,4 +267,40 @@ func (s *Store) SetHash(ctx context.Context, requestID, hash string) error {
 		return fmt.Errorf("record hash: %w", err)
 	}
 	return nil
+}
+
+// checkForwardExposure refuses a forward reservation when the wallet has had
+// MaxForwardFailuresPerWallet forwards fail on-chain within
+// ForwardFailureWindow, or already has MaxForwardInFlightPerWallet pending or
+// unconfirmed. Runs under Reserve's lock, so concurrent submissions can't
+// race past either limit.
+func checkForwardExposure(ctx context.Context, tx pgx.Tx, res Reservation, lim Limits) error {
+	var failures, inFlight int
+	if err := tx.QueryRow(ctx, `SELECT
+			count(*) FILTER (WHERE status = 'failed' AND created_at > NOW() - make_interval(secs => $2)),
+			count(*) FILTER (WHERE status IN ('pending', 'unconfirmed'))
+		FROM sponsored_transactions
+		WHERE wallet = $1 AND mode = 'forward' AND status <> 'rejected'`,
+		res.Wallet, lim.ForwardFailureWindow.Seconds()).Scan(&failures, &inFlight); err != nil {
+		return fmt.Errorf("forward wallet exposure: %w", err)
+	}
+	if failures >= lim.MaxForwardFailuresPerWallet {
+		return ErrForwardFailures
+	}
+	if inFlight >= lim.MaxForwardInFlightPerWallet {
+		return ErrForwardInFlight
+	}
+	return nil
+}
+
+// ForwardLoss is what forwards that failed on-chain within window cost the
+// funder: charged fee-bumps nobody reimbursed.
+func (s *Store) ForwardLoss(ctx context.Context, window time.Duration) (int64, error) {
+	var loss int64
+	if err := s.db.QueryRow(ctx, `SELECT `+spendSQL+` FROM sponsored_transactions
+		WHERE mode = 'forward' AND status = 'failed' AND created_at > NOW() - make_interval(secs => $1)`,
+		window.Seconds()).Scan(&loss); err != nil {
+		return 0, fmt.Errorf("forward loss: %w", err)
+	}
+	return loss, nil
 }

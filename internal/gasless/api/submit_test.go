@@ -98,6 +98,8 @@ func TestSubmit_ErrorMapping(t *testing.T) {
 		sponsor.ErrConflict:        {409, "request_id_conflict"},
 		sponsor.ErrWalletCap:       {429, "wallet_cap_reached"},
 		sponsor.ErrDailyBudget:     {429, "daily_budget_reached"},
+		sponsor.ErrForwardFailures: {429, "forward_failure_limit"},
+		sponsor.ErrForwardInFlight: {429, "forward_in_flight_limit"},
 		sponsor.ErrSimulation:      {422, "simulation_failed"},
 		sponsor.ErrUnavailable:     {503, "sponsorship_unavailable"},
 	}
@@ -125,5 +127,54 @@ func TestGetRequest(t *testing.T) {
 	}
 	if code, _ := serve(t, s, "GET", "/gasless/requests/missing", ""); code != http.StatusNotFound {
 		t.Fatalf("missing: %d", code)
+	}
+}
+
+type fakeQuoter struct {
+	err error
+}
+
+func (f fakeQuoter) Quote(_ context.Context, token string, resourceFee int64) (sponsor.Quote, error) {
+	if f.err != nil {
+		return sponsor.Quote{}, f.err
+	}
+	return sponsor.Quote{FeeToken: token, Symbol: "XLM", MaxFeeAmount: resourceFee * 2, Relayer: "GEXEC", FeeForwarder: "CFWD"}, nil
+}
+
+func (f fakeQuoter) ForwardAddresses() (string, string) { return "CFWD", "GEXEC" }
+
+func (f fakeQuoter) FeeTokens() []sponsor.FeeToken {
+	if f.err != nil {
+		return nil
+	}
+	return []sponsor.FeeToken{{Contract: "CXLM", Symbol: "XLM", Native: true}}
+}
+
+func TestQuoteEndpoint(t *testing.T) {
+	s := &Submissions{Quoter: fakeQuoter{}}
+	code, out := serve(t, s, "POST", "/gasless/quote", `{"fee_token":"CXLM","resource_fee_stroops":50000}`)
+	if code != http.StatusOK || out["max_fee_amount"] != float64(100000) || out["relayer"] != "GEXEC" {
+		t.Fatalf("%d %v", code, out)
+	}
+	if code, _ := serve(t, s, "POST", "/gasless/quote", `{"fee_token":"CXLM","extra":1}`); code != http.StatusBadRequest {
+		t.Fatalf("unknown field: %d", code)
+	}
+	for err, want := range map[error]int{
+		sponsor.ErrPriceUnavailable: http.StatusServiceUnavailable,
+		sponsor.ErrForwardNotBuilt:  http.StatusNotImplemented,
+		sponsor.ErrInvalid:          http.StatusBadRequest,
+	} {
+		if code, _ := serve(t, &Submissions{Quoter: fakeQuoter{err: err}}, "POST", "/gasless/quote", `{"fee_token":"C","resource_fee_stroops":1}`); code != want {
+			t.Errorf("%v: %d, want %d", err, code, want)
+		}
+	}
+}
+
+func TestFeeTokensEndpoint(t *testing.T) {
+	if code, out := serve(t, &Submissions{Quoter: fakeQuoter{}}, "GET", "/gasless/fee-tokens", ""); code != http.StatusOK || out["fee_tokens"] == nil || out["fee_forwarder"] != "CFWD" || out["relayer"] != "GEXEC" {
+		t.Fatalf("%d %v", code, out)
+	}
+	if code, _ := serve(t, &Submissions{Quoter: fakeQuoter{err: sponsor.ErrForwardNotBuilt}}, "GET", "/gasless/fee-tokens", ""); code != http.StatusNotImplemented {
+		t.Fatalf("not configured: %d", code)
 	}
 }
