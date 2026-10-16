@@ -69,3 +69,90 @@ func Accounts(ctx context.Context, rpc RPC, addresses []string) (map[string]Acco
 	}
 	return out, nil
 }
+
+// TokenBalances reads holder's balance in each Stellar Asset Contract in
+// tokens with one getLedgerEntries call, keyed by token contract. A SAC
+// stores a contract holder's balance as persistent contract data under
+// Vec[Symbol("Balance"), holder] with value {amount, authorized, clawback};
+// a missing entry is a zero balance.
+func TokenBalances(ctx context.Context, rpc RPC, holder string, tokens []string) (map[string]int64, error) {
+	holderVal, err := ScAddressVal(holder)
+	if err != nil {
+		return nil, fmt.Errorf("holder: %w", err)
+	}
+	vec := xdr.ScVec{ScSymbol("Balance"), holderVal}
+	vecPtr := &vec
+	balanceKey := xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &vecPtr}
+
+	out := make(map[string]int64, len(tokens))
+	keyToToken := make(map[string]string, len(tokens))
+	keys := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		tokenAddr, err := ScAddressFromString(token)
+		if err != nil {
+			return nil, fmt.Errorf("token: %w", err)
+		}
+		key, err := xdr.MarshalBase64(xdr.LedgerKey{
+			Type: xdr.LedgerEntryTypeContractData,
+			ContractData: &xdr.LedgerKeyContractData{
+				Contract:   tokenAddr,
+				Key:        balanceKey,
+				Durability: xdr.ContractDataDurabilityPersistent,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		keyToToken[key] = token
+		keys = append(keys, key)
+		out[token] = 0
+	}
+
+	resp, err := rpc.GetLedgerEntries(ctx, protocol.GetLedgerEntriesRequest{Keys: keys})
+	if err != nil {
+		return nil, fmt.Errorf("getLedgerEntries: %w", err)
+	}
+	for _, e := range resp.Entries {
+		token, ok := keyToToken[e.KeyXDR]
+		if !ok {
+			continue
+		}
+		var data xdr.LedgerEntryData
+		if err := xdr.SafeUnmarshalBase64(e.DataXDR, &data); err != nil {
+			return nil, fmt.Errorf("decode %s balance: %w", token, err)
+		}
+		cd, ok := data.GetContractData()
+		if !ok {
+			return nil, fmt.Errorf("%s balance entry is not contract data", token)
+		}
+		amount, err := sacBalanceAmount(cd.Val)
+		if err != nil {
+			return nil, fmt.Errorf("%s balance: %w", token, err)
+		}
+		out[token] = amount
+	}
+	return out, nil
+}
+
+// sacBalanceAmount extracts amount from a SAC balance value
+// {amount: i128, authorized: bool, clawback: bool}.
+func sacBalanceAmount(v xdr.ScVal) (int64, error) {
+	m, ok := v.GetMap()
+	if !ok || m == nil {
+		return 0, fmt.Errorf("balance value is not a map")
+	}
+	for _, entry := range *m {
+		if sym, ok := entry.Key.GetSym(); !ok || sym != "amount" {
+			continue
+		}
+		parts, ok := entry.Val.GetI128()
+		if !ok {
+			return 0, fmt.Errorf("amount is not an i128")
+		}
+		if parts.Hi != 0 || int64(parts.Lo) < 0 {
+			return 0, fmt.Errorf("amount does not fit in int64")
+		}
+		return int64(parts.Lo), nil
+	}
+	return 0, fmt.Errorf("balance value has no amount")
+}

@@ -20,15 +20,18 @@ import (
 // ── fakes ─────────────────────────────────────────────────────────────────────
 
 type fakeRPC struct {
-	mu        sync.Mutex
-	simErr    string
-	resource  int64
-	p90       uint64
-	sends     []string // signed envelopes, in order
-	sendQueue []protocol.SendTransactionResponse
-	pollResp  protocol.GetTransactionResponse
-	pollErr   error
-	accountSq int64
+	mu       sync.Mutex
+	simErr   string
+	resource int64
+	// recordResource, when set, is the record-mode resource fee; enforce
+	// mode always returns resource.
+	recordResource int64
+	p90            uint64
+	sends          []string // signed envelopes, in order
+	sendQueue      []protocol.SendTransactionResponse
+	pollResp       protocol.GetTransactionResponse
+	pollErr        error
+	accountSq      int64
 	// record mode: the auth entries a recording simulation returns
 	recordAuth []string
 	simModes   []string
@@ -69,7 +72,11 @@ func (f *fakeRPC) SimulateTransaction(_ context.Context, req protocol.SimulateTr
 			return protocol.SimulateTransactionResponse{}, errors.New("unexpected record-mode simulation")
 		}
 		auth := f.recordAuth
-		return protocol.SimulateTransactionResponse{MinResourceFee: f.resource,
+		resource := f.resource
+		if f.recordResource != 0 {
+			resource = f.recordResource
+		}
+		return protocol.SimulateTransactionResponse{MinResourceFee: resource,
 			Results: []protocol.SimulateHostFunctionResult{{AuthXDR: &auth}}}, nil
 	}
 	if req.AuthMode != protocol.AuthModeEnforce {

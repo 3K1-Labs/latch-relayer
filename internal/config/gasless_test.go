@@ -47,6 +47,21 @@ func TestLoadGasless_Success(t *testing.T) {
 	if cfg.InstanceID == "" {
 		t.Fatal("instance id not defaulted")
 	}
+	if cfg.ForwarderSweepAlertUnits != 10*10_000_000 {
+		t.Fatalf("sweep alert default = %d, want 10 tokens", cfg.ForwarderSweepAlertUnits)
+	}
+}
+
+func TestLoadGasless_SweepAlertCanBeDisabled(t *testing.T) {
+	validGaslessEnv(t)
+	t.Setenv("FORWARDER_SWEEP_ALERT", "0")
+	cfg, err := LoadGasless()
+	if err != nil {
+		t.Fatalf("LoadGasless() error: %v", err)
+	}
+	if cfg.ForwarderSweepAlertUnits != 0 {
+		t.Fatalf("sweep alert = %d, want 0 (disabled)", cfg.ForwarderSweepAlertUnits)
+	}
 }
 
 // The whole point of the service split: a pool key must never be loaded into
@@ -91,6 +106,8 @@ func TestLoadGasless_Validation(t *testing.T) {
 		"no in-flight allowance":    func(t *testing.T) { t.Setenv("FORWARD_MAX_IN_FLIGHT_PER_WALLET", "0") },
 		"negative price staleness":  func(t *testing.T) { t.Setenv("PRICE_MAX_STALE_MINUTES", "-1") },
 		"bad loss alert":            func(t *testing.T) { t.Setenv("FORWARD_LOSS_ALERT_XLM_PER_DAY", "lots") },
+		"bad sweep alert":           func(t *testing.T) { t.Setenv("FORWARDER_SWEEP_ALERT", "lots") },
+		"negative sweep alert":      func(t *testing.T) { t.Setenv("FORWARDER_SWEEP_ALERT", "-1") },
 		"executor is funder": func(t *testing.T) {
 			kp := keypair.MustRandom()
 			t.Setenv("EXECUTOR_ADDRESS", kp.Address())

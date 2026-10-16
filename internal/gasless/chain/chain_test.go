@@ -16,7 +16,8 @@ const forwarder = "CB6KFDFN7CXIOSBOEXABOX6KPRK4X6VMPSDWCGYP564JXGN2LIH2QPWI"
 // fakeRPC serves ledger entries from a map and answers simulations with a
 // canned return value, recording what it was asked.
 type fakeRPC struct {
-	accounts   map[string]xdr.AccountEntry // by address
+	accounts   map[string]xdr.AccountEntry      // by address
+	data       map[string]xdr.ContractDataEntry // by base64 ledger key
 	calls      int
 	simReturn  *xdr.ScVal
 	simError   string
@@ -34,6 +35,16 @@ func (f *fakeRPC) GetLedgerEntries(_ context.Context, req protocol.GetLedgerEntr
 		var lk xdr.LedgerKey
 		if err := xdr.SafeUnmarshalBase64(key, &lk); err != nil {
 			return resp, err
+		}
+		if lk.Type == xdr.LedgerEntryTypeContractData {
+			cd, ok := f.data[key]
+			if !ok {
+				continue
+			}
+			data, _ := xdr.NewLedgerEntryData(xdr.LedgerEntryTypeContractData, cd)
+			b64, _ := xdr.MarshalBase64(data)
+			resp.Entries = append(resp.Entries, protocol.LedgerEntryResult{KeyXDR: key, DataXDR: b64})
+			continue
 		}
 		addr := lk.Account.AccountId.Address()
 		acc, ok := f.accounts[addr]
@@ -89,6 +100,73 @@ func TestAccountsBatchesAndReportsMissing(t *testing.T) {
 	}
 	if got[addrs[1]].Exists {
 		t.Fatal("missing account reported as existing")
+	}
+}
+
+const (
+	xlmSAC  = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA"
+	usdcSAC = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"
+)
+
+// sacBalanceKey is the ledger key a SAC stores holder's balance under.
+func sacBalanceKey(t *testing.T, token, holder string) (string, xdr.ScAddress, xdr.ScVal) {
+	t.Helper()
+	tokenAddr, err := ScAddressFromString(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holderVal, err := ScAddressVal(holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vec := xdr.ScVec{ScSymbol("Balance"), holderVal}
+	vecPtr := &vec
+	k := xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &vecPtr}
+	b64, err := xdr.MarshalBase64(xdr.LedgerKey{Type: xdr.LedgerEntryTypeContractData, ContractData: &xdr.LedgerKeyContractData{
+		Contract: tokenAddr, Key: k, Durability: xdr.ContractDataDurabilityPersistent,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b64, tokenAddr, k
+}
+
+func sacBalanceEntry(tokenAddr xdr.ScAddress, key xdr.ScVal, amount uint64) xdr.ContractDataEntry {
+	f := false
+	tr := true
+	m := xdr.ScMap{
+		{Key: ScSymbol("amount"), Val: xdr.ScVal{Type: xdr.ScValTypeScvI128, I128: &xdr.Int128Parts{Lo: xdr.Uint64(amount)}}},
+		{Key: ScSymbol("authorized"), Val: xdr.ScVal{Type: xdr.ScValTypeScvBool, B: &tr}},
+		{Key: ScSymbol("clawback"), Val: xdr.ScVal{Type: xdr.ScValTypeScvBool, B: &f}},
+	}
+	mp := &m
+	return xdr.ContractDataEntry{Contract: tokenAddr, Key: key, Durability: xdr.ContractDataDurabilityPersistent,
+		Val: xdr.ScVal{Type: xdr.ScValTypeScvMap, Map: &mp}}
+}
+
+func TestTokenBalances(t *testing.T) {
+	f := &fakeRPC{data: map[string]xdr.ContractDataEntry{}}
+	key, tokenAddr, k := sacBalanceKey(t, xlmSAC, forwarder)
+	f.data[key] = sacBalanceEntry(tokenAddr, k, 885_535)
+
+	got, err := TokenBalances(context.Background(), f, forwarder, []string{xlmSAC, usdcSAC})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.calls != 1 {
+		t.Fatalf("took %d RPC calls, want 1", f.calls)
+	}
+	if got[xlmSAC] != 885_535 {
+		t.Fatalf("XLM balance = %d, want 885,535", got[xlmSAC])
+	}
+	if v, ok := got[usdcSAC]; !ok || v != 0 {
+		t.Fatalf("missing USDC entry = %d (present %v), want 0", v, ok)
+	}
+}
+
+func TestTokenBalancesRejectsBadHolder(t *testing.T) {
+	if _, err := TokenBalances(context.Background(), &fakeRPC{}, "not-an-address", []string{xlmSAC}); err == nil {
+		t.Fatal("bad holder accepted")
 	}
 }
 

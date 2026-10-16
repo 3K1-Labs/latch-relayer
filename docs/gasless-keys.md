@@ -33,7 +33,8 @@ A Latch wallet is a C-address contract, and only a G-account can be a transactio
 - The user signs one authorization tree covering `forward()`, the fee token's `approve` up to `max_fee_amount`, and the target call. The relayer fills in the real `fee_amount` (≤ `max_fee_amount`) and the executor co-authorizes. If the target call fails, the fee collection reverts with it.
 - latch-api chooses the fee token when it builds the authorization and shows the maximum fee in that token. "Send max" leaves room for the fee.
 - **Mainnet deployment must call `enable_fee_token` for the XLM and USDC SACs.** Until the first token is enabled, the contract accepts any token as the fee.
-- Fees collected in the contract are withdrawn with the manager-gated `sweep_tokens`.
+- **The user's fee is priced from the enforce-mode simulation** the transaction is built from: `(2 × inclusion + resource fee) × (1 + FEE_MARGIN_BPS)`. The record-mode simulation, which only supplies the executor's entry to sign, overestimated the resource fee by about 40% on mainnet.
+- Fees collected in the contract stay there until the manager sweeps them back to the funder with `sweep_tokens` (see Operating). The funder is not repaid automatically.
 
 The open work to ship this (sponsor endpoint, sponsored mode, fee-token pricing, KMS) is tracked in [GAPS.md](../GAPS.md#1--gasless-sponsorship-launch-blockers).
 
@@ -69,6 +70,13 @@ At boot the service checks the network passphrase, that the executor and funder 
   - Takes a channel out of rotation if it's missing on-chain or under `CHANNEL_MIN_XLM`, and puts it back once healthy.
   - Stops sponsorship while the funder is under its floor.
 - **Top-ups** come from a treasury account that is **never** loaded into the relayer. Keep the funder float small: a few days of expected fees plus margin.
+- **Sweeping collected fees.** User-paid fees accumulate in FeeForwarder, not the funder. `/gasless/status` shows them as `forwarder_fee_balances`, `latch_gasless_forwarder_fee_balance{token}` exports them, and the service logs an `ALERT` when one passes `FORWARDER_SWEEP_ALERT` tokens. The manager (cold key, never loaded into the relayer) sweeps each token to the funder:
+
+  ```bash
+  stellar contract invoke --id <FEE_FORWARDER_CONTRACT_ID> --source-account <manager> --network mainnet -- sweep_tokens --token <XLM or USDC SAC> --recipient <FUNDER_ADDRESS> --operator <manager G-address>
+  ```
+
+  Swept USDC arrives as USDC: only XLM fees refill the funder directly.
 
 ## Rotation
 

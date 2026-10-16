@@ -145,8 +145,9 @@ func TestForward_PricesSignsAndReserves(t *testing.T) {
 	}
 	verifyExecutorSignature(t, ff.executor, exec)
 
-	// Record mode first (no auth sent), then enforce.
-	if len(ff.rpc.simModes) != 2 || ff.rpc.simModes[0] != "record" || ff.rpc.simModes[1] != "enforce" {
+	// Record mode first (no auth sent), then the enforce-mode pricing probe,
+	// then Prepare's enforce-mode run the transaction is built from.
+	if len(ff.rpc.simModes) != 3 || ff.rpc.simModes[0] != "record" || ff.rpc.simModes[1] != "enforce" || ff.rpc.simModes[2] != "enforce" {
 		t.Fatalf("simulation modes = %v", ff.rpc.simModes)
 	}
 	var recorded xdr.TransactionEnvelope
@@ -167,6 +168,61 @@ func TestForward_PricesSignsAndReserves(t *testing.T) {
 
 	if rec := ff.sub.Run(context.Background(), p); rec.Status != StatusSuccess {
 		t.Fatalf("run: %+v", rec)
+	}
+}
+
+// TestForward_PricesFromEnforceMode: record mode overestimates the resource
+// fee (it did by ~40% on mainnet); the user is charged from the enforce-mode
+// simulation the transaction is built from, not the record-mode estimate.
+func TestForward_PricesFromEnforceMode(t *testing.T) {
+	ff := newForwardFixture(t)
+	ff.rpc.recordResource = 70_000 // enforce mode stays at 50,000
+	ff.req = ff.request(t, ff.xlm, 1_000_000)
+
+	p, _, err := ff.sub.Prepare(context.Background(), ff.req)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	// Probe: signed at the record-mode estimate, (2×300 + 70,000) +25% = 88,250.
+	var probe xdr.TransactionEnvelope
+	if err := xdr.SafeUnmarshalBase64(ff.rpc.simTxs[1], &probe); err != nil {
+		t.Fatal(err)
+	}
+	probeArgs := probe.V1.Tx.Operations[0].Body.InvokeHostFunctionOp.HostFunction.MustInvokeContract().Args
+	if got, _ := scI128(probeArgs[argFeeAmount]); got != 88_250 {
+		t.Fatalf("probe fee_amount = %d, want the record-mode estimate 88,250", got)
+	}
+
+	// Charged: (2×300 + 50,000) +25% = 63,250, and the executor signed that.
+	const wantFee = 63_250
+	args := p.call.HostFunction.MustInvokeContract().Args
+	if got, _ := scI128(args[argFeeAmount]); got != wantFee {
+		t.Fatalf("fee_amount = %d, want %d", got, wantFee)
+	}
+	exec := p.call.Auth[len(p.call.Auth)-1]
+	if got, _ := scI128(exec.RootInvocation.Function.ContractFn.Args[argFeeAmount]); got != wantFee {
+		t.Fatalf("executor signed fee_amount %d, want %d", got, wantFee)
+	}
+	verifyExecutorSignature(t, ff.executor, exec)
+	if res := ff.records.reserved[0]; res.UserFee == nil || res.UserFee.Amount != wantFee {
+		t.Fatalf("reservation user fee = %+v", res.UserFee)
+	}
+}
+
+// TestForward_EnforceModeOverMaxIsRefused: a fee the record-mode estimate
+// allowed but the enforce-mode price exceeds is refused, never sent.
+func TestForward_EnforceModeOverMaxIsRefused(t *testing.T) {
+	ff := newForwardFixture(t)
+	ff.rpc.recordResource = 10_000
+	ff.rpc.resource = 900_000 // (2×300 + 900,000) +25% > 1,000,000
+	ff.req = ff.request(t, ff.xlm, 1_000_000)
+
+	if _, _, err := ff.sub.Prepare(context.Background(), ff.req); !errors.Is(err, ErrFeeTooLow) {
+		t.Fatalf("err = %v, want ErrFeeTooLow", err)
+	}
+	if len(ff.records.reserved) != 0 {
+		t.Fatal("reserved despite the fee exceeding the user's maximum")
 	}
 }
 
