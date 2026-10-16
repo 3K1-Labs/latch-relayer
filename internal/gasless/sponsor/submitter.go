@@ -184,11 +184,15 @@ type UserFee struct {
 
 // priceForward fills in fee_amount and the executor's signed authorization:
 //  1. simulate in record mode with fee_amount at the user's maximum, to get
-//     the resource fee and the executor's authorization to sign;
-//  2. price the network cost in the fee token (refused if over the maximum);
-//  3. rewrite fee_amount, sign the executor's entry, and attach it beside the
-//     user's signed entries. The caller's enforce-mode simulation then checks
-//     both signatures before anything is paid.
+//     the executor's authorization to sign and a first estimate of the cost;
+//  2. sign at that estimate and simulate in enforce mode — the run the
+//     transaction is actually built from — to get the real resource fee.
+//     Record mode overestimated it by ~40% on mainnet, and pricing from it
+//     charged users well above the network cost;
+//  3. price the enforce-mode cost in the fee token (refused if over the
+//     maximum), re-sign at that fee, and attach the executor's entry beside
+//     the user's signed entries. The caller's enforce-mode simulation then
+//     checks both signatures before anything is paid.
 func (s *Submitter) priceForward(ctx context.Context, call Call, fc forwardCall, inclusion int64) (Call, *UserFee, error) {
 	f := s.Forward
 	placeholder, err := f.withFee(call, fc.maxFee)
@@ -203,40 +207,74 @@ func (s *Submitter) priceForward(ctx context.Context, call Call, fc forwardCall,
 	if err != nil {
 		return Call{}, nil, fmt.Errorf("%w: %v", ErrSimulation, err)
 	}
-
-	if resp.MinResourceFee < 0 || resp.MinResourceFee > MaxResourceFeeStroops {
-		return Call{}, nil, fmt.Errorf("%w: implausible resource fee %d", ErrSimulation, resp.MinResourceFee)
-	}
-	cost := 2*inclusion + resp.MinResourceFee
-	fee, err := f.FeeInToken(ctx, fc.token, cost)
+	estimate, err := s.feeFor(ctx, fc, inclusion, resp.MinResourceFee)
 	if err != nil {
 		return Call{}, nil, err
 	}
-	if fee > fc.maxFee {
-		return Call{}, nil, fmt.Errorf("%w: needs %d %s units, user allowed %d", ErrFeeTooLow, fee, fc.token.Symbol, fc.maxFee)
-	}
 
-	hf, err := f.withFee(call, fee)
-	if err != nil {
-		return Call{}, nil, err
-	}
-	entry, err := setRootFeeAmount(recorded, fee)
-	if err != nil {
-		return Call{}, nil, fmt.Errorf("%w: %v", ErrSimulation, err)
-	}
 	latest, err := s.RPC.GetLatestLedger(ctx)
 	if err != nil {
 		return Call{}, nil, fmt.Errorf("latest ledger: %w", err)
 	}
-	signed, err := signExecutorEntry(ctx, f.Executor, s.Passphrase, entry, latest.Sequence+f.AuthLedgers)
+	expiration := latest.Sequence + f.AuthLedgers
+
+	probe, err := s.withExecutor(ctx, call, recorded, estimate, expiration)
+	if err != nil {
+		return Call{}, nil, err
+	}
+	enforced, err := s.simulateRaw(ctx, probe, protocol.AuthModeEnforce)
+	if err != nil {
+		return Call{}, nil, err
+	}
+	fee, err := s.feeFor(ctx, fc, inclusion, enforced.MinResourceFee)
 	if err != nil {
 		return Call{}, nil, err
 	}
 
+	out, err := s.withExecutor(ctx, call, recorded, fee, expiration)
+	if err != nil {
+		return Call{}, nil, err
+	}
+	return out, &UserFee{Token: fc.token.Contract, Symbol: fc.token.Symbol, Amount: fee}, nil
+}
+
+// feeFor prices a simulated resource fee, plus the inclusion bid for the
+// inner transaction and its fee-bump, in the fee token. It is refused when
+// the resource fee is implausible or the result exceeds the user's maximum.
+func (s *Submitter) feeFor(ctx context.Context, fc forwardCall, inclusion, resourceFee int64) (int64, error) {
+	if resourceFee < 0 || resourceFee > MaxResourceFeeStroops {
+		return 0, fmt.Errorf("%w: implausible resource fee %d", ErrSimulation, resourceFee)
+	}
+	fee, err := s.Forward.FeeInToken(ctx, fc.token, 2*inclusion+resourceFee)
+	if err != nil {
+		return 0, err
+	}
+	if fee > fc.maxFee {
+		return 0, fmt.Errorf("%w: needs %d %s units, user allowed %d", ErrFeeTooLow, fee, fc.token.Symbol, fc.maxFee)
+	}
+	return fee, nil
+}
+
+// withExecutor returns call with fee_amount set to fee and the executor's
+// recorded entry, signed at that fee, appended to the user's entries.
+func (s *Submitter) withExecutor(ctx context.Context, call Call, recorded xdr.SorobanAuthorizationEntry, fee int64, expiration uint32) (Call, error) {
+	f := s.Forward
+	hf, err := f.withFee(call, fee)
+	if err != nil {
+		return Call{}, err
+	}
+	entry, err := setRootFeeAmount(recorded, fee)
+	if err != nil {
+		return Call{}, fmt.Errorf("%w: %v", ErrSimulation, err)
+	}
+	signed, err := signExecutorEntry(ctx, f.Executor, s.Passphrase, entry, expiration)
+	if err != nil {
+		return Call{}, err
+	}
 	out := call
 	out.HostFunction = hf
 	out.Auth = append(append([]xdr.SorobanAuthorizationEntry(nil), call.Auth...), signed)
-	return out, &UserFee{Token: fc.token.Contract, Symbol: fc.token.Symbol, Amount: fee}, nil
+	return out, nil
 }
 
 // executorEntry finds the executor's recorded authorization.

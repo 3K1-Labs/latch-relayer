@@ -83,6 +83,10 @@ type Gasless struct {
 	// ForwardLossAlertStroops logs an error when unreimbursed losses across
 	// all wallets pass it over 24h. An alert only: nothing is refused.
 	ForwardLossAlertStroops int64
+	// ForwarderSweepAlertUnits logs an alert when FeeForwarder holds more
+	// than this many units (7 decimals) of a fee token: collected fees the
+	// manager should sweep back to the funder. 0 disables the alert.
+	ForwarderSweepAlertUnits int64
 }
 
 // forbiddenInGasless are deposit-bridge settings. The gasless process must
@@ -278,6 +282,10 @@ func loadForward(cfg *Gasless) error {
 	}
 	if cfg.ForwardLossAlertStroops, err = envXLM("FORWARD_LOSS_ALERT_XLM_PER_DAY", "50"); err != nil {
 		return err
+	}
+	sweep := getEnv("FORWARDER_SWEEP_ALERT", "10")
+	if cfg.ForwarderSweepAlertUnits, err = amount.ParseInt64(sweep); err != nil || cfg.ForwarderSweepAlertUnits < 0 {
+		return fmt.Errorf("FORWARDER_SWEEP_ALERT must be a non-negative token amount, got %q", sweep)
 	}
 	cfg.StellarExpertURL = getEnv("STELLAR_EXPERT_PRICE_URL", "https://api.stellar.expert/explorer/"+net+"/asset/XLM")
 	cfg.StellarExpertAPIKey = os.Getenv("STELLAR_EXPERT_API_KEY")

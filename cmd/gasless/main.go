@@ -97,14 +97,30 @@ func main() {
 
 	// ── 5. Background workers ─────────────────────────────────────────────────
 	m := metrics.New(cfg.MetricsNamespace)
-	monitor := balance.NewMonitor(rpc, chanPool, balance.Config{
+	var fwd *sponsor.Forward
+	if cfg.ForwardEnabled {
+		if fwd, err = forwardConfig(cfg); err != nil {
+			slog.Error("forward mode", "err", err)
+			os.Exit(1)
+		}
+	}
+	monitorCfg := balance.Config{
 		Executor:          cfg.Executor.Address(),
 		Funder:            cfg.Funder.Address(),
 		Channels:          cfg.Channels,
 		FunderMinStroops:  cfg.FunderMinStroops,
 		ChannelMinStroops: cfg.ChannelMinStroops,
 		Interval:          cfg.BalanceCheckInterval,
-	}, m.Registry, cfg.MetricsNamespace)
+	}
+	if fwd != nil {
+		monitorCfg.Forwarder = fwd.ForwarderID
+		monitorCfg.FeeTokens = make(map[string]string, len(fwd.Tokens))
+		for contract, t := range fwd.Tokens {
+			monitorCfg.FeeTokens[contract] = t.Symbol
+		}
+		monitorCfg.SweepAlertUnits = cfg.ForwarderSweepAlertUnits
+	}
+	monitor := balance.NewMonitor(rpc, chanPool, monitorCfg, m.Registry, cfg.MetricsNamespace)
 	monitorDone := make(chan struct{})
 	go func() { monitor.Run(ctx); close(monitorDone) }()
 
@@ -142,12 +158,7 @@ func main() {
 		Available:       monitor.SponsorshipOK,
 		RelayerAccounts: relayerAccounts,
 	}
-	if cfg.ForwardEnabled {
-		fwd, err := forwardConfig(cfg)
-		if err != nil {
-			slog.Error("forward mode", "err", err)
-			os.Exit(1)
-		}
+	if fwd != nil {
 		priceFallbacks := prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: cfg.MetricsNamespace,
 			Name:      "price_fallback_total",

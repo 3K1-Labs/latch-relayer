@@ -4,6 +4,10 @@
 // silent outage; channels need their base reserve to exist at all. The
 // monitor turns both into state the rest of the service acts on (refuse
 // sponsorship, take a channel out of rotation) and into metrics to alert on.
+//
+// In forward mode it also watches the fees FeeForwarder has collected: they
+// stay in the contract until the manager sweeps them back to the funder, so
+// a growing balance there is the funder's money waiting to be recovered.
 package balance
 
 import (
@@ -31,6 +35,14 @@ type Config struct {
 	FunderMinStroops  int64
 	ChannelMinStroops int64
 	Interval          time.Duration
+
+	// Forwarder is the FeeForwarder contract; empty when forward mode is off.
+	Forwarder string
+	// FeeTokens maps each fee token's contract to its symbol.
+	FeeTokens map[string]string
+	// SweepAlertUnits logs an alert when FeeForwarder holds more than this
+	// many units (7 decimals) of a fee token; 0 disables the alert.
+	SweepAlertUnits int64
 }
 
 // Snapshot is the latest observed state, served on /health.
@@ -40,6 +52,9 @@ type Snapshot struct {
 	ExecutorStroops int64          `json:"executor_balance_stroops"`
 	SponsorshipOK   bool           `json:"sponsorship_available"`
 	Channels        channels.Stats `json:"channels"`
+	// ForwarderFees is FeeForwarder's balance per fee token (by symbol), in
+	// token units: collected fees not yet swept back to the funder.
+	ForwarderFees map[string]int64 `json:"forwarder_fee_balances,omitempty"`
 }
 
 type Monitor struct {
@@ -52,6 +67,11 @@ type Monitor struct {
 
 	funderGauge, executorGauge, availableGauge prometheus.Gauge
 	channelGauge                               *prometheus.GaugeVec
+	forwarderGauge                             *prometheus.GaugeVec
+
+	// overSweep holds the tokens currently over SweepAlertUnits, so the
+	// alert logs once per crossing. Only Check touches it.
+	overSweep map[string]bool
 }
 
 func NewMonitor(rpc chain.RPC, store ChannelStore, cfg Config, reg prometheus.Registerer, namespace string) *Monitor {
@@ -73,8 +93,13 @@ func NewMonitor(rpc chain.RPC, store ChannelStore, cfg Config, reg prometheus.Re
 			Namespace: namespace, Name: "channels",
 			Help: "Channel accounts by state (active includes leased).",
 		}, []string{"state"}),
+		forwarderGauge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "forwarder_fee_balance",
+			Help: "Fees FeeForwarder holds per token, in token units (7 decimals), not yet swept back to the funder.",
+		}, []string{"token"}),
+		overSweep: map[string]bool{},
 	}
-	reg.MustRegister(m.funderGauge, m.executorGauge, m.availableGauge, m.channelGauge)
+	reg.MustRegister(m.funderGauge, m.executorGauge, m.availableGauge, m.channelGauge, m.forwarderGauge)
 	return m
 }
 
@@ -149,6 +174,7 @@ func (m *Monitor) Check(ctx context.Context) {
 	if stats.Disabled > 0 {
 		slog.Warn("balance monitor: channels out of rotation", "disabled", stats.Disabled, "active", stats.Active)
 	}
+	snap.ForwarderFees = m.checkForwarder(ctx)
 
 	m.mu.Lock()
 	m.snap = snap
@@ -161,6 +187,42 @@ func (m *Monitor) Check(ctx context.Context) {
 	m.channelGauge.WithLabelValues("leased").Set(float64(stats.Leased))
 	m.channelGauge.WithLabelValues("disabled").Set(float64(stats.Disabled))
 	m.channelGauge.WithLabelValues("retired").Set(float64(stats.Retired))
+}
+
+// checkForwarder reads FeeForwarder's fee-token balances, updates their
+// gauge and alerts once each time one passes SweepAlertUnits. A failed read
+// keeps the previous balances, like the account read above.
+func (m *Monitor) checkForwarder(ctx context.Context) map[string]int64 {
+	if m.cfg.Forwarder == "" || len(m.cfg.FeeTokens) == 0 {
+		return nil
+	}
+	tokens := make([]string, 0, len(m.cfg.FeeTokens))
+	for contract := range m.cfg.FeeTokens {
+		tokens = append(tokens, contract)
+	}
+	balances, err := chain.TokenBalances(ctx, m.rpc, m.cfg.Forwarder, tokens)
+	if err != nil {
+		slog.Error("balance monitor: read FeeForwarder fee balances", "err", err)
+		return m.Snapshot().ForwarderFees
+	}
+
+	out := make(map[string]int64, len(balances))
+	for contract, units := range balances {
+		symbol := m.cfg.FeeTokens[contract]
+		out[symbol] = units
+		m.forwarderGauge.WithLabelValues(symbol).Set(float64(units))
+
+		over := m.cfg.SweepAlertUnits > 0 && units > m.cfg.SweepAlertUnits
+		switch {
+		case over && !m.overSweep[symbol]:
+			slog.Error("ALERT gasless: FeeForwarder holds collected fees to sweep back to the funder",
+				"token", symbol, "balance_units", units, "alert_units", m.cfg.SweepAlertUnits, "forwarder", m.cfg.Forwarder)
+		case !over && m.overSweep[symbol]:
+			slog.Info("gasless: FeeForwarder fee balance back under the sweep alert", "token", symbol, "balance_units", units)
+		}
+		m.overSweep[symbol] = over
+	}
+	return out
 }
 
 func boolFloat(b bool) float64 {
