@@ -123,7 +123,7 @@ Deliberation items: latch-relayer#44.
 
 ## 5. Build vs adopt
 
-`reference/openzeppelin-relayer/` in this repo already implements Stellar sponsored
+[OpenZeppelin relayer](https://github.com/OpenZeppelin/openzeppelin-relayer) already implements Stellar sponsored
 transactions (its changelog, #563), KMS signer backends (AWS/GCP/Azure/Vault/Turnkey), and
 multi-key sequence management. Evaluate running it as the executor service, with this Go
 service calling it, before hand-building #37/#38/#39. Decision goes in #37.

@@ -18,7 +18,7 @@ Go — consistent with wallet-backend and stellar-freighter-backend-v2.
 - One memo_id per funding session — not permanent, not derived from the C-address
 - Stored as `BIGINT` in PostgreSQL; Go casts `uint64 ↔ int64` preserving bits
 - Collision retry: up to 5 attempts with `ON CONFLICT (memo_id) DO NOTHING` — statistically irrelevant in practice
-- Previous approach (deterministic `sha256(c_address)[:8]`) was superseded — see ADR in checklist.md
+- Previous approach (deterministic `sha256(c_address)[:8]`) was superseded — see [ADR 0002](docs/adr/0002-per-intent-memos.md)
 
 ### Intent Lifecycle
 Each call to `POST /intents` creates one intent:
