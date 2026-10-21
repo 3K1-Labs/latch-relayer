@@ -1,6 +1,6 @@
 # latch-relayer — Production Gap Tracker
 
-Gaps between what ships today and a production relayer on mainnet. Every entry was checked against the code on 2026-10-08. Fixed items are listed under [Resolved](#resolved) with the code that fixes them; their full write-ups are in git history.
+Gaps between what ships today and a production relayer on mainnet. Every entry was checked against the code on 2026-10-20 (`main` at 85cc0dd), including a pass over OpenZeppelin relayer commits up to 2026-10-15. Fixed items are listed under [Resolved](#resolved) with the code that fixes them; their full write-ups are in git history.
 
 ## Priority legend
 
@@ -13,37 +13,7 @@ Gaps between what ships today and a production relayer on mainnet. Every entry w
 
 ---
 
-## 1 · Gasless sponsorship (launch blockers)
-
-latch-relayer becomes the only submitter for wallet transactions: latch-api validates and simulates, then hands the relayer a validated transaction, and the relayer submits it through a leased channel account with a fee-bump from the funder. The fee model is in [docs/gasless-keys.md](docs/gasless-keys.md#fee-model).
-
-### [Launch] No sponsor endpoint
-
-**What we have:** `cmd/gasless` exposes only `GET /health`, `GET /gasless/status` and `GET /metrics`. The channel lease pool, funder, executor check and balance monitor exist, but nothing submits a wallet transaction.
-
-**What we need:** An API-key-authenticated endpoint that latch-api calls with the validated host function, the user's signed auth entries and the simulated resources (no source account, no sequence). The relayer leases a channel as the source, signs with it, wraps it in a fee-bump from the funder, sends via RPC, polls, and retries `tx_bad_seq` / `TRY_AGAIN_LATER` on a fresh lease. It returns the hash and final status. It re-checks the target contract against an allowlist as defence in depth. latch-api keeps the full validation (one invoke-host-function op, allowed contracts, enforcing-mode simulation).
-
-**Why it matters:** latch-api's `submitWithBundler` uses one bundler account per network with no lock and no bad-sequence retry. Concurrent sends collide, and one source account caps throughput at about one transaction per ledger for all users.
-
-### [Launch] No sponsored (Latch-pays) mode
-
-**What we have:** The gasless design covers only FeeForwarder `forward()`, where the user reimburses the fee in a token.
-
-**What we need:** A mode where the funder pays and the user is charged nothing, limited to a new wallet's setup transactions: wallet deployment and the setup-send-rules / setup-swap-rules steps. Enforce that list on the relayer side (target contract and function), cap it per wallet (count and total XLM), and record each sponsored transaction so the cap survives restarts. Every other transaction is paid by the user; a wallet with neither XLM nor USDC is refused with a clear "add XLM or USDC to pay network fees" error.
-
-### [Launch] Fee-token selection and USDC pricing
-
-**What we have:** Nothing chooses the fee token or computes `fee_amount`.
-
-**What we need:** The relayer fills in `fee_amount` (≤ the user's signed `max_fee_amount`):
-- **XLM** (native SAC): the actual network fee plus a small margin.
-- **USDC:** the network fee converted at a trusted XLM/USDC price keyed by contract ID, never by token code. latch-api `/v1/prices` currently looks up by code and must be fixed first.
-
-latch-api picks the fee token when it builds the authorization (XLM if the wallet can cover the fee plus the action, else USDC, else the sponsored mode) and shows the maximum fee to the user.
-
-### [Launch] FeeForwarder fee-token allowlist not set on mainnet
-
-**What we need:** Call `enable_fee_token` for the native XLM SAC and the Circle USDC SAC as part of the mainnet deployment. Until the first token is enabled, the contract accepts **any** token as the fee.
+## 1 · Launch blockers
 
 ### [Launch] Executor and funder keys loaded from env
 
@@ -51,15 +21,20 @@ latch-api picks the fee token when it builds the authorization (XLM if the walle
 
 **What we have:** All signing goes through the `Signer` interface, but the only implementation is an in-memory keypair loaded from env.
 
-**What we need:** A KMS-backed `Signer` (GCP KMS or Vault Transit; confirm Ed25519 support before choosing AWS KMS) for the executor and funder. Channels can stay seed-derived: they hold ~1.5 XLM and no role.
+**What we need:** A KMS-backed `Signer` (GCP KMS or Vault Transit; confirm Ed25519 support before choosing AWS KMS) for the executor and funder. Channels can stay seed-derived: they hold ~1.5 XLM and no role. OZ ships AWS, GCP, Azure Key Vault, Vault and Turnkey signers.
 
-### [Launch] Inclusion fee is not taken from the network
+### [Launch] Deposit forwarder bids a fixed inclusion fee
 
-**What we need:** Set the inclusion fee from RPC `getFeeStats` with a configured cap, instead of a fixed value. Keep the existing `tx_insufficient_fee` doubling (max 2) as the backstop.
+**File:** [internal/service/forwarder/forwarder.go](internal/service/forwarder/forwarder.go)
 
-### [Launch] Mainnet RPC is the public endpoint
+**What we have:** Every forward starts at `txnbuild.MinBaseFee` (100 stroops) and doubles on `tx_insufficient_fee` at most `maxFeeRetries = 2` times, so the highest bid is 400 stroops. Under surge pricing a forward exhausts that and drops to `pending_retry`. The gasless submitter already bids the `getFeeStats` p90.
 
-**What we need:** Point `RPC_URL` at the paid provider chosen for mainnet. Never put that key in a client build.
+**What we need:** The same p90 bid with a configured cap for the forwarder. OZ also raised its fee-retry ceiling from 2 to 6 and resubmits after a 5s × attempt delay (OZ #822).
+
+### [Launch] Mainnet deployment steps
+
+- Call `enable_fee_token` on FeeForwarder for the native XLM SAC and the Circle USDC SAC. Until the first token is enabled, the contract accepts **any** token as the fee.
+- Point `RPC_URL` at the paid provider chosen for mainnet. Never put that key in a client build.
 
 ---
 
@@ -73,11 +48,19 @@ latch-api picks the fee token when it builds the authorization (XLM if the walle
 
 **What we need:** A `next_retry_at` column (migration) set to `NOW() + backoff` on each transient failure, with `GetPendingRetries` filtering on it. OZ's backoff: base 10s, factor 1.5×, cap 120s.
 
+### [P1] Sequence resync can reuse an in-flight sequence
+
+**File:** [internal/service/forwarder/sequence.go](internal/service/forwarder/sequence.go)
+
+**What we have:** After a failed submission, `resync` reloads the pool's sequence from Horizon, which reports the last closed ledger. Forwards that already left the send lock may still be pending, so the next forward can draw a number one of them holds, get `txBadSeq`, and resync again. It heals once the pending forwards land, but thrashes under bursts. Inferred from the code; not reproduced.
+
+**What we need:** Reseed to the larger of the chain's next sequence and the highest in-flight sequence + 1, as OZ does for its counter (OZ #832).
+
 ### [P2] Watcher retries a failed poll after a flat 5s
 
 **File:** [internal/service/watcher/watcher.go](internal/service/watcher/watcher.go)
 
-**What we have:** The watcher polls Horizon pages (no longer SSE). After a poll error it waits exactly 5 seconds and resumes from the saved cursor, indefinitely.
+**What we have:** The watcher polls Horizon pages. After a poll error it waits exactly 5 seconds and resumes from the saved cursor, indefinitely.
 
 **What we need:** Exponential backoff with ±20% jitter (5s → 60s cap), reset on a successful page.
 
@@ -87,9 +70,27 @@ latch-api picks the fee token when it builds the authorization (XLM if the walle
 
 **What we need:** Nothing before launch: the pool is a classic account, and Horizon stays for it. Longer term, since protocol 23 classic payments emit `transfer` events, so the watcher can move to RPC `getEvents` filtered on the pool address, fetching the memo with `getTransaction`.
 
+### [P3] Forward failures are free text
+
+**What we have:** `forwards.error` holds the error string. The gasless table already records an `error_code`.
+
+**What we need:** A structured failure code on `forwards` (for example the transaction result code), so latch-api and alerts can branch on it. OZ did the same for Stellar (OZ #765).
+
 ---
 
-## 3 · Observability & operations
+## 3 · Gasless sponsorship
+
+### [P3] Auth-entry check misses two Protocol 28 cases
+
+**File:** [internal/gasless/sponsor/request.go](internal/gasless/sponsor/request.go)
+
+**What we have:** `authAddress` refuses source-account credentials and rejects auth entries that claim a relayer account. `AddressWithDelegates` credentials are rejected outright (fails closed), and a muxed M-address for a relayer account is compared as-is rather than reduced to its G-key.
+
+**What we need:** Resolve muxed addresses to the underlying account before the relayer-account check. Accept delegates only if Latch wallets start using them, recursing through nested delegates as OZ does (OZ #873). Low risk: the relayer never signs those entries.
+
+---
+
+## 4 · Observability & operations
 
 ### [P2] No Grafana / monitoring stack or alert rules
 
@@ -109,7 +110,7 @@ latch-api picks the fee token when it builds the authorization (XLM if the walle
 
 ---
 
-## 4 · Testing
+## 5 · Testing
 
 ### [P1] No unit tests for the retry worker
 
@@ -119,15 +120,15 @@ latch-api picks the fee token when it builds the authorization (XLM if the walle
 
 ### [P2] No fault injection for Stellar RPC errors
 
-**What we need:** A WireMock (or equivalent) setup that produces `TRY_AGAIN_LATER`, `tx_insufficient_fee`, RPC 500s and timeouts on demand. GitHub Issue #4 has the spec.
+**What we need:** A WireMock (or equivalent) setup that produces `TRY_AGAIN_LATER`, `tx_insufficient_fee`, RPC 500s and timeouts on demand. GitHub Issue #4 has the spec; OZ's timing-matrix harness in OZ #822 is a model.
 
 ---
 
-## 5 · Database
+## 6 · Database
 
 ### [P3] No down migrations
 
-**What we have:** `migrations/deposit` and `migrations/gasless` contain only `.up.sql` files.
+**What we have:** `migrations/deposit` and `migrations/gasless` contain only `.up.sql` files. #66 adds them.
 
 **What we need:** A `.down.sql` for each migration.
 
@@ -136,6 +137,17 @@ latch-api picks the fee token when it builds the authorization (XLM if the walle
 **What we have:** Both `cmd/serve` and `cmd/gasless` call `migrations.Run` in `main()`.
 
 **What we need:** A separate migrate step in the deploy pipeline before the service starts.
+
+---
+
+## Not needed (checked against OZ, 2026-10-20)
+
+| OZ change | Why we don't need it |
+|-----------|----------------------|
+| Idempotency-Key header (OZ #893, #917) | Gasless `request_id` plus payload hash already does this (409 `request_id_conflict` on mismatch); deposits are keyed by memo |
+| Protocol 28 XDR upgrade (OZ #873) | go-stellar-sdk v0.7.3 already includes Protocol 28 (CAP-83, CAP-85) |
+| Redis status-index repair, Redis worker IDs, RabbitMQ and Pub/Sub queues (OZ #823, #892, #798, #791) | Our state is in Postgres; no Redis or external queue |
+| Masking provider URLs in RPC logs (OZ #916) | Neither service logs the RPC or Horizon URL |
 
 ---
 
@@ -158,3 +170,7 @@ latch-api picks the fee token when it builds the authorization (XLM if the walle
 | DB pool on defaults | `DB_MAX_CONNS` / `DB_MIN_CONNS`, lifetimes and health checks |
 | One transaction per ledger from a single pool | Deposit channel accounts with leases and pool fee-bump (#48) |
 | Most core packages untested | Tests in forwarder, watcher, handler, store, signer and gasless packages |
+| No sponsor endpoint | `POST` sponsored submit through leased channels with a funder fee-bump (#64, `internal/gasless/api/submit.go`) |
+| No sponsored (Latch-pays) mode | `SPONSORED_CALLS` allowlist with per-wallet caps recorded in Postgres (#64, `internal/gasless/sponsor/store.go`) |
+| No fee-token selection or USDC pricing | Forward mode in XLM or USDC, priced from the enforce-mode simulation with a bounded, last-good XLM price (#67, #68) |
+| Gasless inclusion fee fixed | p90 from `getFeeStats`, capped by `MAX_INCLUSION_FEE_STROOPS` (`internal/gasless/sponsor/submitter.go`) |

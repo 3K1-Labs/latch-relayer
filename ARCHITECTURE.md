@@ -18,7 +18,7 @@ Go — consistent with wallet-backend and stellar-freighter-backend-v2.
 - One memo_id per funding session — not permanent, not derived from the C-address
 - Stored as `BIGINT` in PostgreSQL; Go casts `uint64 ↔ int64` preserving bits
 - Collision retry: up to 5 attempts with `ON CONFLICT (memo_id) DO NOTHING` — statistically irrelevant in practice
-- Previous approach (deterministic `sha256(c_address)[:8]`) was superseded — see ADR in checklist.md
+- Previous approach (deterministic `sha256(c_address)[:8]`) was superseded — see [ADR 0002](docs/adr/0002-per-intent-memos.md)
 
 ### Intent Lifecycle
 Each call to `POST /intents` creates one intent:
@@ -30,7 +30,7 @@ pending → completed   (deposit arrived and was forwarded successfully)
 Intents expire via `ExpireStaleIntents`, called by the retry worker on every tick (every 30s).
 
 Whether a deposit is in time is judged by **when it landed on-chain**, not when the relayer processes it, and not by the intent's status:
-- A payment made inside the window is credited even if it is processed late, for example when the stream replays after a restart or a pool is backlogged.
+- A payment made inside the window is credited even if it is processed late, for example when the watcher replays from its cursor after a restart or a pool is backlogged.
 - In that case an intent already flipped to `expired` becomes `completed`.
 - A payment that lands after `expires_at` is swept to recovery.
 
@@ -109,7 +109,7 @@ With channels (see below), the pool fee-bumps each transaction a channel sources
 - **Horizon payment polling** (replaced the SSE stream, which capped intake at about 10 deposits a second; see [docs/deposit-channels.md](docs/deposit-channels.md)) — one poll loop per pooled address, feeding a bounded queue of forward workers (`FORWARD_WORKERS`)
 - On startup: read last saved cursor from DB and resume from that point — no missed events on restart
 - On any poll error: wait 5 seconds, then resume from the last saved cursor
-- Each deposit is written to `forwards` before its cursor is saved; if that write fails the stream stops and replays from the last saved cursor, so a deposit is never skipped without a record
+- Each deposit is written to `forwards` before its cursor is saved; if that write fails the poll stops and resumes from the last saved cursor, so a deposit is never skipped without a record
 - wallet-backend is NOT used for the deposit hot path
 
 ### Multiple Pooled Addresses
