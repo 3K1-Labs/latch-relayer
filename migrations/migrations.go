@@ -16,10 +16,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-//go:embed deposit/*.up.sql
+//go:embed deposit/*.sql
 var depositFiles embed.FS
 
-//go:embed gasless/*.up.sql
+//go:embed gasless/*.sql
 var gaslessFiles embed.FS
 
 // Deposit is the deposit bridge's schema (intents, forwards, cursors).
@@ -28,7 +28,7 @@ var Deposit = Set{Name: "deposit", FS: mustSub(depositFiles, "deposit")}
 // Gasless is the gasless sponsor's schema (channel accounts, quotes, sponsored txs).
 var Gasless = Set{Name: "gasless", FS: mustSub(gaslessFiles, "gasless")}
 
-// Set is one service's migrations: `NNN_name.up.sql` files at the FS root.
+// Set is one service's migrations: `NNN_name.up.sql` and `NNN_name.down.sql` files at the FS root.
 type Set struct {
 	Name string
 	FS   fs.FS
@@ -38,7 +38,7 @@ type Set struct {
 // same time. Arbitrary constant; only needs to be stable.
 const advisoryLockKey int64 = 0x6c617463686d6967 // "latchmig"
 
-// Migration is one embedded `.up.sql` file.
+// Migration is one embedded `.up.sql` or `.down.sql` file.
 type Migration struct {
 	Version string // "<set>/<file stem>", e.g. "deposit/001_init"
 	SQL     string
@@ -60,6 +60,28 @@ func (s Set) Load() ([]Migration, error) {
 		}
 		out = append(out, Migration{
 			Version: s.Name + "/" + strings.TrimSuffix(name, ".up.sql"),
+			SQL:     string(body),
+		})
+	}
+	return out, nil
+}
+
+// LoadDown returns the set's down migrations ordered in reverse by filename.
+func (s Set) LoadDown() ([]Migration, error) {
+	names, err := fs.Glob(s.FS, "*.down.sql")
+	if err != nil {
+		return nil, err
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+
+	out := make([]Migration, 0, len(names))
+	for _, name := range names {
+		body, err := fs.ReadFile(s.FS, name)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		out = append(out, Migration{
+			Version: s.Name + "/" + strings.TrimSuffix(name, ".down.sql"),
 			SQL:     string(body),
 		})
 	}
@@ -120,6 +142,110 @@ func Run(ctx context.Context, pool *pgxpool.Pool, set Set) error {
 	})
 	if err != nil {
 		return fmt.Errorf("run %s migrations: %w", set.Name, err)
+	}
+	return nil
+}
+
+// Rollback applies every down migration for the set recorded in schema_migrations,
+// in reverse order, inside one transaction under the advisory lock.
+func Rollback(ctx context.Context, pool *pgxpool.Pool, set Set) error {
+	downMigs, err := set.LoadDown()
+	if err != nil {
+		return fmt.Errorf("load %s down migrations: %w", set.Name, err)
+	}
+
+	err = pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey); err != nil {
+			return fmt.Errorf("acquire migration lock: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			CREATE TABLE IF NOT EXISTS schema_migrations (
+				version    TEXT        PRIMARY KEY,
+				applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			)`); err != nil {
+			return fmt.Errorf("create schema_migrations: %w", err)
+		}
+
+		rows, err := tx.Query(ctx, `SELECT version FROM schema_migrations WHERE version LIKE $1`, set.Name+"/%")
+		if err != nil {
+			return fmt.Errorf("read schema_migrations: %w", err)
+		}
+		versions, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return fmt.Errorf("read schema_migrations: %w", err)
+		}
+		applied := make(map[string]bool, len(versions))
+		for _, v := range versions {
+			applied[v] = true
+		}
+
+		for _, m := range downMigs {
+			if !applied[m.Version] {
+				continue
+			}
+			if _, err := tx.Exec(ctx, m.SQL); err != nil {
+				return fmt.Errorf("rollback %s: %w", m.Version, err)
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM schema_migrations WHERE version = $1`, m.Version); err != nil {
+				return fmt.Errorf("delete record %s: %w", m.Version, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("rollback %s migrations: %w", set.Name, err)
+	}
+	return nil
+}
+
+// RollbackStep rolls back the single latest applied migration for the set.
+// It returns nil if no migration was applied.
+func RollbackStep(ctx context.Context, pool *pgxpool.Pool, set Set) error {
+	downMigs, err := set.LoadDown()
+	if err != nil {
+		return fmt.Errorf("load %s down migrations: %w", set.Name, err)
+	}
+
+	err = pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey); err != nil {
+			return fmt.Errorf("acquire migration lock: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			CREATE TABLE IF NOT EXISTS schema_migrations (
+				version    TEXT        PRIMARY KEY,
+				applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			)`); err != nil {
+			return fmt.Errorf("create schema_migrations: %w", err)
+		}
+
+		rows, err := tx.Query(ctx, `SELECT version FROM schema_migrations WHERE version LIKE $1`, set.Name+"/%")
+		if err != nil {
+			return fmt.Errorf("read schema_migrations: %w", err)
+		}
+		versions, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return fmt.Errorf("read schema_migrations: %w", err)
+		}
+		applied := make(map[string]bool, len(versions))
+		for _, v := range versions {
+			applied[v] = true
+		}
+
+		for _, m := range downMigs {
+			if applied[m.Version] {
+				if _, err := tx.Exec(ctx, m.SQL); err != nil {
+					return fmt.Errorf("rollback %s: %w", m.Version, err)
+				}
+				if _, err := tx.Exec(ctx, `DELETE FROM schema_migrations WHERE version = $1`, m.Version); err != nil {
+					return fmt.Errorf("delete record %s: %w", m.Version, err)
+				}
+				break
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("rollback-step %s migration: %w", set.Name, err)
 	}
 	return nil
 }
